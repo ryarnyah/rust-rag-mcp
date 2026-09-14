@@ -123,24 +123,27 @@ async fn main() -> anyhow::Result<()> {
             let core = rag::RagCore::new(&db_path, &model, chunk_size, overlap).await?;
             for path_str in &paths {
                 let path = std::path::Path::new(path_str);
-                if path.is_dir() {
-                    for entry in std::fs::read_dir(path)? {
-                        let entry = entry?;
-                        let file_path = entry.path();
-                        if docs::supported_extension(&file_path) {
-                            match core.index_file(&file_path).await {
-                                Ok(count) => println!("Indexed {}: {} chunks", file_path.display(), count),
-                                Err(e) => eprintln!("Failed {}: {}", file_path.display(), e),
+                if !path.exists() {
+                    eprintln!("Path not found: {}", path_str);
+                    continue;
+                }
+
+                // Stack-based iterative directory traversal (avoids recursion limits)
+                let mut stack = vec![path.to_path_buf()];
+                while let Some(current) = stack.pop() {
+                    if current.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&current) {
+                            for entry in entries.flatten() {
+                                let file_path = entry.path();
+                                stack.push(file_path);
                             }
                         }
+                    } else if current.is_file() && docs::supported_extension(&current) {
+                        match core.index_file(&current).await {
+                            Ok(count) => println!("Indexed {}: {} chunks", current.display(), count),
+                            Err(e) => eprintln!("Failed {}: {}", current.display(), e),
+                        }
                     }
-                } else if path.is_file() {
-                    match core.index_file(path).await {
-                        Ok(count) => println!("Indexed {}: {} chunks", path.display(), count),
-                        Err(e) => eprintln!("Failed {}: {}", path.display(), e),
-                    }
-                } else {
-                    eprintln!("Path not found: {}", path_str);
                 }
             }
         }
