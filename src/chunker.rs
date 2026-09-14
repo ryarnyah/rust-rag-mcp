@@ -64,31 +64,6 @@ impl Chunker {
 
         chunks
     }
-
-    pub fn chunk_file(&self, text: &str, source: &str) -> Vec<DocumentChunk> {
-        let sections: Vec<&str> = text.split("--- Page ").collect();
-        let mut all_chunks = Vec::new();
-
-        for (page_idx, section) in sections.iter().enumerate() {
-            if section.trim().is_empty() {
-                continue;
-            }
-
-            let source_label = if page_idx == 0 {
-                source.to_string()
-            } else {
-                format!("{}#page-{}", source, page_idx)
-            };
-
-            let mut page_chunks = self.chunk_text(section, &source_label);
-            for chunk in &mut page_chunks {
-                chunk.id = Uuid::new_v4().to_string();
-            }
-            all_chunks.extend(page_chunks);
-        }
-
-        all_chunks
-    }
 }
 
 #[cfg(test)]
@@ -127,15 +102,6 @@ mod tests {
         let chunker = Chunker::default();
         let chunks = chunker.chunk_text("   \n\t  ", "test.txt");
         assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_file_with_page_markers() {
-        let chunker = Chunker::new(5, 0);
-        let text = "--- Page 1 ---\none two three\n--- Page 2 ---\nfour five six";
-        let chunks = chunker.chunk_file(text, "doc.pdf");
-        assert!(!chunks.is_empty());
-        assert!(chunks.iter().any(|c| c.source.contains("page-1")));
     }
 
     #[test]

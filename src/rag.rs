@@ -7,7 +7,7 @@ use arrow_array::{types::Float32Type, Array, FixedSizeListArray, RecordBatch, St
 use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use rig::lancedb::{LanceDbVectorIndex, LanceDBFilter, SearchParams};
+use rig::lancedb::{LanceDBFilter, LanceDbVectorIndex, SearchParams};
 use rig::vector_store::request::SearchFilter;
 use rig::vector_store::VectorStoreIndex;
 use std::path::Path;
@@ -64,13 +64,9 @@ impl RagCore {
             .column("vector");
 
         let table_clone = table.clone();
-        let index = LanceDbVectorIndex::new(
-            table,
-            embedding.rig_model().clone(),
-            "id",
-            search_params,
-        )
-        .await?;
+        let index =
+            LanceDbVectorIndex::new(table, embedding.rig_model().clone(), "id", search_params)
+                .await?;
 
         Ok(Self {
             index,
@@ -87,14 +83,14 @@ impl RagCore {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
 
-        let chunks = self.chunker.chunk_file(&text, &source);
+        let chunks = self.chunker.chunk_text(&text, &source);
         let count = chunks.len();
         self.index_chunks(chunks).await?;
         Ok(count)
     }
 
     pub async fn index_text(&self, text: &str, source: &str) -> Result<usize> {
-        let chunks = self.chunker.chunk_file(text, source);
+        let chunks = self.chunker.chunk_text(text, source);
         let count = chunks.len();
         self.index_chunks(chunks).await?;
         Ok(count)
@@ -108,21 +104,36 @@ impl RagCore {
         let embeddings_result = self.embedding.embed_chunks(chunks).await?;
         let ndims = self.embedding.dimensions() as i32;
 
-        let ids: Vec<&str> = embeddings_result.iter().map(|(c, _)| c.id.as_str()).collect();
-        let texts: Vec<&str> = embeddings_result.iter().map(|(c, _)| c.text.as_str()).collect();
-        let sources: Vec<&str> = embeddings_result.iter().map(|(c, _)| c.source.as_str()).collect();
-        let chunk_indices: Vec<u32> = embeddings_result.iter().map(|(c, _)| c.chunk_index).collect();
-        let start_offsets: Vec<u64> = embeddings_result.iter().map(|(c, _)| c.start_offset as u64).collect();
-        let end_offsets: Vec<u64> = embeddings_result.iter().map(|(c, _)| c.end_offset as u64).collect();
+        let ids: Vec<&str> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.id.as_str())
+            .collect();
+        let texts: Vec<&str> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.text.as_str())
+            .collect();
+        let sources: Vec<&str> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.source.as_str())
+            .collect();
+        let chunk_indices: Vec<u32> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.chunk_index)
+            .collect();
+        let start_offsets: Vec<u64> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.start_offset as u64)
+            .collect();
+        let end_offsets: Vec<u64> = embeddings_result
+            .iter()
+            .map(|(c, _)| c.end_offset as u64)
+            .collect();
 
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            embeddings_result
-                .iter()
-                .map(|(_, es)| {
-                    es.first().map(|e| {
-                        e.vec.iter().map(|v| Some(*v as f32)).collect::<Vec<_>>()
-                    })
-                }),
+            embeddings_result.iter().map(|(_, es)| {
+                es.first()
+                    .map(|e| e.vec.iter().map(|v| Some(*v as f32)).collect::<Vec<_>>())
+            }),
             ndims,
         );
 
@@ -180,7 +191,8 @@ impl RagCore {
                 .build()
         };
 
-        let results: Vec<(f64, String, DocumentChunk)> = self.index.top_n::<DocumentChunk>(req).await?;
+        let results: Vec<(f64, String, DocumentChunk)> =
+            self.index.top_n::<DocumentChunk>(req).await?;
         Ok(results
             .into_iter()
             .map(|(score, _id, chunk)| SearchResult { score, chunk })

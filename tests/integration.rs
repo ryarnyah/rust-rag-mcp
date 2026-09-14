@@ -83,18 +83,6 @@ fn test_extract_txt_file() {
 }
 
 #[test]
-fn test_chunker_with_page_sections() {
-    let chunker = Chunker::new(10, 2);
-    let text = fixtures::sample_text_with_sections();
-    let chunks = chunker.chunk_file(&text, "ml-doc.pdf");
-
-    assert!(!chunks.is_empty());
-    assert!(chunks.iter().any(|c| c.source.contains("page-1")));
-    assert!(chunks.iter().any(|c| c.source.contains("page-2")));
-    assert!(chunks.iter().any(|c| c.source.contains("page-3")));
-}
-
-#[test]
 fn test_chunker_preserves_content() {
     let chunker = Chunker::new(20, 5);
     let text = "The quick brown fox jumps over the lazy dog. A second sentence for testing.";
