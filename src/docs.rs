@@ -9,8 +9,8 @@ pub fn extract_text(path: &Path) -> Result<String> {
         .to_lowercase();
 
     match ext.to_lowercase().as_str() {
-        "pdf" => Ok(unpdf::extract_text(path)?),
-        "docx" | "xlsx" | "pptx" => Ok(undoc::extract_text(path)?),
+        "pdf" => unpdf::extract_text(path).context("extracting PDF"),
+        "docx" | "xlsx" | "pptx" => undoc::extract_text(path).context("extracting Office document"),
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "json"
         | "yaml" | "yml" | "toml" | "xml" | "csv" | "html" | "css" => {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
