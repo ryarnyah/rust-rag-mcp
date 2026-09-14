@@ -1,0 +1,45 @@
+[package]
+name = "rust-rag-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RAG MCP server using rig, fastembed, LanceDB, unpdf, undoc"
+
+[[bin]]
+name = "rust-rag-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rig = { version = "0.42", features = ["lancedb"] }
+rig-fastembed = "0.42"
+rig-lancedb = "0.42"
+lancedb = "0.30"
+arrow-array = "58"
+arrow-schema = "58"
+rmcp = { version = "3.1", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+] }
+unpdf = "0.19"
+undoc = "0.11.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
