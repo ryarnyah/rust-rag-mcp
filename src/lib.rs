@@ -1,8 +1,8 @@
 pub mod chunker;
 pub mod docs;
 pub mod embeddings;
-pub mod rag;
 pub mod mcp;
+pub mod rag;
 
 use serde::{Deserialize, Serialize};
 

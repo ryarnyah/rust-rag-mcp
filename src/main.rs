@@ -5,7 +5,10 @@ use rmcp::ServiceExt;
 use rust_rag_mcp::{docs, mcp, rag};
 
 #[derive(Parser)]
-#[command(name = "rust-rag-mcp", about = "RAG MCP server with fastembed, LanceDB, PDF/docx/xlsx/pptx")]
+#[command(
+    name = "rust-rag-mcp",
+    about = "RAG MCP server with fastembed, LanceDB, PDF/docx/xlsx/pptx"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -89,9 +92,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
@@ -107,9 +108,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!("Starting RAG MCP server");
             let server = mcp::RagServer::new(&db_path, &model, chunk_size, overlap).await?;
-            let service = server.serve(rmcp::transport::stdio()).await.inspect_err(|e| {
-                tracing::error!("MCP server error: {:?}", e);
-            })?;
+            let service = server
+                .serve(rmcp::transport::stdio())
+                .await
+                .inspect_err(|e| {
+                    tracing::error!("MCP server error: {:?}", e);
+                })?;
             service.waiting().await?;
         }
 
@@ -140,7 +144,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     } else if current.is_file() && docs::supported_extension(&current) {
                         match core.index_file(&current).await {
-                            Ok(count) => println!("Indexed {}: {} chunks", current.display(), count),
+                            Ok(count) => {
+                                println!("Indexed {}: {} chunks", current.display(), count)
+                            }
                             Err(e) => eprintln!("Failed {}: {}", current.display(), e),
                         }
                     }
@@ -157,7 +163,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
             let query_str = query.join(" ");
-            let results: Vec<rust_rag_mcp::SearchResult> = core.search(&query_str, top_k, source.as_deref()).await?;
+            let results: Vec<rust_rag_mcp::SearchResult> =
+                core.search(&query_str, top_k, source.as_deref()).await?;
 
             if results.is_empty() {
                 println!("No results found.");
