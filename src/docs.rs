@@ -9,27 +9,14 @@ pub fn extract_text(path: &Path) -> Result<String> {
         .to_lowercase();
 
     match ext.to_lowercase().as_str() {
-        "pdf" => extract_pdf(path),
-        "docx" | "xlsx" | "pptx" => extract_undoc(path),
+        "pdf" => Ok(unpdf::extract_text(path)?),
+        "docx" | "xlsx" | "pptx" => Ok(undoc::extract_text(path)?),
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "json"
         | "yaml" | "yml" | "toml" | "xml" | "csv" | "html" | "css" => {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
         }
         _ => Err(anyhow::anyhow!("Unsupported file format: {}", ext)),
     }
-}
-
-fn extract_pdf(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading PDF {}", path.display()))?;
-    let doc =
-        unpdf::parse_bytes(&bytes).with_context(|| format!("parsing PDF {}", path.display()))?;
-    Ok(doc.plain_text())
-}
-
-fn extract_undoc(path: &Path) -> Result<String> {
-    let doc =
-        undoc::parse_file(path).with_context(|| format!("parsing document {}", path.display()))?;
-    Ok(doc.plain_text())
 }
 
 pub fn supported_extension(path: &Path) -> bool {

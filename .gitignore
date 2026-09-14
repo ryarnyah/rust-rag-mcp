@@ -1,0 +1,5 @@
+/target
+*.safetensors
+.fastembed_cache
+.rig-rag-db
+.DS_Store
