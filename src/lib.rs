@@ -6,10 +6,9 @@ pub mod rag;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, rig::Embed)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentChunk {
     pub id: String,
-    #[embed]
     pub text: String,
     pub source: String,
     pub chunk_index: u32,

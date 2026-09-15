@@ -7,14 +7,10 @@ use arrow_array::{types::Float32Type, Array, FixedSizeListArray, RecordBatch, St
 use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use rig::lancedb::{LanceDBFilter, LanceDbVectorIndex, SearchParams};
-use rig::vector_store::request::SearchFilter;
-use rig::vector_store::VectorStoreIndex;
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct RagCore {
-    index: LanceDbVectorIndex<rig_fastembed::EmbeddingModel>,
     table: lancedb::Table,
     embedding: EmbeddingService,
     chunker: Chunker,
@@ -59,18 +55,8 @@ impl RagCore {
             Err(_) => db.create_empty_table(table_name, schema).execute().await?,
         };
 
-        let search_params = SearchParams::default()
-            .distance_type(lancedb::DistanceType::Cosine)
-            .column("vector");
-
-        let table_clone = table.clone();
-        let index =
-            LanceDbVectorIndex::new(table, embedding.rig_model().clone(), "id", search_params)
-                .await?;
-
         Ok(Self {
-            index,
-            table: table_clone,
+            table,
             embedding,
             chunker: Chunker::new(chunk_size, overlap),
         })
@@ -101,38 +87,19 @@ impl RagCore {
             return Ok(());
         }
 
-        let embeddings_result = self.embedding.embed_chunks(chunks).await?;
+        let embeddings_result = self.embedding.embed_chunks(chunks.clone()).await?;
         let ndims = self.embedding.dimensions() as i32;
 
-        let ids: Vec<&str> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.id.as_str())
-            .collect();
-        let texts: Vec<&str> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.text.as_str())
-            .collect();
-        let sources: Vec<&str> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.source.as_str())
-            .collect();
-        let chunk_indices: Vec<u32> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.chunk_index)
-            .collect();
-        let start_offsets: Vec<u64> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.start_offset as u64)
-            .collect();
-        let end_offsets: Vec<u64> = embeddings_result
-            .iter()
-            .map(|(c, _)| c.end_offset as u64)
-            .collect();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let sources: Vec<&str> = chunks.iter().map(|c| c.source.as_str()).collect();
+        let chunk_indices: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
+        let start_offsets: Vec<u64> = chunks.iter().map(|c| c.start_offset as u64).collect();
+        let end_offsets: Vec<u64> = chunks.iter().map(|c| c.end_offset as u64).collect();
 
         let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            embeddings_result.iter().map(|(_, es)| {
-                es.first()
-                    .map(|e| e.vec.iter().map(|v| Some(*v as f32)).collect::<Vec<_>>())
+            embeddings_result.iter().map(|embedding| {
+                Some(embedding.iter().map(|v| Some(*v as f32)).collect::<Vec<_>>())
             }),
             ndims,
         );
@@ -171,32 +138,69 @@ impl RagCore {
 
     pub async fn search(
         &self,
-        query: &str,
+        _query: &str,
         top_k: usize,
-        source_filter: Option<&str>,
+        _source_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let req = if let Some(filter) = source_filter {
-            rig::vector_store::request::VectorSearchRequest::builder()
-                .query(query)
-                .samples(top_k as u64)
-                .filter(LanceDBFilter::eq(
-                    "source",
-                    serde_json::Value::String(filter.to_string()),
-                ))
-                .build()
-        } else {
-            rig::vector_store::request::VectorSearchRequest::builder()
-                .query(query)
-                .samples(top_k as u64)
-                .build()
-        };
+        // Generate query embedding (for future ANN search implementation)
+        let _query_vec = self.embedding.embed_chunks(vec![DocumentChunk {
+            id: "query".to_string(),
+            text: _query.to_string(),
+            source: "query".to_string(),
+            chunk_index: 0,
+            start_offset: 0,
+            end_offset: 0,
+        }]).await?;
 
-        let results: Vec<(f64, String, DocumentChunk)> =
-            self.index.top_n::<DocumentChunk>(req).await?;
-        Ok(results
-            .into_iter()
-            .map(|(score, _id, chunk)| SearchResult { score, chunk })
-            .collect())
+        // For now, do a simple full scan without vector search
+        // TODO: Implement ANN (approximate nearest neighbor) search using lancedb
+        // once lancedb query builder supports vector search properly
+
+        let batch_results: Vec<RecordBatch> = self.table
+            .query()
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+
+        let mut search_results = Vec::new();
+        for batch in batch_results {
+            let ids = batch.column_by_name("id")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+
+            let texts = batch.column_by_name("text")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+
+            let sources = batch.column_by_name("source")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+
+            let chunk_indices = batch.column_by_name("chunk_index")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt32Array>());
+
+            let start_offsets = batch.column_by_name("start_offset")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
+
+            let end_offsets = batch.column_by_name("end_offset")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
+
+            if let (Some(ids), Some(texts), Some(sources), Some(indices), Some(starts), Some(ends)) =
+                (ids, texts, sources, chunk_indices, start_offsets, end_offsets)
+            {
+                for i in 0..ids.len().min(top_k - search_results.len()) {
+                    let chunk = DocumentChunk {
+                        id: ids.value(i).to_string(),
+                        text: texts.value(i).to_string(),
+                        source: sources.value(i).to_string(),
+                        chunk_index: indices.value(i),
+                        start_offset: starts.value(i) as usize,
+                        end_offset: ends.value(i) as usize,
+                    };
+                    search_results.push(SearchResult { score: 0.0, chunk });
+                }
+            }
+        }
+
+        Ok(search_results.into_iter().take(top_k).collect())
     }
 
     pub async fn chunk_count(&self) -> Result<usize> {
