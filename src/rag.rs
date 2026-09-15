@@ -3,11 +3,13 @@ use crate::docs;
 use crate::embeddings::EmbeddingService;
 use crate::{DocumentChunk, SearchResult};
 use anyhow::Result;
-use arrow_array::{types::Float32Type, Array, FixedSizeListArray, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::Path;
+
+// Import arrow types from lancedb's re-export
+use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use lancedb::arrow::arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 pub struct RagCore {
@@ -29,19 +31,19 @@ impl RagCore {
         let db = lancedb::connect(db_path).execute().await?;
         let table_name = "chunks";
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new("text", arrow_schema::DataType::Utf8, true),
-            arrow_schema::Field::new("source", arrow_schema::DataType::Utf8, true),
-            arrow_schema::Field::new("chunk_index", arrow_schema::DataType::UInt32, true),
-            arrow_schema::Field::new("start_offset", arrow_schema::DataType::UInt64, true),
-            arrow_schema::Field::new("end_offset", arrow_schema::DataType::UInt64, true),
-            arrow_schema::Field::new(
+        let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("source", DataType::Utf8, true),
+            Field::new("chunk_index", DataType::UInt32, true),
+            Field::new("start_offset", DataType::UInt64, true),
+            Field::new("end_offset", DataType::UInt64, true),
+            Field::new(
                 "vector",
-                arrow_schema::DataType::FixedSizeList(
-                    Arc::new(arrow_schema::Field::new(
+                DataType::FixedSizeList(
+                    Arc::new(Field::new(
                         "item",
-                        arrow_schema::DataType::Float32,
+                        DataType::Float32,
                         true,
                     )),
                     ndims,
@@ -97,15 +99,23 @@ impl RagCore {
         let start_offsets: Vec<u64> = chunks.iter().map(|c| c.start_offset as u64).collect();
         let end_offsets: Vec<u64> = chunks.iter().map(|c| c.end_offset as u64).collect();
 
-        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        // Build vectors using from_iter_primitive
+        use lancedb::arrow::arrow_array::types::Float32Type;
+        
+        let vectors = lancedb::arrow::arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
             embeddings_result.iter().map(|embedding| {
-                Some(embedding.iter().map(|v| Some(*v as f32)).collect::<Vec<_>>())
+                Some(
+                    embedding
+                        .iter()
+                        .map(|v| Some(*v as f32))
+                        .collect::<Vec<_>>(),
+                )
             }),
             ndims,
         );
 
         let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema::Schema::new(vec![
+            Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("text", DataType::Utf8, true),
                 Field::new("source", DataType::Utf8, true),
@@ -125,9 +135,9 @@ impl RagCore {
                 Arc::new(StringArray::from(ids)),
                 Arc::new(StringArray::from(texts)),
                 Arc::new(StringArray::from(sources)),
-                Arc::new(arrow_array::UInt32Array::from(chunk_indices)),
-                Arc::new(arrow_array::UInt64Array::from(start_offsets)),
-                Arc::new(arrow_array::UInt64Array::from(end_offsets)),
+                Arc::new(UInt32Array::from(chunk_indices)),
+                Arc::new(UInt64Array::from(start_offsets)),
+                Arc::new(UInt64Array::from(end_offsets)),
                 Arc::new(vectors),
             ],
         )?;
@@ -138,55 +148,99 @@ impl RagCore {
 
     pub async fn search(
         &self,
-        _query: &str,
+        query: &str,
         top_k: usize,
-        _source_filter: Option<&str>,
+        source_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        // Generate query embedding (for future ANN search implementation)
-        let _query_vec = self.embedding.embed_chunks(vec![DocumentChunk {
-            id: "query".to_string(),
-            text: _query.to_string(),
-            source: "query".to_string(),
-            chunk_index: 0,
-            start_offset: 0,
-            end_offset: 0,
-        }]).await?;
-
-        // For now, do a simple full scan without vector search
-        // TODO: Implement ANN (approximate nearest neighbor) search using lancedb
-        // once lancedb query builder supports vector search properly
-
-        let batch_results: Vec<RecordBatch> = self.table
-            .query()
-            .execute()
-            .await?
-            .try_collect()
+        // Generate query embedding
+        let query_embedding_vec = self
+            .embedding
+            .embed_chunks(vec![DocumentChunk {
+                id: "query".to_string(),
+                text: query.to_string(),
+                source: "query".to_string(),
+                chunk_index: 0,
+                start_offset: 0,
+                end_offset: 0,
+            }])
             .await?;
 
+        if query_embedding_vec.is_empty() || query_embedding_vec[0].is_empty() {
+            return Err(anyhow::anyhow!("Failed to generate query embedding"));
+        }
+
+        let query_embedding = query_embedding_vec[0].clone();
+
+        // Perform vector search using lancedb's nearest_to
+        let mut vector_query = self.table.query().nearest_to(query_embedding)?;
+
+        // Apply source filter if provided
+        if let Some(filter) = source_filter {
+            vector_query = vector_query.only_if(format!("source = '{}'", filter));
+        }
+
+        // Limit results
+        vector_query = vector_query.limit(top_k);
+
+        // Execute the query
+        let results: Vec<RecordBatch> = vector_query.execute().await?.try_collect().await?;
+
         let mut search_results = Vec::new();
-        for batch in batch_results {
-            let ids = batch.column_by_name("id")
+        for batch in results {
+            let ids = batch
+                .column_by_name("id")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>());
 
-            let texts = batch.column_by_name("text")
+            let texts = batch
+                .column_by_name("text")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>());
 
-            let sources = batch.column_by_name("source")
+            let sources = batch
+                .column_by_name("source")
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>());
 
-            let chunk_indices = batch.column_by_name("chunk_index")
+            let chunk_indices = batch
+                .column_by_name("chunk_index")
                 .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt32Array>());
 
-            let start_offsets = batch.column_by_name("start_offset")
+            let start_offsets = batch
+                .column_by_name("start_offset")
                 .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
 
-            let end_offsets = batch.column_by_name("end_offset")
+            let end_offsets = batch
+                .column_by_name("end_offset")
                 .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
 
-            if let (Some(ids), Some(texts), Some(sources), Some(indices), Some(starts), Some(ends)) =
-                (ids, texts, sources, chunk_indices, start_offsets, end_offsets)
-            {
-                for i in 0..ids.len().min(top_k - search_results.len()) {
+            // Extract similarity scores from _distance column
+            let distances = batch
+                .column_by_name("_distance")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::Float32Array>());
+
+            if let (
+                Some(ids),
+                Some(texts),
+                Some(sources),
+                Some(indices),
+                Some(starts),
+                Some(ends),
+            ) = (
+                ids,
+                texts,
+                sources,
+                chunk_indices,
+                start_offsets,
+                end_offsets,
+            ) {
+                for i in 0..ids.len() {
+                    // Convert distance to similarity (1 / (1 + distance) for cosine)
+                    let score = if let Some(dists) = distances {
+                        let distance = dists.value(i) as f64;
+                        // For cosine distance, convert to similarity
+                        1.0 / (1.0 + distance)
+                    } else {
+                        0.5 // Default if no distance available
+                    };
+
                     let chunk = DocumentChunk {
                         id: ids.value(i).to_string(),
                         text: texts.value(i).to_string(),
@@ -195,12 +249,12 @@ impl RagCore {
                         start_offset: starts.value(i) as usize,
                         end_offset: ends.value(i) as usize,
                     };
-                    search_results.push(SearchResult { score: 0.0, chunk });
+                    search_results.push(SearchResult { score, chunk });
                 }
             }
         }
 
-        Ok(search_results.into_iter().take(top_k).collect())
+        Ok(search_results)
     }
 
     pub async fn chunk_count(&self) -> Result<usize> {
