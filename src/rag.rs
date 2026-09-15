@@ -41,11 +41,7 @@ impl RagCore {
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
-                    Arc::new(Field::new(
-                        "item",
-                        DataType::Float32,
-                        true,
-                    )),
+                    Arc::new(Field::new("item", DataType::Float32, true)),
                     ndims,
                 ),
                 true,
@@ -101,8 +97,12 @@ impl RagCore {
 
         // Build vectors using from_iter_primitive
         use lancedb::arrow::arrow_array::types::Float32Type;
-        
-        let vectors = lancedb::arrow::arrow_array::FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+
+        let vectors = lancedb::arrow::arrow_array::FixedSizeListArray::from_iter_primitive::<
+            Float32Type,
+            _,
+            _,
+        >(
             embeddings_result.iter().map(|embedding| {
                 Some(
                     embedding
