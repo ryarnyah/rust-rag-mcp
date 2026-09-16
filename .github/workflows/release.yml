@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: tar -czf rust-rag-mcp-linux-x86_64.tar.gz -C target/release rust-rag-mcp
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rust-rag-mcp-linux-x86_64.tar.gz
