@@ -168,4 +168,4 @@ Add to `.vscode/mcp.json`:
 
 ## License
 
-MIT
+Apache-2.0
