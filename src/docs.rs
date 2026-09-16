@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub fn extract_text(path: &Path) -> Result<String> {
+pub async fn extract_text(path: &Path) -> Result<String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -13,7 +13,9 @@ pub fn extract_text(path: &Path) -> Result<String> {
         "docx" | "xlsx" | "pptx" => undoc::extract_text(path).context("extracting Office document"),
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "json"
         | "yaml" | "yml" | "toml" | "xml" | "csv" | "html" | "css" => {
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+            tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("reading {}", path.display()))
         }
         _ => Err(anyhow::anyhow!("Unsupported file format: {}", ext)),
     }
@@ -59,11 +61,11 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_extract_txt() {
+    #[tokio::test]
+    async fn test_extract_txt() {
         let mut f = NamedTempFile::with_suffix(".txt").unwrap();
         writeln!(f, "Hello, world!").unwrap();
-        let text = extract_text(f.path()).unwrap();
+        let text = extract_text(f.path()).await.unwrap();
         assert_eq!(text.trim(), "Hello, world!");
     }
 
@@ -79,9 +81,9 @@ mod tests {
         assert!(!supported_extension(Path::new("test.bin")));
     }
 
-    #[test]
-    fn test_unsupported_format() {
+    #[tokio::test]
+    async fn test_unsupported_format() {
         let f = NamedTempFile::with_suffix(".xyz").unwrap();
-        assert!(extract_text(f.path()).is_err());
+        assert!(extract_text(f.path()).await.is_err());
     }
 }

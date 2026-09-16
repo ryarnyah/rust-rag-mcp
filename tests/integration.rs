@@ -6,14 +6,14 @@ use tempfile::tempdir;
 
 const TEST_FIXTURES_DIR: &str = "../../test-fixtures";
 
-#[test]
-fn test_extract_sample_pdf() {
+#[tokio::test]
+async fn test_extract_sample_pdf() {
     let pdf_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.pdf");
     if !pdf_path.exists() {
         eprintln!("Skipping - sample.pdf not found");
         return;
     }
-    let text = docs::extract_text(&pdf_path).unwrap();
+    let text = docs::extract_text(&pdf_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real PDF");
     assert!(
         text.len() > 100,
@@ -22,14 +22,14 @@ fn test_extract_sample_pdf() {
     );
 }
 
-#[test]
-fn test_extract_sample_docx() {
+#[tokio::test]
+async fn test_extract_sample_docx() {
     let docx_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.docx");
     if !docx_path.exists() {
         eprintln!("Skipping - sample.docx not found");
         return;
     }
-    let text = docs::extract_text(&docx_path).unwrap();
+    let text = docs::extract_text(&docx_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real DOCX");
     assert!(
         text.len() > 50,
@@ -38,14 +38,14 @@ fn test_extract_sample_docx() {
     );
 }
 
-#[test]
-fn test_extract_sample_xlsx() {
+#[tokio::test]
+async fn test_extract_sample_xlsx() {
     let xlsx_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.xlsx");
     if !xlsx_path.exists() {
         eprintln!("Skipping - sample.xlsx not found");
         return;
     }
-    let text = docs::extract_text(&xlsx_path).unwrap();
+    let text = docs::extract_text(&xlsx_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real XLSX");
     assert!(
         text.len() > 10,
@@ -54,14 +54,14 @@ fn test_extract_sample_xlsx() {
     );
 }
 
-#[test]
-fn test_extract_sample_ppt() {
+#[tokio::test]
+async fn test_extract_sample_ppt() {
     let ppt_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.pptx");
     if !ppt_path.exists() {
         eprintln!("Skipping - sample.pptx not found");
         return;
     }
-    let text = docs::extract_text(&ppt_path).unwrap();
+    let text = docs::extract_text(&ppt_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real PPT");
     assert!(
         text.len() > 10,
@@ -70,14 +70,14 @@ fn test_extract_sample_ppt() {
     );
 }
 
-#[test]
-fn test_extract_txt_file() {
+#[tokio::test]
+async fn test_extract_txt_file() {
     let dir = tempdir().unwrap();
     let txt_path = dir.path().join("test.txt");
     let sample = fixtures::sample_text();
     std::fs::write(&txt_path, &sample).unwrap();
 
-    let text = docs::extract_text(&txt_path).unwrap();
+    let text = docs::extract_text(&txt_path).await.unwrap();
     assert!(text.contains("Rust is a systems programming language"));
     assert!(text.contains("tokio runtime"));
 }
@@ -116,12 +116,12 @@ fn test_supported_extensions() {
     )));
 }
 
-#[test]
-fn test_extract_unsupported_returns_error() {
+#[tokio::test]
+async fn test_extract_unsupported_returns_error() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.xyz");
     std::fs::write(&path, "data").unwrap();
-    assert!(docs::extract_text(&path).is_err());
+    assert!(docs::extract_text(&path).await.is_err());
 }
 
 #[test]

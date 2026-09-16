@@ -108,7 +108,7 @@ impl RagCore {
             self.delete_source(&source_path).await?;
         }
 
-        let text = docs::extract_text(path)?;
+        let text = docs::extract_text(path).await?;
         let chunks = self.chunker.chunk_text(&text, &source_path);
         let count = chunks.len();
         self.index_chunks(chunks).await?;
@@ -163,14 +163,9 @@ impl RagCore {
             _,
             _,
         >(
-            embeddings_result.iter().map(|embedding| {
-                Some(
-                    embedding
-                        .iter()
-                        .map(|v| Some(*v))
-                        .collect::<Vec<_>>(),
-                )
-            }),
+            embeddings_result
+                .iter()
+                .map(|embedding| Some(embedding.iter().map(|v| Some(*v)).collect::<Vec<_>>())),
             ndims,
         );
 
