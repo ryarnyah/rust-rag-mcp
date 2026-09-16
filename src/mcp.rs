@@ -2,8 +2,11 @@ use crate::docs;
 use crate::rag::RagCore;
 use crate::IndexResult;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::{
+    CallToolResult, ContentBlock, NumberOrString, ProgressNotificationParam, ProgressToken,
+};
+use rmcp::service::RequestContext;
+use rmcp::{schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -71,6 +74,7 @@ impl RagServer {
     async fn index_path(
         &self,
         Parameters(req): Parameters<IndexPathRequest>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let path = std::path::Path::new(&req.path);
         if !path.exists() {
@@ -80,10 +84,17 @@ impl RagServer {
             ))]));
         }
 
+        let progress_token = ctx
+            .meta
+            .get_key_value("progressToken")
+            .and_then(|(_, v)| serde_json::from_value::<NumberOrString>(v.clone()).ok())
+            .map(ProgressToken);
+
         let mut stack = vec![path.to_path_buf()];
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut errors = Vec::new();
+        let mut progress = 0u64;
 
         while let Some(current) = stack.pop() {
             if current.is_dir() {
@@ -108,6 +119,16 @@ impl RagServer {
                     Err(e) => {
                         errors.push(format!("Failed {}: {}", current.display(), e));
                     }
+                }
+                progress += 1;
+                if let Some(ref token) = progress_token {
+                    let _ = ctx
+                        .peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(token.clone(), progress as f64)
+                                .with_message(current.display().to_string()),
+                        )
+                        .await;
                 }
             }
         }
