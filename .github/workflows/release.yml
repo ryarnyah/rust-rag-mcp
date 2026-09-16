@@ -9,15 +9,37 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: tar -czf rust-rag-mcp-linux-x86_64.tar.gz -C target/release rust-rag-mcp
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: tar -czf rust-rag-mcp-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release rust-rag-mcp
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: 7z a rust-rag-mcp-${{ matrix.target }}.zip ./target/${{ matrix.target }}/release/rust-rag-mcp.exe
       - uses: softprops/action-gh-release@v2
         with:
-          files: rust-rag-mcp-linux-x86_64.tar.gz
+          files: rust-rag-mcp-${{ matrix.target }}.${{ matrix.archive }}
