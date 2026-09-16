@@ -151,8 +151,8 @@ async fn main() -> anyhow::Result<()> {
                 let mut stack = vec![path.to_path_buf()];
                 while let Some(current) = stack.pop() {
                     if current.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&current) {
-                            for entry in entries.flatten() {
+                        if let Ok(mut entries) = tokio::fs::read_dir(&current).await {
+                            while let Ok(Some(entry)) = entries.next_entry().await {
                                 let file_path = entry.path();
                                 stack.push(file_path);
                             }

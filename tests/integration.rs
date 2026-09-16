@@ -75,7 +75,7 @@ async fn test_extract_txt_file() {
     let dir = tempdir().unwrap();
     let txt_path = dir.path().join("test.txt");
     let sample = fixtures::sample_text();
-    std::fs::write(&txt_path, &sample).unwrap();
+    tokio::fs::write(&txt_path, &sample).await.unwrap();
 
     let text = docs::extract_text(&txt_path).await.unwrap();
     assert!(text.contains("Rust is a systems programming language"));
@@ -120,7 +120,7 @@ fn test_supported_extensions() {
 async fn test_extract_unsupported_returns_error() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.xyz");
-    std::fs::write(&path, "data").unwrap();
+    tokio::fs::write(&path, "data").await.unwrap();
     assert!(docs::extract_text(&path).await.is_err());
 }
 

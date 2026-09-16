@@ -79,8 +79,8 @@ impl RagCore {
         })
     }
 
-    fn compute_file_hash(path: &Path) -> Result<String> {
-        let bytes = std::fs::read(path)?;
+    async fn compute_file_hash(path: &Path) -> Result<String> {
+        let bytes = tokio::fs::read(path).await?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         Ok(hex::encode(hasher.finalize()))
@@ -99,7 +99,7 @@ impl RagCore {
             .to_string_lossy()
             .to_string();
 
-        let content_hash = Self::compute_file_hash(path)?;
+        let content_hash = Self::compute_file_hash(path).await?;
 
         if let Some(status) = self.document_status(&source_path).await? {
             if status.content_hash == content_hash {
