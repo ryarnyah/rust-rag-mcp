@@ -1,4 +1,5 @@
 use crate::rag::RagCore;
+use crate::IndexResult;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{schemars, tool, tool_router, ServerHandler};
@@ -28,32 +29,44 @@ impl RagServer {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexFileRequest {
-    #[schemars(description = "Path to the file to index")]
+    #[schemars(description = "Absolute or relative path to the file to index. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. If the file has already been indexed and has not been modified (content hash unchanged), indexing is skipped automatically.")]
     pub path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexTextRequest {
-    #[schemars(description = "Text content to index")]
+    #[schemars(description = "Raw text content to index. The text is chunked, embedded, and stored. If the same source was previously indexed with identical content, indexing is skipped.")]
     pub text: String,
-    #[schemars(description = "Source identifier for the text")]
+    #[schemars(description = "A unique identifier for this text (e.g. 'docs/api.md', 'clipboard', or any logical name). Used as the key for deduplication — re-indexing the same source with the same text is a no-op.")]
     pub source: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
-    #[schemars(description = "Search query")]
+    #[schemars(description = "Natural language search query. The query is embedded and compared against stored document chunks using cosine similarity.")]
     pub query: String,
-    #[schemars(description = "Number of results to return (default: 5)")]
+    #[schemars(description = "Maximum number of results to return. Higher values return more candidates but take longer. Default: 5.")]
     pub top_k: Option<usize>,
-    #[schemars(description = "Optional source filter")]
+    #[schemars(description = "Optional filter to restrict results to a specific source. Must match the exact source path used during indexing. Useful when searching within a single document.")]
     pub source_filter: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteSourceRequest {
+    #[schemars(description = "The full source path of the document to remove from the index. Must match the exact path used during indexing. All chunks and metadata for this source will be deleted.")]
+    pub source_path: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DocumentStatusRequest {
+    #[schemars(description = "The full source path of the document to check. Must match the exact path used during indexing.")]
+    pub source_path: String,
 }
 
 #[tool_router]
 impl RagServer {
     #[tool(
-        description = "Index a file (PDF, DOCX, XLSX, PPTX, TXT, etc.) into the RAG knowledge base"
+        description = "Index a file into the RAG knowledge base. The file is read, split into chunks, embedded using a local model, and stored in a vector database for semantic search. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. The file's content is hashed (SHA-256) — if the same file was already indexed and has not been modified, indexing is skipped and the response indicates 'unchanged'. If the file was modified, old chunks are removed and the file is re-indexed. Returns the number of chunks created, or a skip message."
     )]
     async fn index_file(
         &self,
@@ -61,21 +74,31 @@ impl RagServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = {
             let core = self.core.read().await;
-            core.index_file(PathBuf::from(req.path).as_path()).await
+            core.index_file(PathBuf::from(&req.path).as_path()).await
         };
         match result {
-            Ok(count) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Indexed {} chunks",
-                count
-            ))])),
+            Ok(IndexResult::Indexed(count)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Indexed '{}' — {} chunks created",
+                    req.path, count
+                ))]))
+            }
+            Ok(IndexResult::Skipped) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Skipped '{}' — file unchanged since last index",
+                    req.path
+                ))]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error indexing file: {}",
-                e
+                "Error indexing file '{}': {}",
+                req.path, e
             ))])),
         }
     }
 
-    #[tool(description = "Index raw text content into the RAG knowledge base")]
+    #[tool(
+        description = "Index raw text content into the RAG knowledge base. The text is split into chunks, embedded, and stored for semantic search. Use this for content that is not in a file (e.g. clipboard text, generated content, API responses). The source parameter serves as a unique key — re-indexing the same source with identical text is automatically skipped (deduplication via content hash). Returns the number of chunks created, or a skip message."
+    )]
     async fn index_text(
         &self,
         Parameters(req): Parameters<IndexTextRequest>,
@@ -85,18 +108,28 @@ impl RagServer {
             core.index_text(&req.text, &req.source).await
         };
         match result {
-            Ok(count) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Indexed {} chunks from '{}'",
-                count, req.source
-            ))])),
+            Ok(IndexResult::Indexed(count)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Indexed '{}' — {} chunks created",
+                    req.source, count
+                ))]))
+            }
+            Ok(IndexResult::Skipped) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Skipped '{}' — content unchanged since last index",
+                    req.source
+                ))]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error indexing text: {}",
-                e
+                "Error indexing text '{}': {}",
+                req.source, e
             ))])),
         }
     }
 
-    #[tool(description = "Search the RAG knowledge base using semantic similarity")]
+    #[tool(
+        description = "Search the RAG knowledge base using semantic similarity. The query is embedded into a vector and compared against all stored document chunks using cosine distance. Results are ranked by similarity score (0.0 to 1.0, where 1.0 is a perfect match). Each result includes the matching text chunk, its source document, chunk index, and similarity score. Use source_filter to restrict searches to a specific document."
+    )]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -135,16 +168,26 @@ impl RagServer {
         }
     }
 
-    #[tool(description = "List all indexed source files")]
+    #[tool(
+        description = "List all source documents currently indexed in the knowledge base. Returns one source path per line. These are the full absolute paths of files or logical source names used during indexing. Use this to see what is available for search or to get source paths for the document_status or delete_source tools."
+    )]
     async fn list_sources(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = {
             let core = self.core.read().await;
             core.list_sources().await
         };
         match result {
-            Ok(sources) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                sources.join("\n"),
-            )])),
+            Ok(sources) => {
+                if sources.is_empty() {
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        "No sources indexed.".to_string(),
+                    )]))
+                } else {
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        sources.join("\n"),
+                    )]))
+                }
+            }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error listing sources: {}",
                 e
@@ -152,7 +195,9 @@ impl RagServer {
         }
     }
 
-    #[tool(description = "Get the total number of indexed chunks")]
+    #[tool(
+        description = "Get the total number of indexed chunks across all documents. Each document is split into multiple chunks during indexing. This count reflects the total number of searchable units in the knowledge base."
+    )]
     async fn chunk_count(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = {
             let core = self.core.read().await;
@@ -170,12 +215,65 @@ impl RagServer {
         }
     }
 
-    #[tool(description = "List all available embedding models")]
+    #[tool(
+        description = "List all available embedding models that can be used with this server. Models are local (no API keys needed) and run via ONNX. Examples: Xenova/bge-small-en-v1.5 (default, fast, good quality), sentence-transformers/all-MiniLM-L6-v2 (fastest), Xenova/bge-large-en-v1.5 (higher quality, slower). The model is set at server startup via the --model flag."
+    )]
     async fn list_models(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let models = RagCore::list_embedding_models();
         Ok(CallToolResult::success(vec![ContentBlock::text(
             models.join("\n"),
         )]))
+    }
+
+    #[tool(
+        description = "Permanently remove all indexed chunks and metadata for a specific source document from the knowledge base. After deletion, the document will no longer appear in search results. The source_path must match exactly the path used during indexing (use list_sources to see current source paths). This operation cannot be undone — re-index the file to restore it."
+    )]
+    async fn delete_source(
+        &self,
+        Parameters(req): Parameters<DeleteSourceRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = {
+            let core = self.core.read().await;
+            core.delete_source(&req.source_path).await
+        };
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Deleted all chunks and metadata for '{}'",
+                req.source_path
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Error deleting source '{}': {}",
+                req.source_path, e
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Check the indexing status of a specific document. Returns the content hash (SHA-256), the timestamp when it was last indexed, and the number of chunks it was split into. Useful for verifying whether a document is up-to-date or needs re-indexing. Returns 'not found' if the source has not been indexed."
+    )]
+    async fn document_status(
+        &self,
+        Parameters(req): Parameters<DocumentStatusRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = {
+            let core = self.core.read().await;
+            core.document_status(&req.source_path).await
+        };
+        match result {
+            Ok(Some(status)) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                format!(
+                    "Source: {}\nContent hash: {}\nIndexed at: {}\nChunks: {}",
+                    status.source_path, status.content_hash, status.indexed_at, status.chunk_count
+                ),
+            )])),
+            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                format!("'{}' has not been indexed", req.source_path),
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Error checking status for '{}': {}",
+                req.source_path, e
+            ))])),
+        }
     }
 }
 

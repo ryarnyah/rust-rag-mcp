@@ -1,19 +1,20 @@
 use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
-use crate::{DocumentChunk, SearchResult};
+use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
 use anyhow::Result;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
-// Import arrow types from lancedb's re-export
 use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use lancedb::arrow::arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 pub struct RagCore {
     table: lancedb::Table,
+    metadata_table: lancedb::Table,
     embedding: EmbeddingService,
     chunker: Chunker,
 }
@@ -53,31 +54,91 @@ impl RagCore {
             Err(_) => db.create_empty_table(table_name, schema).execute().await?,
         };
 
+        let metadata_schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
+            Field::new("source_path", DataType::Utf8, false),
+            Field::new("content_hash", DataType::Utf8, true),
+            Field::new("indexed_at", DataType::Utf8, true),
+            Field::new("chunk_count", DataType::UInt32, true),
+        ]));
+
+        let metadata_table_name = "document_metadata";
+        let metadata_table = match db.open_table(metadata_table_name).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                db.create_empty_table(metadata_table_name, metadata_schema)
+                    .execute()
+                    .await?
+            }
+        };
+
         Ok(Self {
             table,
+            metadata_table,
             embedding,
             chunker: Chunker::new(chunk_size, overlap),
         })
     }
 
-    pub async fn index_file(&self, path: &Path) -> Result<usize> {
-        let text = docs::extract_text(path)?;
-        let source = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
-
-        let chunks = self.chunker.chunk_text(&text, &source);
-        let count = chunks.len();
-        self.index_chunks(chunks).await?;
-        Ok(count)
+    fn compute_file_hash(path: &Path) -> Result<String> {
+        let bytes = std::fs::read(path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Ok(hex::encode(hasher.finalize()))
     }
 
-    pub async fn index_text(&self, text: &str, source: &str) -> Result<usize> {
+    fn compute_text_hash(text: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
+        let source_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+
+        let content_hash = Self::compute_file_hash(path)?;
+
+        if let Some(status) = self.document_status(&source_path).await? {
+            if status.content_hash == content_hash {
+                return Ok(IndexResult::Skipped);
+            }
+            self.delete_source(&source_path).await?;
+        }
+
+        let text = docs::extract_text(path)?;
+        let chunks = self.chunker.chunk_text(&text, &source_path);
+        let count = chunks.len();
+        self.index_chunks(chunks).await?;
+
+        let now = chrono_free_timestamp();
+        self.upsert_metadata(&source_path, &content_hash, &now, count as u32)
+            .await?;
+
+        Ok(IndexResult::Indexed(count))
+    }
+
+    pub async fn index_text(&self, text: &str, source: &str) -> Result<IndexResult> {
+        let content_hash = Self::compute_text_hash(text);
+
+        if let Some(status) = self.document_status(source).await? {
+            if status.content_hash == content_hash {
+                return Ok(IndexResult::Skipped);
+            }
+            self.delete_source(source).await?;
+        }
+
         let chunks = self.chunker.chunk_text(text, source);
         let count = chunks.len();
         self.index_chunks(chunks).await?;
-        Ok(count)
+
+        let now = chrono_free_timestamp();
+        self.upsert_metadata(source, &content_hash, &now, count as u32)
+            .await?;
+
+        Ok(IndexResult::Indexed(count))
     }
 
     async fn index_chunks(&self, chunks: Vec<DocumentChunk>) -> Result<()> {
@@ -95,7 +156,6 @@ impl RagCore {
         let start_offsets: Vec<u64> = chunks.iter().map(|c| c.start_offset as u64).collect();
         let end_offsets: Vec<u64> = chunks.iter().map(|c| c.end_offset as u64).collect();
 
-        // Build vectors using from_iter_primitive
         use lancedb::arrow::arrow_array::types::Float32Type;
 
         let vectors = lancedb::arrow::arrow_array::FixedSizeListArray::from_iter_primitive::<
@@ -107,7 +167,7 @@ impl RagCore {
                 Some(
                     embedding
                         .iter()
-                        .map(|v| Some(*v as f32))
+                        .map(|v| Some(*v))
                         .collect::<Vec<_>>(),
                 )
             }),
@@ -152,7 +212,6 @@ impl RagCore {
         top_k: usize,
         source_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        // Generate query embedding
         let query_embedding_vec = self
             .embedding
             .embed_chunks(vec![DocumentChunk {
@@ -171,18 +230,14 @@ impl RagCore {
 
         let query_embedding = query_embedding_vec[0].clone();
 
-        // Perform vector search using lancedb's nearest_to
         let mut vector_query = self.table.query().nearest_to(query_embedding)?;
 
-        // Apply source filter if provided
         if let Some(filter) = source_filter {
             vector_query = vector_query.only_if(format!("source = '{}'", filter));
         }
 
-        // Limit results
         vector_query = vector_query.limit(top_k);
 
-        // Execute the query
         let results: Vec<RecordBatch> = vector_query.execute().await?.try_collect().await?;
 
         let mut search_results = Vec::new();
@@ -211,7 +266,6 @@ impl RagCore {
                 .column_by_name("end_offset")
                 .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
 
-            // Extract similarity scores from _distance column
             let distances = batch
                 .column_by_name("_distance")
                 .and_then(|col| col.as_any().downcast_ref::<arrow_array::Float32Array>());
@@ -232,13 +286,11 @@ impl RagCore {
                 end_offsets,
             ) {
                 for i in 0..ids.len() {
-                    // Convert distance to similarity (1 / (1 + distance) for cosine)
                     let score = if let Some(dists) = distances {
                         let distance = dists.value(i) as f64;
-                        // For cosine distance, convert to similarity
                         1.0 / (1.0 + distance)
                     } else {
-                        0.5 // Default if no distance available
+                        0.5
                     };
 
                     let chunk = DocumentChunk {
@@ -286,7 +338,94 @@ impl RagCore {
         Ok(v)
     }
 
+    pub async fn delete_source(&self, source_path: &str) -> Result<()> {
+        self.table
+            .delete(&format!("source = '{}'", source_path))
+            .await?;
+        self.metadata_table
+            .delete(&format!("source_path = '{}'", source_path))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn document_status(&self, source_path: &str) -> Result<Option<DocumentStatus>> {
+        let results: Vec<RecordBatch> = self
+            .metadata_table
+            .query()
+            .only_if(format!("source_path = '{}'", source_path))
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+
+        for batch in &results {
+            let source_paths = batch
+                .column_by_name("source_path")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+            let hashes = batch
+                .column_by_name("content_hash")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+            let timestamps = batch
+                .column_by_name("indexed_at")
+                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+            let counts = batch
+                .column_by_name("chunk_count")
+                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
+
+            if let (Some(sp), Some(h), Some(t), Some(c)) =
+                (source_paths, hashes, timestamps, counts)
+            {
+                if sp.len() > 0 {
+                    return Ok(Some(DocumentStatus {
+                        source_path: sp.value(0).to_string(),
+                        content_hash: h.value(0).to_string(),
+                        indexed_at: t.value(0).to_string(),
+                        chunk_count: c.value(0),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn upsert_metadata(
+        &self,
+        source_path: &str,
+        content_hash: &str,
+        indexed_at: &str,
+        chunk_count: u32,
+    ) -> Result<()> {
+        self.metadata_table
+            .delete(&format!("source_path = '{}'", source_path))
+            .await?;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
+                Field::new("source_path", DataType::Utf8, false),
+                Field::new("content_hash", DataType::Utf8, true),
+                Field::new("indexed_at", DataType::Utf8, true),
+                Field::new("chunk_count", DataType::UInt32, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![source_path])),
+                Arc::new(StringArray::from(vec![content_hash])),
+                Arc::new(StringArray::from(vec![indexed_at])),
+                Arc::new(UInt32Array::from(vec![chunk_count])),
+            ],
+        )?;
+
+        self.metadata_table.add(batch).execute().await?;
+        Ok(())
+    }
+
     pub fn list_embedding_models() -> Vec<String> {
         EmbeddingService::list_models()
     }
+}
+
+fn chrono_free_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}", d.as_secs()))
+        .unwrap_or_else(|_| "0".to_string())
 }

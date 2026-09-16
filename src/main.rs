@@ -31,7 +31,7 @@ enum Commands {
         overlap: usize,
     },
 
-    /// Index a file or directory
+    /// Index a file or directory (skips unchanged files automatically)
     Index {
         #[arg(required = true)]
         paths: Vec<String>,
@@ -78,6 +78,18 @@ enum Commands {
 
     /// Show index statistics
     Stats {
+        #[arg(long, default_value = ".rig-rag-db")]
+        db_path: String,
+
+        #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
+        model: String,
+    },
+
+    /// Remove a source document from the index
+    Delete {
+        /// Full source path to remove (use 'sources' command to list paths)
+        source_path: String,
+
         #[arg(long, default_value = ".rig-rag-db")]
         db_path: String,
 
@@ -136,7 +148,6 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Stack-based iterative directory traversal (avoids recursion limits)
                 let mut stack = vec![path.to_path_buf()];
                 while let Some(current) = stack.pop() {
                     if current.is_dir() {
@@ -148,8 +159,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                     } else if current.is_file() && docs::supported_extension(&current) {
                         match core.index_file(&current).await {
-                            Ok(count) => {
+                            Ok(rust_rag_mcp::IndexResult::Indexed(count)) => {
                                 println!("Indexed {}: {} chunks", current.display(), count)
+                            }
+                            Ok(rust_rag_mcp::IndexResult::Skipped) => {
+                                println!("Skipped {} (unchanged)", current.display())
                             }
                             Err(e) => eprintln!("Failed {}: {}", current.display(), e),
                         }
@@ -206,6 +220,18 @@ async fn main() -> anyhow::Result<()> {
             println!("Indexed sources: {}", sources.len());
             for source in &sources {
                 println!("  - {}", source);
+            }
+        }
+
+        Commands::Delete {
+            source_path,
+            db_path,
+            model,
+        } => {
+            let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
+            match core.delete_source(&source_path).await {
+                Ok(()) => println!("Deleted: {}", source_path),
+                Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),
             }
         }
 

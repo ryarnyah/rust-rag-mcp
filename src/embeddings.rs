@@ -23,6 +23,7 @@ impl EmbeddingService {
             "BAAI/bge-large-en-v1.5" => EmbeddingModel::BGELargeENV15,
             "Quantized BAAI/bge-large-en-v1.5" => EmbeddingModel::BGELargeENV15Q,
             "BAAI/bge-small-en-v1.5 - Default" => EmbeddingModel::BGESmallENV15,
+            "Xenova/bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15,
             "Quantized BAAI/bge-small-en-v1.5" => EmbeddingModel::BGESmallENV15Q,
             "nomic-ai/nomic-embed-text-v1" => EmbeddingModel::NomicEmbedTextV1,
             "nomic-ai/nomic-embed-text-v1.5" => EmbeddingModel::NomicEmbedTextV15,
@@ -194,7 +195,7 @@ mod tests {
     fn test_list_models() {
         let models = EmbeddingService::list_models();
         assert!(!models.is_empty());
-        assert!(models.contains(&"Xenova/bge-small-en-v1.5".to_string()));
+        assert!(models.contains(&"BAAI/bge-small-en-v1.5 - Default".to_string()));
     }
 
     #[test]
@@ -210,8 +211,8 @@ mod tests {
         assert!(svc.dimensions() > 0);
     }
 
-    #[test]
-    fn test_embed_chunks() {
+    #[tokio::test]
+    async fn test_embed_chunks() {
         let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5").unwrap();
         let chunks = vec![DocumentChunk {
             id: "1".to_string(),
@@ -221,7 +222,7 @@ mod tests {
             start_offset: 0,
             end_offset: 11,
         }];
-        let embeddings = svc.embed_chunks(chunks).unwrap();
+        let embeddings = svc.embed_chunks(chunks).await.unwrap();
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), svc.dimensions());
     }

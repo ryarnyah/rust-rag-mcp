@@ -21,3 +21,17 @@ pub struct SearchResult {
     pub score: f64,
     pub chunk: DocumentChunk,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IndexResult {
+    Indexed(usize),
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentStatus {
+    pub source_path: String,
+    pub content_hash: String,
+    pub indexed_at: String,
+    pub chunk_count: u32,
+}
