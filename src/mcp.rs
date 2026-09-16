@@ -2,7 +2,7 @@ use crate::rag::RagCore;
 use crate::IndexResult;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::{schemars, tool, tool_router, ServerHandler};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -277,6 +277,7 @@ impl RagServer {
     }
 }
 
+#[tool_handler]
 impl ServerHandler for RagServer {
     fn get_info(&self) -> rmcp::model::InitializeResult {
         rmcp::model::InitializeResult::new(
