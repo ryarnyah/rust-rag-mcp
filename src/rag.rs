@@ -8,7 +8,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array, Float32Array};
 use lancedb::arrow::arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -251,19 +251,19 @@ impl RagCore {
 
             let chunk_indices = batch
                 .column_by_name("chunk_index")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt32Array>());
+                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
 
             let start_offsets = batch
                 .column_by_name("start_offset")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
+                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
             let end_offsets = batch
                 .column_by_name("end_offset")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt64Array>());
+                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
 
             let distances = batch
                 .column_by_name("_distance")
-                .and_then(|col| col.as_any().downcast_ref::<arrow_array::Float32Array>());
+                .and_then(|col| col.as_any().downcast_ref::<Float32Array>());
 
             if let (
                 Some(ids),

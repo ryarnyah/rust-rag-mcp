@@ -12,8 +12,6 @@ path = "src/main.rs"
 [dependencies]
 fastembed = "7.0.1"
 lancedb = { version = "0.38", default-features = false, features = ["remote"] }
-arrow-array = "60"
-arrow-schema = "60"
 rmcp = { version = "3.1", features = [
     "server",
     "macros",
