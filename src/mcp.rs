@@ -1,9 +1,9 @@
+use crate::docs;
 use crate::rag::RagCore;
 use crate::IndexResult;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -28,8 +28,8 @@ impl RagServer {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct IndexFileRequest {
-    #[schemars(description = "Absolute or relative path to the file to index. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. If the file has already been indexed and has not been modified (content hash unchanged), indexing is skipped automatically.")]
+pub struct IndexPathRequest {
+    #[schemars(description = "Absolute or relative path to a file or directory to index. If a directory is given, all supported files within it (recursively) are indexed. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. Files unchanged since last index are skipped automatically.")]
     pub path: String,
 }
 
@@ -66,34 +66,61 @@ pub struct DocumentStatusRequest {
 #[tool_router]
 impl RagServer {
     #[tool(
-        description = "Index a file into the RAG knowledge base. The file is read, split into chunks, embedded using a local model, and stored in a vector database for semantic search. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. The file's content is hashed (SHA-256) — if the same file was already indexed and has not been modified, indexing is skipped and the response indicates 'unchanged'. If the file was modified, old chunks are removed and the file is re-indexed. Returns the number of chunks created, or a skip message."
+        description = "Index a file or directory into the RAG knowledge base. If a file is given, it is read, split into chunks, embedded using a local model, and stored for semantic search. If a directory is given, all supported files within it are indexed recursively. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. Files unchanged since last index are skipped automatically. Returns a summary of indexed, skipped, and failed files."
     )]
-    async fn index_file(
+    async fn index_path(
         &self,
-        Parameters(req): Parameters<IndexFileRequest>,
+        Parameters(req): Parameters<IndexPathRequest>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = {
-            let core = self.core.read().await;
-            core.index_file(PathBuf::from(&req.path).as_path()).await
-        };
-        match result {
-            Ok(IndexResult::Indexed(count)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Indexed '{}' — {} chunks created",
-                    req.path, count
-                ))]))
-            }
-            Ok(IndexResult::Skipped) => {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Skipped '{}' — file unchanged since last index",
-                    req.path
-                ))]))
-            }
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error indexing file '{}': {}",
-                req.path, e
-            ))])),
+        let path = std::path::Path::new(&req.path);
+        if !path.exists() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "Path not found: {}",
+                req.path
+            ))]));
         }
+
+        let mut stack = vec![path.to_path_buf()];
+        let mut indexed = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        while let Some(current) = stack.pop() {
+            if current.is_dir() {
+                if let Ok(mut entries) = tokio::fs::read_dir(&current).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        stack.push(entry.path());
+                    }
+                }
+            } else if current.is_file() && docs::supported_extension(&current) {
+                let result = {
+                    let core = self.core.read().await;
+                    core.index_file(&current).await
+                };
+                match result {
+                    Ok(IndexResult::Indexed(count)) => {
+                        indexed += 1;
+                        errors.push(format!("Indexed {} — {} chunks", current.display(), count));
+                    }
+                    Ok(IndexResult::Skipped) => {
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed {}: {}", current.display(), e));
+                    }
+                }
+            }
+        }
+
+        let mut output = format!(
+            "Done. Indexed: {}, Skipped (unchanged): {}",
+            indexed, skipped
+        );
+        if !errors.is_empty() {
+            output.push('\n');
+            output.push_str(&errors.join("\n"));
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     #[tool(
