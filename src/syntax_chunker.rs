@@ -173,12 +173,7 @@ pub fn language_for_extension(ext: &str) -> Option<Language> {
         "js" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "ts" | "tsx" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
-        "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        "cpp" | "cc" | "cxx" | "hpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
-        "html" | "htm" => Some(tree_sitter_html::LANGUAGE.into()),
-        "css" | "scss" => Some(tree_sitter_css::LANGUAGE.into()),
-        "json" | "jsonc" => Some(tree_sitter_json::LANGUAGE.into()),
         _ => None,
     }
 }

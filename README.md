@@ -57,12 +57,7 @@ This produces higher-quality embeddings for code search.
 | JavaScript  | `.js`, `.jsx`           |
 | TypeScript  | `.ts`, `.tsx`           |
 | Go          | `.go`                   |
-| Java        | `.java`                 |
 | C           | `.c`, `.h`              |
-| C++         | `.cpp`, `.cc`, `.cxx`, `.hpp` |
-| HTML        | `.html`, `.htm`         |
-| CSS         | `.css`, `.scss`         |
-| JSON        | `.json`, `.jsonc`        |
 
 Non-code files (PDF, DOCX, plain text, etc.) fall back to word-count chunking.
 
