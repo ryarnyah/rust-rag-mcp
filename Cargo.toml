@@ -10,10 +10,10 @@ name = "rust-rag-mcp"
 path = "src/main.rs"
 
 [dependencies]
-fastembed = "6.1"
+fastembed = "7.0.1"
 lancedb = { version = "0.38", default-features = false, features = ["remote"] }
-arrow-array = "59"
-arrow-schema = "59"
+arrow-array = "60"
+arrow-schema = "60"
 rmcp = { version = "3.1", features = [
     "server",
     "macros",
@@ -31,7 +31,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 chardetng = "1.0"
 encoding_rs = "0.8"
@@ -40,8 +40,10 @@ encoding_rs = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 
-#[profile.release]
-#opt-level = 3
-#lto = true
-#codegen-units = 1
-#strip = true
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false
