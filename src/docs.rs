@@ -1,6 +1,40 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+async fn read_text_with_encoding_detection(path: &Path) -> Result<String> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(text.to_string());
+    }
+
+    let mut detector =
+        chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(&bytes, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
+
+    let (cow, _, had_errors) = encoding.decode(&bytes);
+    if !had_errors {
+        return Ok(cow.into_owned());
+    }
+
+    let (cow, _, had_errors) = encoding_rs::UTF_8.decode(&bytes);
+    if !had_errors {
+        return Ok(cow.into_owned());
+    }
+
+    Err(anyhow::anyhow!(
+        "Could not detect encoding for {}",
+        path.display()
+    ))
+}
+
 pub async fn extract_text(path: &Path) -> Result<String> {
     let ext = path
         .extension()
@@ -13,9 +47,7 @@ pub async fn extract_text(path: &Path) -> Result<String> {
         "docx" | "xlsx" | "pptx" => undoc::extract_text(path).context("extracting Office document"),
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "json"
         | "yaml" | "yml" | "toml" | "xml" | "csv" | "html" | "css" => {
-            tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("reading {}", path.display()))
+            read_text_with_encoding_detection(path).await
         }
         _ => Err(anyhow::anyhow!("Unsupported file format: {}", ext)),
     }
