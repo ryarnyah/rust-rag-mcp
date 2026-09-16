@@ -14,8 +14,7 @@ async fn read_text_with_encoding_detection(path: &Path) -> Result<String> {
         return Ok(text.to_string());
     }
 
-    let mut detector =
-        chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
     detector.feed(&bytes, true);
     let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
 

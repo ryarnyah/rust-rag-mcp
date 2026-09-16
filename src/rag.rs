@@ -1,6 +1,7 @@
 use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
+use crate::syntax_chunker::{language_for_extension, SyntaxChunker};
 use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
 use anyhow::Result;
 use futures::TryStreamExt;
@@ -8,7 +9,9 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array, Float32Array};
+use lancedb::arrow::arrow_array::{
+    Array, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use lancedb::arrow::arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -17,6 +20,7 @@ pub struct RagCore {
     metadata_table: lancedb::Table,
     embedding: EmbeddingService,
     chunker: Chunker,
+    syntax_chunker: SyntaxChunker,
 }
 
 impl RagCore {
@@ -76,6 +80,7 @@ impl RagCore {
             metadata_table,
             embedding,
             chunker: Chunker::new(chunk_size, overlap),
+            syntax_chunker: SyntaxChunker::new(chunk_size, overlap),
         })
     }
 
@@ -109,7 +114,18 @@ impl RagCore {
         }
 
         let text = docs::extract_text(path).await?;
-        let chunks = self.chunker.chunk_text(&text, &source_path);
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let chunks = if language_for_extension(&ext).is_some() {
+            self.syntax_chunker.chunk_text(&text, &source_path)
+        } else {
+            self.chunker.chunk_text(&text, &source_path)
+        };
         let count = chunks.len();
         self.index_chunks(chunks).await?;
 
@@ -130,7 +146,13 @@ impl RagCore {
             self.delete_source(source).await?;
         }
 
-        let chunks = self.chunker.chunk_text(text, source);
+        let ext = source.rsplit('.').next().unwrap_or("").to_lowercase();
+
+        let chunks = if language_for_extension(&ext).is_some() {
+            self.syntax_chunker.chunk_text(text, source)
+        } else {
+            self.chunker.chunk_text(text, source)
+        };
         let count = chunks.len();
         self.index_chunks(chunks).await?;
 

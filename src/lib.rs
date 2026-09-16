@@ -3,6 +3,7 @@ pub mod docs;
 pub mod embeddings;
 pub mod mcp;
 pub mod rag;
+pub mod syntax_chunker;
 
 use serde::{Deserialize, Serialize};
 

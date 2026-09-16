@@ -32,37 +32,53 @@ impl RagServer {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexPathRequest {
-    #[schemars(description = "Absolute or relative path to a file or directory to index. If a directory is given, all supported files within it (recursively) are indexed. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. Files unchanged since last index are skipped automatically.")]
+    #[schemars(
+        description = "Absolute or relative path to a file or directory to index. If a directory is given, all supported files within it (recursively) are indexed. Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. Files unchanged since last index are skipped automatically."
+    )]
     pub path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexTextRequest {
-    #[schemars(description = "Raw text content to index. The text is chunked, embedded, and stored. If the same source was previously indexed with identical content, indexing is skipped.")]
+    #[schemars(
+        description = "Raw text content to index. The text is chunked, embedded, and stored. If the same source was previously indexed with identical content, indexing is skipped."
+    )]
     pub text: String,
-    #[schemars(description = "A unique identifier for this text (e.g. 'docs/api.md', 'clipboard', or any logical name). Used as the key for deduplication — re-indexing the same source with the same text is a no-op.")]
+    #[schemars(
+        description = "A unique identifier for this text (e.g. 'docs/api.md', 'clipboard', or any logical name). Used as the key for deduplication — re-indexing the same source with the same text is a no-op."
+    )]
     pub source: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
-    #[schemars(description = "Natural language search query. The query is embedded and compared against stored document chunks using cosine similarity.")]
+    #[schemars(
+        description = "Natural language search query. The query is embedded and compared against stored document chunks using cosine similarity."
+    )]
     pub query: String,
-    #[schemars(description = "Maximum number of results to return. Higher values return more candidates but take longer. Default: 5.")]
+    #[schemars(
+        description = "Maximum number of results to return. Higher values return more candidates but take longer. Default: 5."
+    )]
     pub top_k: Option<usize>,
-    #[schemars(description = "Optional filter to restrict results to a specific source. Must match the exact source path used during indexing. Useful when searching within a single document.")]
+    #[schemars(
+        description = "Optional filter to restrict results to a specific source. Must match the exact source path used during indexing. Useful when searching within a single document."
+    )]
     pub source_filter: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteSourceRequest {
-    #[schemars(description = "The full source path of the document to remove from the index. Must match the exact path used during indexing. All chunks and metadata for this source will be deleted.")]
+    #[schemars(
+        description = "The full source path of the document to remove from the index. Must match the exact path used during indexing. All chunks and metadata for this source will be deleted."
+    )]
     pub source_path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DocumentStatusRequest {
-    #[schemars(description = "The full source path of the document to check. Must match the exact path used during indexing.")]
+    #[schemars(
+        description = "The full source path of the document to check. Must match the exact path used during indexing."
+    )]
     pub source_path: String,
 }
 
@@ -308,15 +324,14 @@ impl RagServer {
             core.document_status(&req.source_path).await
         };
         match result {
-            Ok(Some(status)) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                format!(
-                    "Source: {}\nContent hash: {}\nIndexed at: {}\nChunks: {}",
-                    status.source_path, status.content_hash, status.indexed_at, status.chunk_count
-                ),
-            )])),
-            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                format!("'{}' has not been indexed", req.source_path),
-            )])),
+            Ok(Some(status)) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Source: {}\nContent hash: {}\nIndexed at: {}\nChunks: {}",
+                status.source_path, status.content_hash, status.indexed_at, status.chunk_count
+            ))])),
+            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "'{}' has not been indexed",
+                req.source_path
+            ))])),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error checking status for '{}': {}",
                 req.source_path, e
