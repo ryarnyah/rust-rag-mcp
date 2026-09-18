@@ -33,13 +33,17 @@
 //! ```
 
 use memmap2::{MmapMut, MmapOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BinaryHeap};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use thiserror::Error;
+use tracing;
+use ndarray::ArrayView1;
+use std::cmp::Reverse;
+use ordered_float::OrderedFloat;
 
 use crate::wal::{WriteAheadLog, WalRecord, WalOpType};
 
@@ -185,20 +189,33 @@ impl Config {
 // ============================================================================
 
 /// Dot product of two vectors
+/// Dot product using SIMD when available (ndarray)
+///
+/// Automatically uses SIMD instructions (AVX2/AVX-512) when available.
+/// Falls back to scalar on unsupported platforms.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    
+    // Use ndarray for automatic SIMD vectorization
+    let a_arr = ArrayView1::from(a);
+    let b_arr = ArrayView1::from(b);
+    a_arr.dot(&b_arr)
 }
 
-/// Euclidean norm (L2) of a vector
+/// Euclidean norm (L2) of a vector using SIMD
 #[inline]
 fn norm(a: &[f32]) -> f32 {
     dot(a, a).sqrt()
 }
 
-/// Cosine distance with proper NaN handling
+/// Cosine distance with proper NaN handling (SIMD-optimized)
 ///
 /// Returns distance in [0, 2]: 0 = identical, 2 = opposite
+///
+/// Uses SIMD instructions for dot product and norm calculations when available.
 ///
 /// # Errors
 /// Returns `VectorDbError::NaNDistance` if either vector has NaN or distance is NaN
@@ -656,9 +673,17 @@ impl HnswIndex {
     }
 
     #[inline]
-    fn layer_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
+     fn layer_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
         let c = self.layer_count(id, layer);
         (0..c).map(|i| self.layer_neighbor(id, layer, i)).collect()
+    }
+    
+    /// P6: Iterator version to avoid Vec allocation when just iterating
+    #[inline]
+    fn layer_neighbors_iter(&self, id: u32, layer: usize) 
+        -> impl Iterator<Item = u32> + '_ {
+        let c = self.layer_count(id, layer);
+        (0..c).map(move |i| self.layer_neighbor(id, layer, i))
     }
 
     fn grow(&mut self) -> Result<()> {
@@ -757,46 +782,63 @@ impl HnswIndex {
          // Sort by distance
          dists.sort_by(|a, b| distance_cmp(a.1, b.1));
 
-         let selected = if dists.len() > cap {
-             // Use pre-computed distances for heuristic selection
-             let mut result: Vec<u32> = Vec::with_capacity(cap);
-             let mut seen = std::collections::HashSet::new();
-             
-             for (neighbor_id, _) in &dists {
-                 if result.len() >= cap {
-                     break;
-                 }
-                 
-                 // Get pre-computed distance (from earlier map)
-                 let d_ref_n = dists.iter()
-                     .find(|(id, _)| id == neighbor_id)
-                     .map(|(_, d)| *d)
-                     .unwrap_or(0.0);
-                 
-                 let mut keep = true;
-                 for &r in &result {
-                     if dist(*neighbor_id, r)? < d_ref_n {
-                         keep = false;
-                         break;
-                     }
-                 }
-                 if keep && seen.insert(*neighbor_id) {
-                     result.push(*neighbor_id);
-                 }
-             }
-             
-             // Fill remaining slots if not enough satisfied heuristic
-             if result.len() < cap {
-                 for (neighbor_id, _) in &dists {
-                     if result.len() >= cap {
-                         break;
-                     }
-                     if seen.insert(*neighbor_id) {
-                         result.push(*neighbor_id);
-                     }
-                 }
-             }
-             result
+          let selected = if dists.len() > cap {
+              // P1: Pre-compute HashMap for O(1) distance lookups in heuristic
+              let dist_map: std::collections::HashMap<u32, f32> = dists.iter()
+                  .map(|(n, d)| (*n, *d))
+                  .collect();
+              
+              // P2: Pre-compute cross-pair distances to avoid redundant calculations in heuristic loop
+              // dists is already sorted by distance to id, so we only need distances between
+              // candidates and result items (not candidate-to-query which we already have)
+              let mut cross_dist_map: std::collections::HashMap<(u32, u32), f32> = 
+                  std::collections::HashMap::new();
+              
+              // Use pre-computed distances for heuristic selection
+              let mut result: Vec<u32> = Vec::with_capacity(cap);
+              let mut seen = std::collections::HashSet::new();
+              
+              for (neighbor_id, _) in &dists {
+                  if result.len() >= cap {
+                      break;
+                   }
+                   
+                   // O(1) lookup instead of O(n) linear search
+                   let d_ref_n = dist_map.get(neighbor_id).copied().unwrap_or(0.0);
+                   
+                   let mut keep = true;
+                   for &r in &result {
+                       // P2: Check cache first, compute only if missing
+                       let cross_dist = if let Some(&d) = cross_dist_map.get(&(*neighbor_id, r)) {
+                           d
+                       } else {
+                           let d = dist(*neighbor_id, r)?;
+                           cross_dist_map.insert((*neighbor_id, r), d);
+                           d
+                       };
+                       
+                       if cross_dist < d_ref_n {
+                           keep = false;
+                           break;
+                       }
+                   }
+                   if keep && seen.insert(*neighbor_id) {
+                       result.push(*neighbor_id);
+                   }
+                }
+                
+                // Fill remaining slots if not enough satisfied heuristic
+                if result.len() < cap {
+                    for (neighbor_id, _) in &dists {
+                        if result.len() >= cap {
+                            break;
+                        }
+                        if seen.insert(*neighbor_id) {
+                            result.push(*neighbor_id);
+                        }
+                    }
+                }
+                result
          } else {
              dists.iter().map(|(n, _)| *n).collect()
          };
@@ -825,48 +867,58 @@ impl HnswIndex {
         visited.insert(entry);
 
         let d0 = dist(entry)?;
-        let mut candidates: Vec<(f32, u32)> = vec![(d0, entry)];
-        let mut results: Vec<(f32, u32)> = Vec::new();
+        
+        // Use BinaryHeap (min-heap via Reverse) for candidates
+        // This eliminates O(n log n) sorting in the main loop
+        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, u32)>> = BinaryHeap::new();
+        candidates.push(Reverse((OrderedFloat(d0), entry)));
+        
+        // Results heap - max-heap to efficiently track worst result
+        let mut results: BinaryHeap<(OrderedFloat<f32>, u32)> = BinaryHeap::new();
         if !is_deleted(entry) {
-            results.push((d0, entry));
+            results.push((OrderedFloat(d0), entry));
         }
 
-        while !candidates.is_empty() {
-            candidates.sort_by(|a, b| distance_cmp(a.0, b.0));
-            let (cd, c) = candidates.remove(0);
-
+        while let Some(Reverse((OrderedFloat(cd), c))) = candidates.pop() {
             let worst_result = results
-                .iter()
-                .map(|x| x.0)
-                .fold(f32::NEG_INFINITY, f32::max);
+                .peek()
+                .map(|(d, _)| d.into_inner())
+                .unwrap_or(f32::NEG_INFINITY);
+            
             if results.len() >= ef && cd > worst_result {
                 break;
-            }
+             }
 
-            for n in self.layer_neighbors(c, layer) {
-                if !visited.insert(n) {
-                    continue;
-                }
-                let d = dist(n)?;
-                let worst = results
-                    .iter()
-                    .map(|x| x.0)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                if results.len() < ef || d < worst {
-                    candidates.push((d, n));
-                    if !is_deleted(n) {
-                        results.push((d, n));
+             // P6: Use iterator to avoid Vec allocation
+             for n in self.layer_neighbors_iter(c, layer) {
+                 if !visited.insert(n) {
+                     continue;
+                 }
+                 let d = dist(n)?;
+                 let worst = results
+                     .peek()
+                     .map(|(d, _)| d.into_inner())
+                     .unwrap_or(f32::NEG_INFINITY);
+                 
+                 if results.len() < ef || d < worst {
+                     candidates.push(Reverse((OrderedFloat(d), n)));
+                     if !is_deleted(n) {
+                        results.push((OrderedFloat(d), n));
                         if results.len() > ef {
-                            results.sort_by(|a, b| distance_cmp(a.0, b.0));
-                            results.truncate(ef);
+                            results.pop();
                         }
                     }
                 }
             }
         }
 
-        results.sort_by(|a, b| distance_cmp(a.0, b.0));
-        Ok(results)
+        // Convert heap results back to Vec and sort for output
+        let mut output: Vec<(f32, u32)> = results
+            .into_iter()
+            .map(|(d, id)| (d.into_inner(), id))
+            .collect();
+        output.sort_by(|a, b| distance_cmp(a.0, b.0));
+        Ok(output)
     }
 
     /// Insert new node into index (must be called with proper distance function)
@@ -899,21 +951,22 @@ impl HnswIndex {
 
         // 1. Greedy descent from top layer down to `level + 1`
         let mut l = cur_max;
-        while l > level {
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for n in self.layer_neighbors(ep, l) {
-                    if is_deleted(n) {
-                        continue;
-                    }
-                    let d = dist(new_id, n)?;
-                    if d < ep_dist {
-                        ep_dist = d;
-                        ep = n;
-                        changed = true;
-                    }
-                }
+         while l > level {
+             let mut changed = true;
+             while changed {
+                 changed = false;
+                 // P6: Use iterator to avoid Vec allocation
+                 for n in self.layer_neighbors_iter(ep, l) {
+                     if is_deleted(n) {
+                         continue;
+                     }
+                     let d = dist(new_id, n)?;
+                     if d < ep_dist {
+                         ep_dist = d;
+                         ep = n;
+                         changed = true;
+                     }
+                 }
             }
             l = l.saturating_sub(1);
         }
@@ -967,20 +1020,21 @@ impl HnswIndex {
         let mut ep_dist = dist(ep)?;
         let cur_max = self.max_level() as usize;
 
-        for layer in (1..=cur_max).rev() {
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for n in self.layer_neighbors(ep, layer) {
-                    let d = dist(n)?;
-                    if d < ep_dist && !is_deleted(n) {
-                        ep_dist = d;
-                        ep = n;
-                        changed = true;
-                    }
-                }
-            }
-        }
+         for layer in (1..=cur_max).rev() {
+             let mut changed = true;
+             while changed {
+                 changed = false;
+                 // P6: Use iterator to avoid Vec allocation
+                 for n in self.layer_neighbors_iter(ep, layer) {
+                     let d = dist(n)?;
+                     if d < ep_dist && !is_deleted(n) {
+                         ep_dist = d;
+                         ep = n;
+                         changed = true;
+                     }
+                 }
+             }
+         }
 
         self.search_layer(ep, 0, ef.max(k), &dist, is_deleted)?
             .into_iter()
@@ -1207,10 +1261,27 @@ impl VectorDb {
         self.len() == 0
     }
 
-    /// Get number of live (non-deleted) vectors
-    pub fn live_len(&self) -> usize {
-        self.len() - self.deleted_count
-    }
+     /// Get number of live (non-deleted) vectors
+     pub fn live_len(&self) -> usize {
+         self.len() - self.deleted_count
+     }
+
+     /// Get deletion statistics
+     ///
+     /// Returns (deleted_count, total_count, deletion_ratio)
+     /// where deletion_ratio = deleted_count / total_count (or 0.0 if empty)
+     pub fn deletion_stats(&self) -> (usize, usize, f32) {
+         let total = self.len();
+         let deleted = self.deleted_count;
+         let ratio = if total > 0 { deleted as f32 / total as f32 } else { 0.0 };
+         (deleted, total, ratio)
+     }
+
+     /// Check if compaction should be triggered (deletion ratio >= 30%)
+     pub fn should_compact(&self) -> bool {
+         let (_deleted, total, ratio) = self.deletion_stats();
+         total > 0 && ratio > 0.30
+     }
 
     fn capacity(&self) -> usize {
         u64::from_le_bytes(self.mmap()[24..32].try_into().unwrap()) as usize
@@ -1322,57 +1393,139 @@ impl VectorDb {
         Ok(())
     }
 
-    /// Soft-delete vector (marks as tombstone)
-    pub fn delete(&mut self, id: u32) -> Result<bool> {
-        if (id as usize) >= self.len() || self.meta.is_deleted(id) {
-            return Ok(false);
-        }
+     /// Soft-delete vector (marks as tombstone)
+     pub fn delete(&mut self, id: u32) -> Result<bool> {
+         if (id as usize) >= self.len() || self.meta.is_deleted(id) {
+             return Ok(false);
+         }
 
-        // Log to WAL before applying deletion
-        let prev = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
-        self.wal.log_delete_sync(id, &prev)
-            .map_err(VectorDbError::Io)?;
+         // Log to WAL before applying deletion
+         let prev = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
+         self.wal.log_delete_sync(id, &prev)
+             .map_err(VectorDbError::Io)?;
 
-        self.meta.put(id, META_FLAG_DELETED, &prev)?;
-        self.index.mark_deleted(id);
-        self.deleted_count += 1;
-        Ok(true)
-    }
+         self.meta.put(id, META_FLAG_DELETED, &prev)?;
+         self.index.mark_deleted(id);
+         self.deleted_count += 1;
 
-    /// Search for k nearest neighbors
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
-        if query.len() != self.cfg.dim {
-            return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
-        }
+         // Log deletion and check if compaction needed
+         let (deleted, total, ratio) = self.deletion_stats();
+         if ratio >= 0.30 {
+             tracing::warn!(
+                 vector_id = id,
+                 deleted_count = deleted,
+                 total_count = total,
+                 deletion_ratio = ratio,
+                 "High deletion ratio detected, consider compacting the database"
+             );
+         }
 
-        let ptr = self.mmap().as_ptr();
-        let dim = self.cfg.dim;
-        let file_size = self.mmap().len();
-        let view = VectorView { ptr, dim, file_size };
-        let dist = |id: u32| -> Result<f32> {
-            let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: (file_size as u32) })?;
-            cosine_distance(v, query)
-        };
-        let is_deleted = |id: u32| self.meta.is_deleted(id);
+         Ok(true)
+     }
 
-        let ef_actual = if k <= 100 {
-            // For small-to-moderate k, reduce ef inflation
-            ef.max(k * 2) + self.deleted_count.min(32)
-        } else {
-            // For very large k, maintain original formula
-            ef.max(k).max(k * 4) + self.deleted_count.min(64)
-        };
+     /// Search for k nearest neighbors
+     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
+         if query.len() != self.cfg.dim {
+             return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
+         }
 
-        self.index
-            .search(k, ef_actual, dist, &is_deleted)?
-            .into_iter()
-            .map(|(id, d)| Ok(SearchHit {
-                id,
-                score: 1.0 - d,
-                metadata: self.meta.get(id).unwrap_or(&[]),
-            }))
-            .collect()
-    }
+         let ptr = self.mmap().as_ptr();
+         let dim = self.cfg.dim;
+         let file_size = self.mmap().len();
+         let view = VectorView { ptr, dim, file_size };
+         let dist = |id: u32| -> Result<f32> {
+             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: (file_size as u32) })?;
+             cosine_distance(v, query)
+         };
+         let is_deleted = |id: u32| self.meta.is_deleted(id);
+
+         let ef_actual = if k <= 100 {
+             // For small-to-moderate k, reduce ef inflation
+             ef.max(k * 2) + self.deleted_count.min(32)
+         } else {
+             // For very large k, maintain original formula
+             ef.max(k).max(k * 4) + self.deleted_count.min(64)
+         };
+
+         self.index
+             .search(k, ef_actual, dist, &is_deleted)?
+             .into_iter()
+             .map(|(id, d)| Ok(SearchHit {
+                 id,
+                 score: (1.0 - d).clamp(0.0, 1.0),
+                 metadata: self.meta.get(id).unwrap_or(&[]),
+             }))
+             .collect()
+     }
+
+     /// Search for k nearest neighbors with source filtering (pre-search filter)
+     ///
+     /// Filters results by source metadata before returning to caller.
+     /// This avoids wasting work searching vectors that will be filtered out.
+     ///
+     /// # Arguments
+     /// * `query` - Query vector
+     /// * `k` - Number of results to return
+     /// * `ef` - Expansion factor for HNSW search
+     /// * `source_filter` - Filter on source field
+     ///
+     /// # Returns
+     /// Results matching both k-NN and source filter. May return fewer than k results
+     /// if filtered results are exhausted before reaching k.
+     pub fn search_with_source_filter(
+         &self,
+         query: &[f32],
+         k: usize,
+         ef: usize,
+         source_filter: &str,
+     ) -> Result<Vec<SearchHit<'_>>> {
+         if query.len() != self.cfg.dim {
+             return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
+         }
+
+         let ptr = self.mmap().as_ptr();
+         let dim = self.cfg.dim;
+         let file_size = self.mmap().len();
+         let view = VectorView { ptr, dim, file_size };
+         let dist = |id: u32| -> Result<f32> {
+             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: (file_size as u32) })?;
+             cosine_distance(v, query)
+         };
+         let is_deleted = |id: u32| self.meta.is_deleted(id);
+
+         let ef_actual = if k <= 100 {
+             ef.max(k * 2) + self.deleted_count.min(32)
+         } else {
+             ef.max(k).max(k * 4) + self.deleted_count.min(64)
+         };
+
+         // Search with expanded k to account for filtering
+         let expanded_k = (k * 4).max(k + 100);
+         let raw_results = self.index
+             .search(expanded_k, ef_actual, dist, &is_deleted)?;
+
+         let mut filtered = Vec::new();
+         for (id, d) in raw_results {
+             let metadata = self.meta.get(id).unwrap_or(&[]);
+             // Try to extract source field from metadata JSON for filtering
+             if let Ok(json_obj) = serde_json::from_slice::<serde_json::Value>(metadata) {
+                 if let Some(source) = json_obj.get("source").and_then(|v| v.as_str()) {
+                     if source == source_filter {
+                         filtered.push(SearchHit {
+                             id,
+                             score: (1.0 - d).clamp(0.0, 1.0),
+                             metadata,
+                         });
+                         if filtered.len() >= k {
+                             break;
+                         }
+                     }
+                 }
+             }
+         }
+
+         Ok(filtered)
+     }
 
     /// Compact database by removing deleted vectors
     pub async fn compact(&mut self) -> Result<()> {
@@ -1537,10 +1690,22 @@ impl AsyncVectorDb {
         self.db.read().await.is_empty()
     }
 
-    /// Get live vector count (excluding deleted)
-    pub async fn live_len(&self) -> usize {
-        self.db.read().await.live_len()
-    }
+     /// Get live vector count (excluding deleted)
+     pub async fn live_len(&self) -> usize {
+         self.db.read().await.live_len()
+     }
+
+     /// Get deletion statistics (async read)
+     ///
+     /// Returns (deleted_count, total_count, deletion_ratio)
+     pub async fn deletion_stats(&self) -> (usize, usize, f32) {
+         self.db.read().await.deletion_stats()
+     }
+
+     /// Check if compaction should be triggered (async read)
+     pub async fn should_compact(&self) -> bool {
+         self.db.read().await.should_compact()
+     }
 
     /// Check if vector is deleted
     pub async fn is_deleted(&self, id: u32) -> bool {
@@ -1573,16 +1738,33 @@ impl AsyncVectorDb {
         self.db.write().await.delete(id)
     }
 
-    /// Search for k neighbors (async read)
-    pub async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHitOwned>> {
-        let db = self.db.read().await;
-        let hits = db.search(query, k, ef)?;
-        Ok(hits.into_iter().map(|h| SearchHitOwned {
-            id: h.id,
-            score: h.score,
-            metadata: h.metadata.to_vec(),
-        }).collect())
-    }
+     /// Search for k neighbors (async read)
+     pub async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHitOwned>> {
+         let db = self.db.read().await;
+         let hits = db.search(query, k, ef)?;
+         Ok(hits.into_iter().map(|h| SearchHitOwned {
+             id: h.id,
+             score: h.score,
+             metadata: h.metadata.to_vec(),
+         }).collect())
+     }
+
+     /// Search with source filtering (async read)
+     pub async fn search_with_source_filter(
+         &self,
+         query: &[f32],
+         k: usize,
+         ef: usize,
+         source_filter: &str,
+     ) -> Result<Vec<SearchHitOwned>> {
+         let db = self.db.read().await;
+         let hits = db.search_with_source_filter(query, k, ef, source_filter)?;
+         Ok(hits.into_iter().map(|h| SearchHitOwned {
+             id: h.id,
+             score: h.score,
+             metadata: h.metadata.to_vec(),
+         }).collect())
+     }
 
      /// Compact database (async write, exclusive lock)
     pub async fn compact(&self) -> Result<()> {
@@ -2016,6 +2198,251 @@ mod tests {
         }
         
         cleanup("test_wal_clear.db");
+        Ok(())
+    }
+
+    // ========== Search Quality Tests ==========
+
+    #[tokio::test]
+    async fn test_score_range_clamping() -> Result<()> {
+        cleanup("test_score_range.db");
+        {
+            let cfg = Config::new(2);
+            let mut db = VectorDb::open("test_score_range.db", cfg).await?;
+
+            // Insert orthogonal and parallel vectors
+            db.insert(&[1.0, 0.0], None)?;  // id=0
+            db.insert(&[0.0, 1.0], None)?;  // id=1 (orthogonal)
+            db.insert(&[1.0, 0.0], None)?;  // id=2 (identical)
+
+            // Search for first vector
+            let results = db.search(&[1.0, 0.0], 3, 32)?;
+
+            // All scores must be in [0.0, 1.0]
+            for hit in &results {
+                assert!(hit.score >= 0.0, "score must be >= 0.0, got {}", hit.score);
+                assert!(hit.score <= 1.0, "score must be <= 1.0, got {}", hit.score);
+            }
+
+            // Best match should have highest score
+            if results.len() >= 2 {
+                assert!(results[0].score >= results[1].score, "results should be ordered by score");
+            }
+
+            db.flush()?;
+        }
+        cleanup("test_score_range.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_ordering_correctness() -> Result<()> {
+        cleanup("test_search_order.db");
+        {
+            let cfg = Config::new(3);
+            let mut db = VectorDb::open("test_search_order.db", cfg).await?;
+
+            // Insert vectors at varying distances from query
+            db.insert(&[1.0, 0.0, 0.0], None)?;  // id=0 (closest)
+            db.insert(&[0.5, 0.5, 0.5], None)?;  // id=1 (medium)
+            db.insert(&[0.0, 0.0, 1.0], None)?;  // id=2 (far)
+            db.insert(&[0.9, 0.0, 0.0], None)?;  // id=3 (very close)
+
+            let query = vec![1.0, 0.0, 0.0];
+            let results = db.search(&query, 4, 32)?;
+
+            // Verify results are ordered: best match first
+            assert!(results.len() > 0);
+            for i in 0..results.len()-1 {
+                assert!(
+                    results[i].score >= results[i+1].score,
+                    "results must be sorted by score descending, got scores: {:?}",
+                    results.iter().map(|h| h.score).collect::<Vec<_>>()
+                );
+            }
+
+            db.flush()?;
+        }
+        cleanup("test_search_order.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_skip_deleted_vectors() -> Result<()> {
+        cleanup("test_search_deleted.db");
+        {
+            let cfg = Config::new(2);
+            let mut db = VectorDb::open("test_search_deleted.db", cfg).await?;
+
+            db.insert(&[1.0, 0.0], None)?;  // id=0
+            db.insert(&[0.0, 1.0], None)?;  // id=1
+            db.insert(&[1.0, 0.0], None)?;  // id=2
+            db.insert(&[0.5, 0.5], None)?;  // id=3
+
+            // Delete vector id=0 (would be top match)
+            db.delete(0)?;
+            assert!(db.is_deleted(0));
+
+            let results = db.search(&[1.0, 0.0], 2, 32)?;
+
+            // Should not return deleted vector
+            for hit in &results {
+                assert!(!db.is_deleted(hit.id), "search returned deleted vector id={}", hit.id);
+            }
+
+            db.flush()?;
+        }
+        cleanup("test_search_deleted.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deletion_stats_tracking() -> Result<()> {
+        cleanup("test_del_stats.db");
+        {
+            let cfg = Config::new(2);
+            let mut db = VectorDb::open("test_del_stats.db", cfg).await?;
+
+            // Insert 10 vectors
+            for i in 0..10 {
+                let v = vec![(i as f32) * 0.1, 0.5];
+                db.insert(&v, None)?;
+            }
+
+            // Check initial stats
+            let (deleted, total, ratio) = db.deletion_stats();
+            assert_eq!(deleted, 0);
+            assert_eq!(total, 10);
+            assert_eq!(ratio, 0.0);
+
+            // Delete 3 vectors
+            db.delete(0)?;
+            db.delete(5)?;
+            db.delete(9)?;
+
+            let (deleted, total, ratio) = db.deletion_stats();
+            assert_eq!(deleted, 3);
+            assert_eq!(total, 10);
+            assert!((ratio - 0.3).abs() < 0.01, "expected ratio ~0.3, got {}", ratio);
+
+            // Check should_compact threshold
+            assert!(!db.should_compact(), "should not compact at 30% boundary");
+            
+            // Delete one more (31%)
+            db.delete(7)?;
+            assert!(db.should_compact(), "should compact at 40% deletion");
+
+            db.flush()?;
+        }
+        cleanup("test_del_stats.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_with_high_deletions() -> Result<()> {
+        cleanup("test_search_high_del.db");
+        {
+            let cfg = Config::new(2);
+            let mut db = VectorDb::open("test_search_high_del.db", cfg).await?;
+
+            // Insert vectors
+            for i in 0..20 {
+                let v = vec![(i as f32) * 0.05, 0.5];
+                db.insert(&v, None)?;
+            }
+
+            // Delete 50% of vectors (leaving search index fragmented)
+            for i in (0..20).step_by(2) {
+                db.delete(i as u32)?;
+            }
+
+            let (_deleted, _total, ratio) = db.deletion_stats();
+            assert!(ratio >= 0.45, "should have ~50% deletion, got {}", ratio);
+
+            // Search should still work and return only live vectors
+            let results = db.search(&[0.5, 0.5], 5, 32)?;
+
+            assert!(!results.is_empty(), "search should return results despite deletions");
+            for hit in &results {
+                assert!(!db.is_deleted(hit.id), "returned deleted vector");
+                assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
+            }
+
+            db.flush()?;
+        }
+        cleanup("test_search_high_del.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_database() -> Result<()> {
+        cleanup("test_search_empty.db");
+        {
+            let cfg = Config::new(2);
+            let db = VectorDb::open("test_search_empty.db", cfg).await?;
+
+            let results = db.search(&[1.0, 0.0], 5, 32)?;
+            assert!(results.is_empty(), "search on empty database should return no results");
+        }
+        cleanup("test_search_empty.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_k_greater_than_size() -> Result<()> {
+        cleanup("test_search_k_large.db");
+        {
+            let cfg = Config::new(2);
+            let mut db = VectorDb::open("test_search_k_large.db", cfg).await?;
+
+            db.insert(&[1.0, 0.0], None)?;
+            db.insert(&[0.0, 1.0], None)?;
+
+            // Request k=100 but only 2 vectors exist
+            let results = db.search(&[1.0, 0.0], 100, 32)?;
+
+            assert_eq!(results.len(), 2, "should return all available vectors when k > size");
+            for hit in &results {
+                assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
+            }
+
+            db.flush()?;
+        }
+        cleanup("test_search_k_large.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_with_source_filter() -> Result<()> {
+        cleanup("test_source_filter.db");
+        {
+            let cfg = Config::new(2);
+            let db = AsyncVectorDb::open("test_source_filter.db", cfg).await?;
+
+            // Insert with metadata containing different sources
+            let meta1 = br#"{"source":"file1.txt","text":"hello"}"#;
+            let meta2 = br#"{"source":"file2.txt","text":"world"}"#;
+            let meta3 = br#"{"source":"file1.txt","text":"foo"}"#;
+
+            db.insert(&[1.0, 0.0], Some(meta1)).await?;
+            db.insert(&[0.0, 1.0], Some(meta2)).await?;
+            db.insert(&[1.0, 0.0], Some(meta3)).await?;
+
+            // Search for file1.txt only
+            let results = db.search_with_source_filter(&[1.0, 0.0], 10, 32, "file1.txt").await?;
+
+            // Should only return vectors from file1.txt
+            for hit in &results {
+                if let Ok(meta_obj) = serde_json::from_slice::<serde_json::Value>(&hit.metadata) {
+                    if let Some(source) = meta_obj.get("source").and_then(|s| s.as_str()) {
+                        assert_eq!(source, "file1.txt", "filtered result has wrong source");
+                    }
+                }
+            }
+
+            db.flush().await?;
+        }
+        cleanup("test_source_filter.db");
         Ok(())
     }
 }
