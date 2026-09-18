@@ -109,8 +109,10 @@ pub struct Config {
     pub seed: u64,
     /// Initial capacity (number of vectors)
     pub initial_capacity: usize,
-    /// Maximum WAL file size in bytes before auto-truncation (0 = no limit)
-    pub max_wal_size: u64,
+    /// Maximum WAL segment file size in bytes before rotation (0 = no rotation)
+    pub max_wal_segment_size: u64,
+    /// Maximum total WAL size across all segments in bytes before cleanup (0 = no limit)
+    pub max_total_wal_size: u64,
 }
 
 impl Config {
@@ -121,7 +123,8 @@ impl Config {
     /// - `m_max`: 30 (max connections for layer 0)
     /// - `max_level`: 7 (maximum tree depth)
     /// - `ef_construction`: 150 (search expansion during construction)
-    /// - `max_wal_size`: 64 MB (auto-truncate WAL when exceeded)
+    /// - `max_wal_segment_size`: 64 MB (rotate WAL when segment exceeds this)
+    /// - `max_total_wal_size`: 256 MB (cleanup old segments when total exceeds this)
     ///
     /// # Panics
     /// If `dim == 0`
@@ -153,7 +156,8 @@ impl Config {
             ef_construction: 150,
             seed,
             initial_capacity: 1024,
-            max_wal_size: 64 * 1024 * 1024, // 64 MB
+            max_wal_segment_size: 64 * 1024 * 1024, // 64 MB per segment
+            max_total_wal_size: 256 * 1024 * 1024,  // 256 MB total across all segments
         }
     }
 
@@ -188,12 +192,21 @@ impl Config {
         self
     }
 
-    /// Set maximum WAL file size in bytes before auto-truncation
+    /// Set maximum WAL segment file size in bytes before rotation
     ///
-    /// When the WAL exceeds this size, records up to the last checkpoint
-    /// are automatically truncated. Set to 0 to disable auto-truncation.
-    pub fn with_max_wal_size(mut self, max_wal_size: u64) -> Self {
-        self.max_wal_size = max_wal_size;
+    /// When a WAL segment exceeds this size, it is rotated to a numbered segment
+    /// and a new active WAL file is created. Set to 0 to disable rotation.
+    pub fn with_max_wal_segment_size(mut self, max_wal_segment_size: u64) -> Self {
+        self.max_wal_segment_size = max_wal_segment_size;
+        self
+    }
+
+    /// Set maximum total WAL size across all segments in bytes before cleanup
+    ///
+    /// When total size of all WAL segments (including active) exceeds this limit,
+    /// the oldest checkpointed segments are deleted. Set to 0 to disable cleanup.
+    pub fn with_max_total_wal_size(mut self, max_total_wal_size: u64) -> Self {
+        self.max_total_wal_size = max_total_wal_size;
         self
     }
 }
@@ -583,7 +596,8 @@ impl HnswIndex {
                 seed: u64::from_le_bytes(m[64..72].try_into()
                     .map_err(|_| VectorDbError::Corruption("invalid seed".to_string()))?),
                 initial_capacity: cfg.initial_capacity,
-                max_wal_size: cfg.max_wal_size,
+                max_wal_segment_size: cfg.max_wal_segment_size,
+                max_total_wal_size: cfg.max_total_wal_size,
             };
 
             if on_disk.m != cfg.m || on_disk.m0 != cfg.m0 || on_disk.max_level != cfg.max_level {
@@ -1158,7 +1172,7 @@ impl VectorDb {
 
         let index = HnswIndex::open(hnsw_path(&path), &cfg).await?;
         let meta = MetadataStore::open(meta_path(&path)).await?;
-        let wal = WriteAheadLog::new(&path, cfg.max_wal_size).await.map_err(VectorDbError::Io)?;
+        let wal = WriteAheadLog::new(&path, cfg.max_wal_segment_size, cfg.max_total_wal_size).await.map_err(VectorDbError::Io)?;
 
         let mut db = Self {
             path: path.clone(),
@@ -1816,6 +1830,17 @@ mod tests {
         let _ = fs::remove_file(format!("{}.hnsw", path));
         let _ = fs::remove_file(format!("{}.meta", path));
         let _ = fs::remove_file(format!("{}.wal", path));
+        // Clean up numbered WAL segments
+        let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+        let prefix = format!("{}.wal.", std::path::Path::new(path).file_name().unwrap().to_string_lossy());
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(&prefix) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     #[test]
@@ -2176,6 +2201,175 @@ mod tests {
         }
         
         cleanup("test_wal_mixed.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_rotation_creates_segments() -> Result<()> {
+        cleanup("test_wal_rotation.db");
+
+        // Use a very small segment size to trigger rotation quickly
+        let cfg = Config::new(4)
+            .with_capacity(32)
+            .with_max_wal_segment_size(256) // 256 bytes - very small to trigger rotation
+            .with_max_total_wal_size(0); // No total size limit
+
+        {
+            let mut db = VectorDb::open("test_wal_rotation.db", cfg).await?;
+
+            // Insert enough vectors to exceed 256 bytes and trigger rotation
+            for i in 0..20u32 {
+                let v = vec![i as f32, 0.1, 0.2, 0.3];
+                db.insert(&v, Some(&i.to_le_bytes()))?;
+            }
+
+            // Small delay to let the async WAL writer process all queued messages
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Count all files matching the WAL pattern in the current directory
+            let mut segment_count = 0;
+            if let Ok(entries) = fs::read_dir(".") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("test_wal_rotation.db.wal.") {
+                        segment_count += 1;
+                    }
+                }
+            }
+            assert!(segment_count >= 1, "Expected at least 1 WAL segment, found {}", segment_count);
+        }
+
+        // Reopen and verify all data is recovered
+        {
+            let cfg = Config::new(4)
+                .with_capacity(32)
+                .with_max_wal_segment_size(256)
+                .with_max_total_wal_size(0);
+            let db = VectorDb::open("test_wal_rotation.db", cfg).await?;
+            assert_eq!(db.len(), 20, "Should recover all 20 vectors from multi-segment WAL");
+        }
+
+        cleanup("test_wal_rotation.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_total_size_cleanup() -> Result<()> {
+        cleanup("test_wal_cleanup.db");
+
+        // Use small segment and total size limits
+        let cfg = Config::new(4)
+            .with_capacity(32)
+            .with_max_wal_segment_size(200) // Small segment
+            .with_max_total_wal_size(600); // Total limit - should force cleanup of old segments
+
+        {
+            let mut db = VectorDb::open("test_wal_cleanup.db", cfg).await?;
+
+            // Batch 1: insert and flush to create checkpoint
+            for i in 0..10 {
+                let v = vec![i as f32, 0.0, 0.0, 0.0];
+                db.insert(&v, None)?;
+            }
+            db.flush()?; // This creates a checkpoint
+
+            // Batch 2: insert more to trigger rotation and cleanup
+            for i in 10..30 {
+                let v = vec![i as f32, 0.1, 0.1, 0.1];
+                db.insert(&v, None)?;
+            }
+            db.flush()?;
+
+            // Batch 3: more inserts
+            for i in 30..50 {
+                let v = vec![i as f32, 0.2, 0.2, 0.2];
+                db.insert(&v, None)?;
+            }
+            db.flush()?;
+        }
+
+        // Verify we can still recover
+        {
+            let cfg = Config::new(4)
+                .with_capacity(32)
+                .with_max_wal_segment_size(200)
+                .with_max_total_wal_size(600);
+            let db = VectorDb::open("test_wal_cleanup.db", cfg).await?;
+            assert_eq!(db.len(), 50, "Should recover all 50 vectors after cleanup");
+        }
+
+        cleanup("test_wal_cleanup.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_multi_segment_recovery() -> Result<()> {
+        cleanup("test_wal_multi.db");
+
+        let cfg = Config::new(4)
+            .with_capacity(64)
+            .with_max_wal_segment_size(300) // Force frequent rotation
+            .with_max_total_wal_size(0);    // No cleanup
+
+        {
+            let mut db = VectorDb::open("test_wal_multi.db", cfg).await?;
+
+            // Insert enough to create multiple segments
+            for i in 0..30u32 {
+                let v = vec![i as f32, (i * 2) as f32, (i * 3) as f32, (i * 4) as f32];
+                db.insert(&v, Some(&i.to_le_bytes()))?;
+            }
+
+            // Don't flush - simulates crash with unflushed WAL data
+        }
+
+        // Reopen and verify recovery from multiple segments
+        {
+            let cfg = Config::new(4)
+                .with_capacity(64)
+                .with_max_wal_segment_size(300)
+                .with_max_total_wal_size(0);
+            let db = VectorDb::open("test_wal_multi.db", cfg).await?;
+            assert_eq!(db.len(), 30, "Should recover all 30 vectors from multiple WAL segments");
+        }
+
+        cleanup("test_wal_multi.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_no_cleanup_uncheckpointed_segments() -> Result<()> {
+        cleanup("test_wal_no_cleanup.db");
+
+        let cfg = Config::new(4)
+            .with_capacity(32)
+            .with_max_wal_segment_size(200)
+            .with_max_total_wal_size(400); // Very small total limit
+
+        {
+            let mut db = VectorDb::open("test_wal_no_cleanup.db", cfg).await?;
+
+            // Insert and create a segment but don't checkpoint
+            for i in 0..15 {
+                let v = vec![i as f32, 0.0, 0.0, 0.0];
+                db.insert(&v, None)?;
+            }
+
+            // Don't flush - the segment should NOT be deleted since it has no checkpoint
+        }
+
+        // Reopen and verify all data is still there
+        {
+            let cfg = Config::new(4)
+                .with_capacity(32)
+                .with_max_wal_segment_size(200)
+                .with_max_total_wal_size(400);
+            let db = VectorDb::open("test_wal_no_cleanup.db", cfg).await?;
+            assert_eq!(db.len(), 15, "Uncheckpointed segments should not be deleted");
+        }
+
+        cleanup("test_wal_no_cleanup.db");
         Ok(())
     }
 
