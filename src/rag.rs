@@ -113,6 +113,11 @@ impl RagCore {
         )?;
         let ndims = embedding.dimensions();
 
+        // Ensure db_path points to a directory and create db files inside it
+        let db_dir = Path::new(db_path);
+        tokio::fs::create_dir_all(db_dir).await?;
+        let db_file_path = db_dir.join("db");
+
         // Create vector database for chunks and metadata
         // P4: Adaptive ef_construction based on dataset size
         let ef_construction = 150;  // Default for initial creation
@@ -120,7 +125,7 @@ impl RagCore {
             .with_m(20)
             .with_ef_construction(ef_construction)
             .with_capacity(1024);
-        let vectors_db = AsyncVectorDb::open(db_path, vectors_cfg).await?;
+        let vectors_db = AsyncVectorDb::open(db_file_path, vectors_cfg).await?;
 
         // P3: Create metadata index and populate from existing vectors
         let metadata_index = MetadataIndex::new();
