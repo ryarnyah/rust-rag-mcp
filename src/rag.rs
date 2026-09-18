@@ -1,26 +1,40 @@
 use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
+use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig};
 use crate::syntax_chunker::{language_for_extension, SyntaxChunker};
 use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
 use anyhow::Result;
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-
-use lancedb::arrow::arrow_array::{
-    Array, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-};
-use lancedb::arrow::arrow_schema::{DataType, Field};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 pub struct RagCore {
-    table: lancedb::Table,
-    metadata_table: lancedb::Table,
+    vectors_db: AsyncVectorDb,
     embedding: EmbeddingService,
     chunker: Chunker,
     syntax_chunker: SyntaxChunker,
+}
+
+/// Serialized chunk data with full metadata - stored in vector metadata field
+#[derive(Serialize, Deserialize, Debug)]
+struct ChunkMetadata {
+    id: String,
+    text: String,
+    source: String,
+    chunk_index: u32,
+    start_offset: u64,
+    end_offset: u64,
+}
+
+/// Serialized document metadata - also stored in vector metadata field
+#[derive(Serialize, Deserialize, Debug)]
+struct DocumentMetadataEntry {
+    source_path: String,
+    content_hash: String,
+    indexed_at: u64,
+    chunk_count: u32,
 }
 
 impl RagCore {
@@ -28,7 +42,7 @@ impl RagCore {
     /**
      * Creates a new instance of RagCore with the specified database path, cache directory,
      * model name, chunk size, and overlap. Initializes the embedding service, chunker,
-     * syntax chunker, and sets up the necessary tables and indexes in the database.
+     * syntax chunker, and sets up the necessary vector database.
      */
     pub async fn new(
         db_path: &str,
@@ -41,51 +55,17 @@ impl RagCore {
             model_name,
             cache_dir
         )?;
-        let ndims = embedding.dimensions() as i32;
+        let ndims = embedding.dimensions();
 
-        let db = lancedb::connect(db_path).execute().await?;
-        let table_name = "chunks";
-
-        let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("text", DataType::Utf8, true),
-            Field::new("source", DataType::Utf8, true),
-            Field::new("chunk_index", DataType::UInt32, true),
-            Field::new("start_offset", DataType::UInt64, true),
-            Field::new("end_offset", DataType::UInt64, true),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    ndims,
-                ),
-                true,
-            ),
-        ]));
-
-        let table = match db.open_table(table_name).execute().await {
-            Ok(t) => t,
-            Err(_) => db.create_empty_table(table_name, schema).execute().await?,
-        };
-
-        let metadata_schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
-            Field::new("source_path", DataType::Utf8, false),
-            Field::new("content_hash", DataType::Utf8, true),
-            Field::new("indexed_at", DataType::Utf8, true),
-            Field::new("chunk_count", DataType::UInt32, true),
-        ]));
-
-        let metadata_table_name = "document_metadata";
-        let metadata_table = match db.open_table(metadata_table_name).execute().await {
-            Ok(t) => t,
-            Err(_) => db.create_empty_table(metadata_table_name, metadata_schema)
-                    .execute()
-                    .await?
-        };
+        // Create vector database for chunks and metadata
+        let vectors_cfg = VectorDbConfig::new(ndims)
+            .with_m(20)
+            .with_ef_construction(200)
+            .with_capacity(1024);
+        let vectors_db = AsyncVectorDb::open(db_path, vectors_cfg).await?;
 
         Ok(Self {
-            table,
-            metadata_table,
+            vectors_db,
             embedding,
             chunker: Chunker::new(chunk_size, overlap),
             syntax_chunker: SyntaxChunker::new(chunk_size, overlap),
@@ -192,57 +172,26 @@ impl RagCore {
         }
 
         let embeddings_result = self.embedding.embed_chunks(chunks.clone()).await?;
-        let ndims = self.embedding.dimensions() as i32;
 
-        let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let sources: Vec<&str> = chunks.iter().map(|c| c.source.as_str()).collect();
-        let chunk_indices: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
-        let start_offsets: Vec<u64> = chunks.iter().map(|c| c.start_offset as u64).collect();
-        let end_offsets: Vec<u64> = chunks.iter().map(|c| c.end_offset as u64).collect();
+        // Insert each chunk with its embedding
+        for (chunk, embedding) in chunks.iter().zip(embeddings_result.iter()) {
+            // Serialize chunk metadata
+            let chunk_meta = ChunkMetadata {
+                id: chunk.id.clone(),
+                text: chunk.text.clone(),
+                source: chunk.source.clone(),
+                chunk_index: chunk.chunk_index,
+                start_offset: chunk.start_offset as u64,
+                end_offset: chunk.end_offset as u64,
+            };
+            let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
 
-        use lancedb::arrow::arrow_array::types::Float32Type;
+            // Insert vector with metadata
+            let _ = self.vectors_db
+                .insert(embedding, Some(&metadata_bytes))
+                .await?;
+        }
 
-        let vectors = lancedb::arrow::arrow_array::FixedSizeListArray::from_iter_primitive::<
-            Float32Type,
-            _,
-            _,
-        >(
-            embeddings_result
-                .iter()
-                .map(|embedding| Some(embedding.iter().map(|v| Some(*v)).collect::<Vec<_>>())),
-            ndims,
-        );
-
-        let batch = RecordBatch::try_new(
-            Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("text", DataType::Utf8, true),
-                Field::new("source", DataType::Utf8, true),
-                Field::new("chunk_index", DataType::UInt32, true),
-                Field::new("start_offset", DataType::UInt64, true),
-                Field::new("end_offset", DataType::UInt64, true),
-                Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        ndims,
-                    ),
-                    true,
-                ),
-            ])),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(StringArray::from(texts)),
-                Arc::new(StringArray::from(sources)),
-                Arc::new(UInt32Array::from(chunk_indices)),
-                Arc::new(UInt64Array::from(start_offsets)),
-                Arc::new(UInt64Array::from(end_offsets)),
-                Arc::new(vectors),
-            ],
-        )?;
-
-        self.table.add(batch).execute().await?;
         Ok(())
     }
 
@@ -272,117 +221,65 @@ impl RagCore {
             return Err(anyhow::anyhow!("Failed to generate query embedding"));
         }
 
-        let query_embedding = query_embedding_vec[0].clone();
+        let query_embedding = &query_embedding_vec[0];
 
-        let mut vector_query = self.table.query().nearest_to(query_embedding)?;
+        // Search vectors
+        let search_results = self.vectors_db
+            .search(query_embedding, top_k, 200)
+            .await?;
 
-        if let Some(filter) = source_filter {
-            vector_query = vector_query.only_if(format!("source = '{}'", filter));
-        }
-
-        vector_query = vector_query.limit(top_k);
-
-        let results: Vec<RecordBatch> = vector_query.execute().await?.try_collect().await?;
-
-        let mut search_results = Vec::new();
-        for batch in results {
-            let ids = batch
-                .column_by_name("id")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-
-            let texts = batch
-                .column_by_name("text")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-
-            let sources = batch
-                .column_by_name("source")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-
-            let chunk_indices = batch
-                .column_by_name("chunk_index")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-
-            let start_offsets = batch
-                .column_by_name("start_offset")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
-
-            let end_offsets = batch
-                .column_by_name("end_offset")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
-
-            let distances = batch
-                .column_by_name("_distance")
-                .and_then(|col| col.as_any().downcast_ref::<Float32Array>());
-
-            if let (
-                Some(ids),
-                Some(texts),
-                Some(sources),
-                Some(indices),
-                Some(starts),
-                Some(ends),
-            ) = (
-                ids,
-                texts,
-                sources,
-                chunk_indices,
-                start_offsets,
-                end_offsets,
-            ) {
-                for i in 0..ids.len() {
-                    let score = if let Some(dists) = distances {
-                        let distance = dists.value(i) as f64;
-                        1.0 / (1.0 + distance)
-                    } else {
-                        0.5
-                    };
-
-                    let chunk = DocumentChunk {
-                        id: ids.value(i).to_string(),
-                        text: texts.value(i).to_string(),
-                        source: sources.value(i).to_string(),
-                        chunk_index: indices.value(i),
-                        start_offset: starts.value(i) as usize,
-                        end_offset: ends.value(i) as usize,
-                    };
-                    search_results.push(SearchResult { score, chunk });
+        let mut results = Vec::new();
+        for hit in search_results {
+            // Deserialize chunk metadata
+            if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&hit.metadata) {
+                // Apply source filter if needed
+                if let Some(filter) = source_filter {
+                    if chunk_meta.source != filter {
+                        continue;
+                    }
                 }
+
+                let chunk = DocumentChunk {
+                    id: chunk_meta.id,
+                    text: chunk_meta.text,
+                    source: chunk_meta.source,
+                    chunk_index: chunk_meta.chunk_index,
+                    start_offset: chunk_meta.start_offset as usize,
+                    end_offset: chunk_meta.end_offset as usize,
+                };
+                results.push(SearchResult {
+                    score: hit.score as f64,
+                    chunk,
+                });
             }
         }
 
-        Ok(search_results)
+        Ok(results)
     }
 
     /**
      * Returns the total number of chunks stored in the database.
      */
     pub async fn chunk_count(&self) -> Result<usize> {
-        Ok(self.table.count_rows(None).await? as usize)
+        Ok(self.vectors_db.len().await)
     }
 
     /**
      * Returns a list of all unique sources present in the database.
      */
     pub async fn list_sources(&self) -> Result<Vec<String>> {
-        let results: Vec<RecordBatch> = self
-            .table
-            .query()
-            .select(lancedb::query::Select::Columns(vec!["source".to_string()]))
-            .execute()
-            .await?
-            .try_collect()
-            .await?;
+        let mut sources = HashSet::new();
 
-        let mut sources = std::collections::HashSet::new();
-        for batch in &results {
-            if let Some(col) = batch.column_by_name("source") {
-                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        sources.insert(arr.value(i).to_string());
-                    }
+        // Iterate through all vectors and extract sources from metadata
+        let total = self.vectors_db.len().await;
+        for id in 0..total as u32 {
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await {
+                if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes) {
+                    sources.insert(chunk_meta.source);
                 }
             }
         }
+
         let mut v: Vec<String> = sources.into_iter().collect();
         v.sort();
         Ok(v)
@@ -392,12 +289,21 @@ impl RagCore {
      * Deletes all chunks and metadata associated with the specified source path from the database.
      */
     pub async fn delete_source(&self, source_path: &str) -> Result<()> {
-        self.table
-            .delete(&format!("source = '{}'", source_path))
-            .await?;
-        self.metadata_table
-            .delete(&format!("source_path = '{}'", source_path))
-            .await?;
+        // Find all vectors with matching source and delete them
+        let total = self.vectors_db.len().await;
+        for id in 0..total as u32 {
+            if self.vectors_db.is_deleted(id).await {
+                continue;
+            }
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await {
+                if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes) {
+                    if chunk_meta.source == source_path {
+                        let _ = self.vectors_db.delete(id).await;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -406,39 +312,22 @@ impl RagCore {
      * Returns None if the document is not found.
      */
     pub async fn document_status(&self, source_path: &str) -> Result<Option<DocumentStatus>> {
-        let results: Vec<RecordBatch> = self
-            .metadata_table
-            .query()
-            .only_if(format!("source_path = '{}'", source_path))
-            .execute()
-            .await?
-            .try_collect()
-            .await?;
-
-        for batch in &results {
-            let source_paths = batch
-                .column_by_name("source_path")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-            let hashes = batch
-                .column_by_name("content_hash")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
-            let timestamps = batch
-                .column_by_name("indexed_at")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
-            let counts = batch
-                .column_by_name("chunk_count")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-
-            if let (Some(sp), Some(h), Some(t), Some(c)) =
-                (source_paths, hashes, timestamps, counts)
-            {
-                if sp.len() > 0 {
-                    return Ok(Some(DocumentStatus {
-                        source_path: sp.value(0).to_string(),
-                        content_hash: h.value(0).to_string(),
-                        indexed_at: t.value(0),
-                        chunk_count: c.value(0),
-                    }));
+        let total = self.vectors_db.len().await;
+        for id in 0..total as u32 {
+            if self.vectors_db.is_deleted(id).await {
+                continue;
+            }
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await {
+                // Try to find document metadata entry for this source
+                if let Ok(doc_meta) = serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes) {
+                    if doc_meta.source_path == source_path {
+                        return Ok(Some(DocumentStatus {
+                            source_path: doc_meta.source_path,
+                            content_hash: doc_meta.content_hash,
+                            indexed_at: doc_meta.indexed_at,
+                            chunk_count: doc_meta.chunk_count,
+                        }));
+                    }
                 }
             }
         }
@@ -455,26 +344,36 @@ impl RagCore {
         indexed_at: u64,
         chunk_count: u32,
     ) -> Result<()> {
-        self.metadata_table
-            .delete(&format!("source_path = '{}'", source_path))
+        // Find and delete existing document metadata entry for this source
+        let total = self.vectors_db.len().await;
+        for id in 0..total as u32 {
+            if self.vectors_db.is_deleted(id).await {
+                continue;
+            }
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await {
+                if let Ok(doc_meta) = serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes) {
+                    if doc_meta.source_path == source_path {
+                        let _ = self.vectors_db.delete(id).await;
+                    }
+                }
+            }
+        }
+
+        // Insert new metadata entry with a dummy embedding vector
+        let doc_meta = DocumentMetadataEntry {
+            source_path: source_path.to_string(),
+            content_hash: content_hash.to_string(),
+            indexed_at,
+            chunk_count,
+        };
+        let metadata_bytes = serde_json::to_vec(&doc_meta)?;
+
+        // Create a dummy embedding vector for metadata storage
+        let dummy_embedding = vec![0.0; self.embedding.dimensions()];
+        let _ = self.vectors_db
+            .insert(&dummy_embedding, Some(&metadata_bytes))
             .await?;
 
-        let batch = RecordBatch::try_new(
-            Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
-                Field::new("source_path", DataType::Utf8, false),
-                Field::new("content_hash", DataType::Utf8, true),
-                Field::new("indexed_at", DataType::UInt64, true),
-                Field::new("chunk_count", DataType::UInt32, true),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec![source_path])),
-                Arc::new(StringArray::from(vec![content_hash])),
-                Arc::new(UInt64Array::from(vec![indexed_at])),
-                Arc::new(UInt32Array::from(vec![chunk_count])),
-            ],
-        )?;
-
-        self.metadata_table.add(batch).execute().await?;
         Ok(())
     }
 
