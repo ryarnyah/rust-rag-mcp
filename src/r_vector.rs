@@ -476,6 +476,9 @@ impl MetadataStore {
     /// Grow mmap to accommodate more data (doubling strategy)
     fn grow(&mut self, need: usize) -> Result<()> {
         let new_size = (need * 2).max(1024);
+        if let Some(m) = self.mmap.as_ref() {
+            m.flush().map_err(VectorDbError::Io)?;
+        }
         self.mmap = None;
         self.file.set_len(new_size as u64).map_err(VectorDbError::Io)?;
         self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
@@ -484,8 +487,11 @@ impl MetadataStore {
 
     /// Flush metadata to disk
     fn flush(&mut self) -> Result<()> {
+        self.mmap().flush().map_err(VectorDbError::Io)?;
         self.file.set_len(self.file_len as u64).map_err(VectorDbError::Io)?;
-        self.mmap().flush().map_err(VectorDbError::Io)
+        // Remap after truncation so subsequent writes go to file-backed pages
+        self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
+        Ok(())
     }
 }
 
@@ -1239,7 +1245,7 @@ impl VectorDb {
         }
 
         if recovered_count > 0 {
-            self.flush()?;
+            self.flush().await?;
         }
 
         Ok(())
@@ -1377,7 +1383,7 @@ impl VectorDb {
         let meta_bytes = metadata.unwrap_or(&[]);
 
         // Log to WAL before applying changes
-        self.wal.log_insert_sync(id, v, meta_bytes)
+        self.wal.log_insert(id, v, meta_bytes)
             .map_err(VectorDbError::Io)?;
 
         // Now apply to database
@@ -1413,7 +1419,7 @@ impl VectorDb {
         let meta_bytes = metadata.unwrap_or(&[]);
 
         // Log to WAL before applying changes
-        self.wal.log_update_sync(id, v, meta_bytes)
+        self.wal.log_update(id, v, meta_bytes)
             .map_err(VectorDbError::Io)?;
 
         // Now apply to database
@@ -1430,7 +1436,7 @@ impl VectorDb {
 
          // Log to WAL before applying deletion
          let prev = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
-         self.wal.log_delete_sync(id, &prev)
+         self.wal.log_delete(id, &prev)
              .map_err(VectorDbError::Io)?;
 
          self.meta.put(id, META_FLAG_DELETED, &prev)?;
@@ -1586,7 +1592,7 @@ impl VectorDb {
                 let meta = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
                 fresh.insert(&v, Some(&meta))?;
             }
-            fresh.flush()?;
+            fresh.flush().await?;
         }
 
         // Unmap before renaming
@@ -1608,13 +1614,9 @@ impl VectorDb {
     }
 
     /// Flush all pending changes to disk
-    pub fn flush(&mut self) -> Result<()> {
-        // Write checkpoint to WAL to mark all operations as safe
-        self.wal.checkpoint_sync(1)
-            .map_err(VectorDbError::Io)?;
-        
-        // Sync WAL to disk first
-        self.wal.sync()
+    pub async fn flush(&mut self) -> Result<()> {
+        // Write checkpoint to WAL and wait for fsync confirmation
+        self.wal.checkpoint(1).await
             .map_err(VectorDbError::Io)?;
         
         // Then sync all data files
@@ -1802,7 +1804,7 @@ impl AsyncVectorDb {
 
      /// Flush changes to disk (async write, exclusive lock)
     pub async fn flush(&self) -> Result<()> {
-        self.db.write().await.flush()
+        self.db.write().await.flush().await
     }
 }
 
@@ -1893,7 +1895,7 @@ mod tests {
             let meta = db.get_meta(id)?;
             assert_eq!(meta.map(|m| m.to_vec()), Some(b"mydata".to_vec()), "Metadata should match");
             
-            db.flush()?;
+            db.flush().await?;
             
             let meta = db.get_meta(id)?;
             assert_eq!(meta.map(|m| m.to_vec()), Some(b"mydata".to_vec()), "Metadata should persist after flush");
@@ -2039,7 +2041,7 @@ mod tests {
             db.insert(&[0.9, 0.1, 0.2, 0.3], Some(b"vec3"))?;
             
             // Flush to write WAL and checkpoint
-            db.flush()?;
+            db.flush().await?;
         }
         
         // Stage 2: Reopen and verify all data is persisted
@@ -2076,7 +2078,7 @@ mod tests {
             db.insert(&[1.0, 0.0, 0.0], None)?;
             db.insert(&[0.0, 1.0, 0.0], None)?;
             db.insert(&[0.0, 0.0, 1.0], None)?;
-            db.flush()?; // Flush initial inserts
+            db.flush().await?; // Flush initial inserts
         }
         
         // Stage 2: Delete one and simulate crash
@@ -2116,7 +2118,7 @@ mod tests {
             let mut db = VectorDb::open("test_wal_update_crash.db", cfg).await?;
             
             db.insert(&[1.0, 0.0], Some(b"original"))?;
-            db.flush()?;
+            db.flush().await?;
         }
         
         // Stage 2: Update and flush
@@ -2125,7 +2127,7 @@ mod tests {
             let mut db = VectorDb::open("test_wal_update_crash.db", cfg).await?;
             
             db.update(0, &[2.0, 3.0], Some(b"updated"))?;
-            db.flush()?; // Flush to make the update durable
+            db.flush().await?; // Flush to make the update durable
         }
         
         // Stage 3: Reopen and verify update persisted
@@ -2155,7 +2157,7 @@ mod tests {
                 let v = vec![(i as f32) * 0.1, 0.5, 0.9];
                 db.insert(&v, Some(format!("vec{}", i).as_bytes()))?;
             }
-            db.flush()?;
+            db.flush().await?;
         }
         
         // Stage 2: Mixed operations with flush
@@ -2172,7 +2174,7 @@ mod tests {
             // Delete one
             db.delete(3)?;
             
-            db.flush()?; // Flush to persist all changes
+            db.flush().await?; // Flush to persist all changes
         }
         
         // Stage 3: Verify all operations persisted
@@ -2272,21 +2274,21 @@ mod tests {
                 let v = vec![i as f32, 0.0, 0.0, 0.0];
                 db.insert(&v, None)?;
             }
-            db.flush()?; // This creates a checkpoint
+            db.flush().await?; // This creates a checkpoint
 
             // Batch 2: insert more to trigger rotation and cleanup
             for i in 10..30 {
                 let v = vec![i as f32, 0.1, 0.1, 0.1];
                 db.insert(&v, None)?;
             }
-            db.flush()?;
+            db.flush().await?;
 
             // Batch 3: more inserts
             for i in 30..50 {
                 let v = vec![i as f32, 0.2, 0.2, 0.2];
                 db.insert(&v, None)?;
             }
-            db.flush()?;
+            db.flush().await?;
         }
 
         // Verify we can still recover
@@ -2373,9 +2375,7 @@ mod tests {
         Ok(())
     }
 
-    // WAL clear after checkpoint - deferred as async truncate needs synchronization
-    // The checkpoint mechanism itself preserves all data safely via last_checkpoint_lsn filtering
-    #[ignore]
+    // WAL clear after checkpoint - verifies data persists across multiple flush cycles
     #[tokio::test]
     async fn test_wal_clear_after_checkpoint() -> Result<()> {
         cleanup("test_wal_clear.db");
@@ -2390,11 +2390,14 @@ mod tests {
                     let v = vec![(batch as f32) + (i as f32) * 0.1, 0.5];
                     db.insert(&v, None)?;
                 }
-                db.flush()?; // Checkpoints written to WAL
+                db.flush().await?; // Checkpoints written to WAL
             }
             
             assert_eq!(db.len(), 6);
         }
+        
+        // Small delay to let WAL writer process truncate
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         
         // Reopen: recovery should load based on last checkpoint
         {
@@ -2438,7 +2441,7 @@ mod tests {
                 assert!(results[0].score >= results[1].score, "results should be ordered by score");
             }
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_score_range.db");
         Ok(())
@@ -2470,7 +2473,7 @@ mod tests {
                 );
             }
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_search_order.db");
         Ok(())
@@ -2499,7 +2502,7 @@ mod tests {
                 assert!(!db.is_deleted(hit.id), "search returned deleted vector id={}", hit.id);
             }
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_search_deleted.db");
         Ok(())
@@ -2541,7 +2544,7 @@ mod tests {
             db.delete(7)?;
             assert!(db.should_compact(), "should compact at 40% deletion");
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_del_stats.db");
         Ok(())
@@ -2577,7 +2580,7 @@ mod tests {
                 assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
             }
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_search_high_del.db");
         Ok(())
@@ -2615,7 +2618,7 @@ mod tests {
                 assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
             }
 
-            db.flush()?;
+            db.flush().await?;
         }
         cleanup("test_search_k_large.db");
         Ok(())
