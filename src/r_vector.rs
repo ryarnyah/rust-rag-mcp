@@ -12,10 +12,10 @@
 //!
 //! # Example
 //! ```no_run
-//! use r_vector::{Config, AsyncVectorDb};
+//! use rust_rag_mcp::r_vector::{Config, AsyncVectorDb};
 //!
 //! #[tokio::main]
-//! async fn main() -> std::io::Result<()> {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let cfg = Config::new(128).with_m(8).with_ef_construction(200);
 //!     let db = AsyncVectorDb::open("vectors.db", cfg).await?;
 //!
@@ -109,6 +109,8 @@ pub struct Config {
     pub seed: u64,
     /// Initial capacity (number of vectors)
     pub initial_capacity: usize,
+    /// Maximum WAL file size in bytes before auto-truncation (0 = no limit)
+    pub max_wal_size: u64,
 }
 
 impl Config {
@@ -119,12 +121,14 @@ impl Config {
     /// - `m_max`: 30 (max connections for layer 0)
     /// - `max_level`: 7 (maximum tree depth)
     /// - `ef_construction`: 150 (search expansion during construction)
+    /// - `max_wal_size`: 64 MB (auto-truncate WAL when exceeded)
     ///
     /// # Panics
     /// If `dim == 0`
     ///
     /// # Example
     /// ```
+    /// use rust_rag_mcp::r_vector::Config;
     /// let cfg = Config::new(128);
     /// assert_eq!(cfg.dim, 128);
     /// assert_eq!(cfg.m, 20);  // default
@@ -149,6 +153,7 @@ impl Config {
             ef_construction: 150,
             seed,
             initial_capacity: 1024,
+            max_wal_size: 64 * 1024 * 1024, // 64 MB
         }
     }
 
@@ -180,6 +185,15 @@ impl Config {
     /// Set random seed for reproducible node level assignment
     pub fn with_seed(mut self, s: u64) -> Self {
         self.seed = s;
+        self
+    }
+
+    /// Set maximum WAL file size in bytes before auto-truncation
+    ///
+    /// When the WAL exceeds this size, records up to the last checkpoint
+    /// are automatically truncated. Set to 0 to disable auto-truncation.
+    pub fn with_max_wal_size(mut self, max_wal_size: u64) -> Self {
+        self.max_wal_size = max_wal_size;
         self
     }
 }
@@ -569,6 +583,7 @@ impl HnswIndex {
                 seed: u64::from_le_bytes(m[64..72].try_into()
                     .map_err(|_| VectorDbError::Corruption("invalid seed".to_string()))?),
                 initial_capacity: cfg.initial_capacity,
+                max_wal_size: cfg.max_wal_size,
             };
 
             if on_disk.m != cfg.m || on_disk.m0 != cfg.m0 || on_disk.max_level != cfg.max_level {
@@ -1143,7 +1158,7 @@ impl VectorDb {
 
         let index = HnswIndex::open(hnsw_path(&path), &cfg).await?;
         let meta = MetadataStore::open(meta_path(&path)).await?;
-        let wal = WriteAheadLog::new(&path).await.map_err(VectorDbError::Io)?;
+        let wal = WriteAheadLog::new(&path, cfg.max_wal_size).await.map_err(VectorDbError::Io)?;
 
         let mut db = Self {
             path: path.clone(),
@@ -1636,10 +1651,10 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
 ///
 /// # Example
 /// ```no_run
-/// use r_vector::{Config, AsyncVectorDb};
+/// use rust_rag_mcp::r_vector::{Config, AsyncVectorDb};
 ///
 /// #[tokio::main]
-/// async fn main() -> std::io::Result<()> {
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let cfg = Config::new(128);
 ///     let db = AsyncVectorDb::open("db.vec", cfg).await?;
 ///

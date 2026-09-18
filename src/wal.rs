@@ -201,7 +201,10 @@ impl WalRecord {
 pub enum WalMessage {
     Record(WalRecord),
     Checkpoint(u64),  // generation number
+    /// Full truncation after flush - clears entire WAL
     Truncate,
+    /// Incremental truncation when WAL exceeds max size - removes records up to last checkpoint
+    TruncateToCheckpoint,
 }
 
 /// WAL file header
@@ -256,11 +259,15 @@ pub struct WalWriter {
     last_checkpoint_generation: Arc<AtomicU64>,
     current_generation: u64,  // Local counter, incremented with each checkpoint
     rx: mpsc::UnboundedReceiver<WalMessage>,
+    /// Maximum WAL file size in bytes before auto-truncation (0 = no limit)
+    max_wal_size: u64,
+    /// Current WAL file size in bytes
+    current_file_size: u64,
 }
 
 impl WriteAheadLog {
     /// Create WAL and start writer thread
-    pub async fn new(db_path: &Path) -> io::Result<Self> {
+    pub async fn new(db_path: &Path, max_wal_size: u64) -> io::Result<Self> {
         let wal_path = Self::wal_path(db_path);
         let exists = wal_path.exists();
 
@@ -291,6 +298,9 @@ impl WriteAheadLog {
 
         let current_lsn = Arc::new(AtomicU64::new(header.current_lsn));
 
+        // Get current file size
+        let current_file_size = file.metadata()?.len();
+
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Start WAL writer thread
@@ -301,6 +311,8 @@ impl WriteAheadLog {
             last_checkpoint_generation: Arc::new(AtomicU64::new(header.last_checkpoint_generation)),
             current_generation: header.last_checkpoint_generation,
             rx,
+            max_wal_size,
+            current_file_size,
         };
 
         tokio::spawn(async move {
@@ -438,8 +450,18 @@ impl WalWriter {
             match msg {
                 WalMessage::Record(record) => {
                     let bytes = record.to_bytes()?;
+                    let written = bytes.len() as u64;
                     self.file.write_all(&bytes)?;
+                    self.current_file_size += written;
                     self.current_lsn.store(record.lsn.0 + 1, Ordering::SeqCst);
+
+                    // Auto-truncate if WAL exceeds max size and we have a checkpoint
+                    if self.max_wal_size > 0
+                        && self.current_file_size > self.max_wal_size
+                        && self.last_checkpoint_lsn.load(Ordering::SeqCst) > 0
+                    {
+                        self.truncate_to_checkpoint()?;
+                    }
                 }
                 WalMessage::Checkpoint(generation) => {
                     // Write checkpoint record
@@ -452,7 +474,9 @@ impl WalWriter {
                         metadata: Vec::new(),
                     };
                     let bytes = checkpoint.to_bytes()?;
+                    let written = bytes.len() as u64;
                     self.file.write_all(&bytes)?;
+                    self.current_file_size += written;
 
                     // Update local generation
                     self.current_generation = generation;
@@ -477,7 +501,7 @@ impl WalWriter {
                     self.last_checkpoint_generation.store(generation, Ordering::SeqCst);
                 }
                 WalMessage::Truncate => {
-                    // Truncate file to header size (clearing all records after checkpoint)
+                    // Full truncation after flush - clears entire WAL
                     self.file.set_len(WAL_HEADER_SIZE as u64)?;
                     self.file.seek(SeekFrom::Start(0))?;
                     
@@ -491,9 +515,80 @@ impl WalWriter {
                     self.file.write_all(&header.to_bytes())?;
                     self.file.flush()?;
                     self.file.sync_all()?;
+                    self.current_file_size = WAL_HEADER_SIZE as u64;
+
+                    // Reset shared atomics
+                    self.last_checkpoint_lsn.store(0, Ordering::SeqCst);
+                    self.last_checkpoint_generation.store(0, Ordering::SeqCst);
+                }
+                WalMessage::TruncateToCheckpoint => {
+                    self.truncate_to_checkpoint()?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Truncate WAL to keep only records after the last checkpoint
+    fn truncate_to_checkpoint(&mut self) -> io::Result<()> {
+        let checkpoint_lsn = self.last_checkpoint_lsn.load(Ordering::SeqCst);
+        if checkpoint_lsn == 0 {
+            return Ok(()); // No checkpoint to truncate to
+        }
+
+        // Read entire file to find checkpoint position
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut data = Vec::new();
+        self.file.read_to_end(&mut data)?;
+
+        if data.len() <= WAL_HEADER_SIZE {
+            return Ok(()); // Only header, nothing to truncate
+        }
+
+        // Skip header and scan for checkpoint record
+        let mut offset = WAL_HEADER_SIZE;
+        let mut checkpoint_end_offset = None;
+
+        while offset < data.len() {
+            match WalRecord::from_bytes(&data[offset..]) {
+                Ok((record, consumed)) => {
+                    if record.op_type == WalOpType::Checkpoint && record.lsn.0 == checkpoint_lsn {
+                        // Found the checkpoint - truncate everything up to and including it
+                        checkpoint_end_offset = Some(offset + consumed);
+                        break;
+                    }
+                    offset += consumed;
+                }
+                Err(_) => break, // Partial/corrupt record
+            }
+        }
+
+        if let Some(end_offset) = checkpoint_end_offset {
+            // Truncate: keep header + records after checkpoint
+            let remaining = &data[end_offset..];
+
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+
+            // Write header with preserved checkpoint info
+            let header = WalHeader {
+                magic: WAL_MAGIC,
+                last_checkpoint_lsn: checkpoint_lsn,
+                current_lsn: self.current_lsn.load(Ordering::SeqCst),
+                last_checkpoint_generation: self.current_generation,
+            };
+            self.file.write_all(&header.to_bytes())?;
+
+            // Write remaining records
+            if !remaining.is_empty() {
+                self.file.write_all(remaining)?;
+            }
+
+            self.file.flush()?;
+            self.file.sync_all()?;
+            self.current_file_size = WAL_HEADER_SIZE as u64 + remaining.len() as u64;
+        }
+
         Ok(())
     }
 }
