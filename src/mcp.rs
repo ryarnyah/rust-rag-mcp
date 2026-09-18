@@ -19,11 +19,12 @@ pub struct RagServer {
 impl RagServer {
     pub async fn new(
         db_path: &str,
+        cache_path: &str,
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
     ) -> anyhow::Result<Self> {
-        let core = RagCore::new(db_path, model_name, chunk_size, overlap).await?;
+        let core = RagCore::new(db_path, cache_path, model_name, chunk_size, overlap).await?;
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
         })

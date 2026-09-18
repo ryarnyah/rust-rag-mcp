@@ -10,7 +10,10 @@ pub struct EmbeddingService {
 }
 
 impl EmbeddingService {
-    pub fn new(model_name: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        model_name: &str,
+        cache_dir: &str
+    ) -> anyhow::Result<Self> {
         // Map model name to EmbeddingModel enum
         let embedding_model = match model_name {
             "sentence-transformers/all-MiniLM-L6-v2" => EmbeddingModel::AllMiniLML6V2,
@@ -87,7 +90,10 @@ impl EmbeddingService {
             }
         };
 
-        let mut model = TextEmbedding::try_new(TextInitOptions::new(embedding_model))?;
+        let mut model = TextEmbedding::try_new(
+            TextInitOptions::new(embedding_model)
+                .with_cache_dir(cache_dir.into())
+        )?;
 
         // Get dimensions by embedding a dummy text
         let test_embedding = model.embed(vec!["test"], None)?;
@@ -201,19 +207,28 @@ mod tests {
     #[test]
     fn test_new_invalid_model() {
         // fastembed uses default model regardless of input
-        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5").unwrap();
+        let svc = EmbeddingService::new(
+            "Xenova/bge-small-en-v1.5",
+            DEFAULT_CACHE_DIR.into()
+        ).unwrap();
         assert!(svc.dimensions() > 0);
     }
 
     #[test]
     fn test_new_valid_model() {
-        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5").unwrap();
+        let svc = EmbeddingService::new(
+            "Xenova/bge-small-en-v1.5",
+            DEFAULT_CACHE_DIR.into()
+        ).unwrap();
         assert!(svc.dimensions() > 0);
     }
 
     #[tokio::test]
     async fn test_embed_chunks() {
-        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5").unwrap();
+        let svc = EmbeddingService::new(
+            "Xenova/bge-small-en-v1.5",
+            DEFAULT_CACHE_DIR.into()
+        ).unwrap();
         let chunks = vec![DocumentChunk {
             id: "1".to_string(),
             text: "hello world".to_string(),
@@ -226,4 +241,6 @@ mod tests {
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), svc.dimensions());
     }
+
+    const DEFAULT_CACHE_DIR: &str = ".fastembed_cache";
 }

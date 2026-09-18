@@ -18,8 +18,11 @@ struct Cli {
 enum Commands {
     /// Start MCP server (stdio transport)
     Serve {
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -36,8 +39,11 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<String>,
 
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -54,8 +60,11 @@ enum Commands {
         #[arg(required = true)]
         query: Vec<String>,
 
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -69,8 +78,11 @@ enum Commands {
 
     /// List indexed sources
     Sources {
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -78,8 +90,11 @@ enum Commands {
 
     /// Show index statistics
     Stats {
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -90,8 +105,11 @@ enum Commands {
         /// Full source path to remove (use 'sources' command to list paths)
         source_path: String,
 
-        #[arg(long, default_value = ".rig-rag-db")]
+        #[arg(long, default_value = ".rag-db")]
         db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
@@ -118,12 +136,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve {
             db_path,
+            cache_path,
             model,
             chunk_size,
             overlap,
         } => {
             tracing::info!("Starting RAG MCP server");
-            let server = mcp::RagServer::new(&db_path, &model, chunk_size, overlap).await?;
+            let server = mcp::RagServer::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
             let service = server
                 .serve(rmcp::transport::stdio())
                 .await
@@ -136,11 +155,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Index {
             paths,
             db_path,
+            cache_path,
             model,
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &model, chunk_size, overlap).await?;
+            let core = rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
             for path_str in &paths {
                 let path = std::path::Path::new(path_str);
                 if !path.exists() {
@@ -175,11 +195,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Search {
             query,
             db_path,
+            cache_path,
             model,
             top_k,
             source,
         } => {
-            let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
+            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let query_str = query.join(" ");
             let results: Vec<rust_rag_mcp::SearchResult> =
                 core.search(&query_str, top_k, source.as_deref()).await?;
@@ -200,8 +221,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Sources { db_path, model } => {
-            let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
+        Commands::Sources { db_path, cache_path, model } => {
+            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let sources = core.list_sources().await?;
             if sources.is_empty() {
                 println!("No indexed sources.");
@@ -212,8 +233,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Stats { db_path, model } => {
-            let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
+        Commands::Stats { db_path, cache_path, model } => {
+            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let count = core.chunk_count().await?;
             let sources = core.list_sources().await?;
             println!("Indexed chunks: {}", count);
@@ -226,9 +247,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Delete {
             source_path,
             db_path,
+            cache_path,
             model,
         } => {
-            let core = rag::RagCore::new(&db_path, &model, 512, 64).await?;
+            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             match core.delete_source(&source_path).await {
                 Ok(()) => println!("Deleted: {}", source_path),
                 Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),

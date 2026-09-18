@@ -33,6 +33,6 @@ pub enum IndexResult {
 pub struct DocumentStatus {
     pub source_path: String,
     pub content_hash: String,
-    pub indexed_at: String,
+    pub indexed_at: u64,
     pub chunk_count: u32,
 }

@@ -24,13 +24,23 @@ pub struct RagCore {
 }
 
 impl RagCore {
+
+    /**
+     * Creates a new instance of RagCore with the specified database path, cache directory,
+     * model name, chunk size, and overlap. Initializes the embedding service, chunker,
+     * syntax chunker, and sets up the necessary tables and indexes in the database.
+     */
     pub async fn new(
         db_path: &str,
+        cache_dir: &str,
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
     ) -> Result<Self> {
-        let embedding = EmbeddingService::new(model_name)?;
+        let embedding = EmbeddingService::new(
+            model_name,
+            cache_dir
+        )?;
         let ndims = embedding.dimensions() as i32;
 
         let db = lancedb::connect(db_path).execute().await?;
@@ -68,11 +78,9 @@ impl RagCore {
         let metadata_table_name = "document_metadata";
         let metadata_table = match db.open_table(metadata_table_name).execute().await {
             Ok(t) => t,
-            Err(_) => {
-                db.create_empty_table(metadata_table_name, metadata_schema)
+            Err(_) => db.create_empty_table(metadata_table_name, metadata_schema)
                     .execute()
                     .await?
-            }
         };
 
         Ok(Self {
@@ -84,6 +92,9 @@ impl RagCore {
         })
     }
 
+    /**
+     * Computes the SHA-256 hash of the contents of the specified file asynchronously.
+     */
     async fn compute_file_hash(path: &Path) -> Result<String> {
         let bytes = tokio::fs::read(path).await?;
         let mut hasher = Sha256::new();
@@ -91,12 +102,18 @@ impl RagCore {
         Ok(hex::encode(hasher.finalize()))
     }
 
+    /**
+     * Computes the SHA-256 hash of the given text synchronously.
+     */
     fn compute_text_hash(text: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         hex::encode(hasher.finalize())
     }
 
+    /**
+     * Indexes the specified file by extracting its text, chunking it, and storing the chunks and metadata in the database.
+     */
     pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
         let source_path = path
             .canonicalize()
@@ -130,12 +147,15 @@ impl RagCore {
         self.index_chunks(chunks).await?;
 
         let now = chrono_free_timestamp();
-        self.upsert_metadata(&source_path, &content_hash, &now, count as u32)
+        self.upsert_metadata(&source_path, &content_hash, now, count as u32)
             .await?;
 
         Ok(IndexResult::Indexed(count))
     }
 
+    /**
+     * Indexes the given text by chunking it and storing the chunks and metadata in the database.
+     */
     pub async fn index_text(&self, text: &str, source: &str) -> Result<IndexResult> {
         let content_hash = Self::compute_text_hash(text);
 
@@ -157,12 +177,15 @@ impl RagCore {
         self.index_chunks(chunks).await?;
 
         let now = chrono_free_timestamp();
-        self.upsert_metadata(source, &content_hash, &now, count as u32)
+        self.upsert_metadata(source, &content_hash, now, count as u32)
             .await?;
 
         Ok(IndexResult::Indexed(count))
     }
 
+    /**
+     * Indexes the given chunks by generating embeddings and storing them in the database.
+     */
     async fn index_chunks(&self, chunks: Vec<DocumentChunk>) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
@@ -223,6 +246,10 @@ impl RagCore {
         Ok(())
     }
 
+    /**
+     * Performs a semantic search for the given query string, returning the top_k most relevant results.
+     * Optionally filters results by the specified source.
+     */
     pub async fn search(
         &self,
         query: &str,
@@ -326,10 +353,16 @@ impl RagCore {
         Ok(search_results)
     }
 
+    /**
+     * Returns the total number of chunks stored in the database.
+     */
     pub async fn chunk_count(&self) -> Result<usize> {
         Ok(self.table.count_rows(None).await? as usize)
     }
 
+    /**
+     * Returns a list of all unique sources present in the database.
+     */
     pub async fn list_sources(&self) -> Result<Vec<String>> {
         let results: Vec<RecordBatch> = self
             .table
@@ -355,6 +388,9 @@ impl RagCore {
         Ok(v)
     }
 
+    /**
+     * Deletes all chunks and metadata associated with the specified source path from the database.
+     */
     pub async fn delete_source(&self, source_path: &str) -> Result<()> {
         self.table
             .delete(&format!("source = '{}'", source_path))
@@ -365,6 +401,10 @@ impl RagCore {
         Ok(())
     }
 
+    /**
+     * Retrieves the status of the document associated with the specified source path.
+     * Returns None if the document is not found.
+     */
     pub async fn document_status(&self, source_path: &str) -> Result<Option<DocumentStatus>> {
         let results: Vec<RecordBatch> = self
             .metadata_table
@@ -384,7 +424,7 @@ impl RagCore {
                 .and_then(|col| col.as_any().downcast_ref::<StringArray>());
             let timestamps = batch
                 .column_by_name("indexed_at")
-                .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>());
             let counts = batch
                 .column_by_name("chunk_count")
                 .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
@@ -396,7 +436,7 @@ impl RagCore {
                     return Ok(Some(DocumentStatus {
                         source_path: sp.value(0).to_string(),
                         content_hash: h.value(0).to_string(),
-                        indexed_at: t.value(0).to_string(),
+                        indexed_at: t.value(0),
                         chunk_count: c.value(0),
                     }));
                 }
@@ -405,11 +445,14 @@ impl RagCore {
         Ok(None)
     }
 
+    /**
+     * Upserts the metadata for a document, replacing any existing entry with the same source path.
+     */
     async fn upsert_metadata(
         &self,
         source_path: &str,
         content_hash: &str,
-        indexed_at: &str,
+        indexed_at: u64,
         chunk_count: u32,
     ) -> Result<()> {
         self.metadata_table
@@ -420,13 +463,13 @@ impl RagCore {
             Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
                 Field::new("source_path", DataType::Utf8, false),
                 Field::new("content_hash", DataType::Utf8, true),
-                Field::new("indexed_at", DataType::Utf8, true),
+                Field::new("indexed_at", DataType::UInt64, true),
                 Field::new("chunk_count", DataType::UInt32, true),
             ])),
             vec![
                 Arc::new(StringArray::from(vec![source_path])),
                 Arc::new(StringArray::from(vec![content_hash])),
-                Arc::new(StringArray::from(vec![indexed_at])),
+                Arc::new(UInt64Array::from(vec![indexed_at])),
                 Arc::new(UInt32Array::from(vec![chunk_count])),
             ],
         )?;
@@ -440,9 +483,12 @@ impl RagCore {
     }
 }
 
-fn chrono_free_timestamp() -> String {
+/**
+ * Generates a timestamp string representing the current time in seconds since the UNIX epoch.
+ */
+fn chrono_free_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| format!("{}", d.as_secs()))
-        .unwrap_or_else(|_| "0".to_string())
+        .map(|d| d.as_secs())
+        .unwrap_or_else(|_| 0)
 }

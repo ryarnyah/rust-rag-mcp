@@ -1,5 +1,5 @@
 /target
 *.safetensors
 .fastembed_cache
-.rig-rag-db
+.rag-db
 .DS_Store
