@@ -260,7 +260,7 @@ fn norm(a: &[f32]) -> f32 {
 /// # Errors
 /// Returns `VectorDbError::NaNDistance` if either vector has NaN or distance is NaN
 #[inline]
-fn cosine_distance(a: &[f32], b: &[f32]) -> Result<f32> {
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> Result<f32> {
     let dot_prod = dot(a, b);
     let norm_a = norm(a).max(1e-20);
     let norm_b = norm(b).max(1e-20);
@@ -752,152 +752,87 @@ impl HnswIndex {
         ((-r.ln() * ml) as usize).min(self.cfg.max_level)
     }
 
-    /// Select M best neighbors from candidates using heuristic
+    /// Select M best neighbors from precomputed distances using heuristic.
     ///
-    /// Uses HashSet for O(1) deduplication instead of O(n) linear search.
-     fn select_neighbors_heuristic<F: Fn(u32, u32) -> Result<f32>>(
-         &self,
-         ref_id: u32,
-         candidates: &[u32],
-         m: usize,
-         dist: &F,
-     ) -> Result<Vec<u32>> {
-         let mut result: Vec<u32> = Vec::with_capacity(m);
-         let mut seen: HashSet<u32> = HashSet::new();
-         let mut need_fill = m;
+    /// `dists` must be pre-sorted by distance to the reference node (ascending).
+    /// Each entry is `(neighbor_id, distance_to_ref)`.
+    fn select_neighbors_heuristic(
+        dists: &[(u32, f32)],
+        m: usize,
+        cross_dist: impl Fn(u32, u32) -> Result<f32>,
+    ) -> Result<Vec<u32>> {
+        if dists.len() <= m {
+            return Ok(dists.iter().map(|(n, _)| *n).collect());
+        }
 
-         // Single pass: apply heuristic and fill simultaneously
-         for &c in candidates {
-             if need_fill == 0 {
-                 break;
-             }
-             
-             if !seen.insert(c) {
-                 continue; // Already seen
-             }
+        let mut result: Vec<u32> = Vec::with_capacity(m);
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut cross_cache: HashMap<(u32, u32), f32> = HashMap::new();
 
-             let d_ref_c = dist(ref_id, c)?;
-             let mut keep = true;
-             
-             // Check if candidate is dominated by existing results
-             for &r in &result {
-                 if dist(c, r)? < d_ref_c {
-                     keep = false;
-                     break;
-                 }
-             }
-             
-             if keep {
-                 result.push(c);
-                 need_fill -= 1;
-             }
-         }
-
-         // Fill remaining slots with any unseen candidates
-         if need_fill > 0 {
-             for &c in candidates {
-                 if need_fill == 0 {
-                     break;
-                 }
-                 if seen.insert(c) {
-                     result.push(c);
-                     need_fill -= 1;
-                 }
-             }
-         }
-
-         Ok(result)
-     }
-
-     /// Add bidirectional link between two nodes at given layer
-     fn add_link<F: Fn(u32, u32) -> Result<f32>>(
-         &mut self,
-         id: u32,
-         layer: usize,
-         new: u32,
-         dist: &F,
-     ) -> Result<()> {
-         let cap = Self::layer_capacity(&self.cfg, layer);
-         let mut neighbors = self.layer_neighbors(id, layer);
-         if !neighbors.contains(&new) {
-             neighbors.push(new);
-         }
-         
-         // Pre-compute distances to avoid redundant calculations in sort and heuristic
-         let mut dists: Vec<(u32, f32)> = neighbors.iter()
-             .map(|&n| dist(id, n).map(|d| (n, d)))
-             .collect::<Result<Vec<_>>>()?;
-         
-         // Sort by distance
-         dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-
-          let selected = if dists.len() > cap {
-              // P1: Pre-compute HashMap for O(1) distance lookups in heuristic
-              let dist_map: std::collections::HashMap<u32, f32> = dists.iter()
-                  .map(|(n, d)| (*n, *d))
-                  .collect();
-              
-              // P2: Pre-compute cross-pair distances to avoid redundant calculations in heuristic loop
-              // dists is already sorted by distance to id, so we only need distances between
-              // candidates and result items (not candidate-to-query which we already have)
-              let mut cross_dist_map: std::collections::HashMap<(u32, u32), f32> = 
-                  std::collections::HashMap::new();
-              
-              // Use pre-computed distances for heuristic selection
-              let mut result: Vec<u32> = Vec::with_capacity(cap);
-              let mut seen = std::collections::HashSet::new();
-              
-              for (neighbor_id, _) in &dists {
-                  if result.len() >= cap {
-                      break;
-                   }
-                   
-                   // O(1) lookup instead of O(n) linear search
-                   let d_ref_n = dist_map.get(neighbor_id).copied().unwrap_or(0.0);
-                   
-                   let mut keep = true;
-                   for &r in &result {
-                       // P2: Check cache first, compute only if missing
-                       let cross_dist = if let Some(&d) = cross_dist_map.get(&(*neighbor_id, r)) {
-                           d
-                       } else {
-                           let d = dist(*neighbor_id, r)?;
-                           cross_dist_map.insert((*neighbor_id, r), d);
-                           d
-                       };
-                       
-                       if cross_dist < d_ref_n {
-                           keep = false;
-                           break;
-                       }
-                   }
-                   if keep && seen.insert(*neighbor_id) {
-                       result.push(*neighbor_id);
-                   }
+        for &(neighbor_id, d_ref_n) in dists {
+            if result.len() >= m {
+                break;
+            }
+            let mut keep = true;
+            for &r in &result {
+                let d = if let Some(&cached) = cross_cache.get(&(neighbor_id, r)) {
+                    cached
+                } else {
+                    let d = cross_dist(neighbor_id, r)?;
+                    cross_cache.insert((neighbor_id, r), d);
+                    d
+                };
+                if d < d_ref_n {
+                    keep = false;
+                    break;
                 }
-                
-                // Fill remaining slots if not enough satisfied heuristic
-                if result.len() < cap {
-                    for (neighbor_id, _) in &dists {
-                        if result.len() >= cap {
-                            break;
-                        }
-                        if seen.insert(*neighbor_id) {
-                            result.push(*neighbor_id);
-                        }
-                    }
-                }
-                result
-         } else {
-             dists.iter().map(|(n, _)| *n).collect()
-         };
+            }
+            if keep && seen.insert(neighbor_id) {
+                result.push(neighbor_id);
+            }
+        }
 
-         self.set_layer_count(id, layer, selected.len());
-         for (i, n) in selected.iter().enumerate() {
-             self.set_layer_neighbor(id, layer, i, *n);
-         }
-         Ok(())
-     }
+        if result.len() < m {
+            for &(neighbor_id, _) in dists {
+                if result.len() >= m {
+                    break;
+                }
+                if seen.insert(neighbor_id) {
+                    result.push(neighbor_id);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Add bidirectional link between two nodes at given layer
+    fn add_link<F: Fn(u32, u32) -> Result<f32>>(
+        &mut self,
+        id: u32,
+        layer: usize,
+        new: u32,
+        dist: &F,
+    ) -> Result<()> {
+        let cap = Self::layer_capacity(&self.cfg, layer);
+        let mut neighbors = self.layer_neighbors(id, layer);
+        if !neighbors.contains(&new) {
+            neighbors.push(new);
+        }
+
+        let mut dists: Vec<(u32, f32)> = neighbors.iter()
+            .map(|&n| dist(id, n).map(|d| (n, d)))
+            .collect::<Result<Vec<_>>>()?;
+        dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+
+        let selected = Self::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
+
+        self.set_layer_count(id, layer, selected.len());
+        for (i, n) in selected.iter().enumerate() {
+            self.set_layer_neighbor(id, layer, i, *n);
+        }
+        Ok(())
+    }
 
     /// Search layer for candidates similar to entry node
     fn search_layer<F, D>(
@@ -1027,8 +962,9 @@ impl HnswIndex {
             let candidates = self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
 
             let cap = Self::layer_capacity(&self.cfg, layer);
-            let ordered: Vec<u32> = candidates.iter().map(|&(_, id)| id).collect();
-            let selected = self.select_neighbors_heuristic(new_id, &ordered, cap, &dist)?;
+            let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
+            dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+            let selected = Self::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
 
             for &n in &selected {
                 self.add_link(new_id, layer, n, &dist)?;
@@ -1307,10 +1243,7 @@ impl VectorDb {
 
     /// Rebuild HNSW edges for a single node after vector data changed
     fn rebuild_hnsw_node(&mut self, id: u32) -> Result<()> {
-        let ptr = self.mmap().as_ptr();
-        let dim = self.cfg.dim;
-        let file_size = self.mmap().len();
-        let view = VectorView { ptr, dim, file_size };
+        let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |id: u32| self.meta.is_deleted(id);
 
@@ -1357,10 +1290,9 @@ impl VectorDb {
                 ep, layer, self.cfg.ef_construction, &to_new, &is_deleted,
             )?;
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
-            let ordered: Vec<u32> = candidates.iter().map(|&(_, id)| id).collect();
-            let selected = self.index.select_neighbors_heuristic(
-                id, &ordered, cap, &dist,
-            )?;
+            let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
+            dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+            let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
             for &n in &selected {
                 self.index.add_link(id, layer, n, &dist)?;
                 self.index.add_link(n, layer, id, &dist)?;
@@ -1390,10 +1322,7 @@ impl VectorDb {
         self.set_len_field(n + 1);
         self.meta.put(id, 0, metadata)?;
 
-        let ptr = self.mmap().as_ptr();
-        let dim = self.cfg.dim;
-        let file_size = self.mmap().len();
-        let view = VectorView { ptr, dim, file_size };
+        let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |_id: u32| false;
         self.index.insert(id, dist, &is_deleted)?;
@@ -1406,6 +1335,14 @@ impl VectorDb {
 
     fn mmap_mut(&mut self) -> &mut MmapMut {
         self.mmap.as_mut().expect("vec mmap present")
+    }
+
+    fn vector_view(&self) -> VectorView {
+        VectorView {
+            ptr: self.mmap().as_ptr(),
+            dim: self.cfg.dim,
+            file_size: self.mmap().len(),
+        }
     }
 
     /// Get vector dimensionality
@@ -1426,6 +1363,11 @@ impl VectorDb {
      /// Get number of live (non-deleted) vectors
      pub fn live_len(&self) -> usize {
          self.len() - self.deleted_count
+     }
+
+     /// Get number of deleted vectors
+     pub fn deleted_count(&self) -> usize {
+         self.deleted_count
      }
 
      /// Get deletion statistics
@@ -1521,10 +1463,7 @@ impl VectorDb {
         self.set_len_field(n + 1);
         self.meta.put(id, 0, meta_bytes)?;
 
-        let ptr = self.mmap().as_ptr();
-        let dim = self.cfg.dim;
-        let file_size = self.mmap().len();
-        let view = VectorView { ptr, dim, file_size };
+        let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |_id: u32| false;
         self.index.insert(id, dist, &is_deleted)?;
@@ -1574,18 +1513,6 @@ impl VectorDb {
          self.index.mark_deleted(id);
          self.deleted_count += 1;
 
-         // Log deletion and check if compaction needed
-         let (deleted, total, ratio) = self.deletion_stats();
-         if ratio >= 0.30 {
-             tracing::warn!(
-                 vector_id = id,
-                 deleted_count = deleted,
-                 total_count = total,
-                 deletion_ratio = ratio,
-                 "High deletion ratio detected, consider compacting the database"
-             );
-         }
-
          Ok(true)
      }
 
@@ -1595,12 +1522,9 @@ impl VectorDb {
              return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
          }
 
-         let ptr = self.mmap().as_ptr();
-         let dim = self.cfg.dim;
-         let file_size = self.mmap().len();
-         let view = VectorView { ptr, dim, file_size };
+         let view = self.vector_view();
          let dist = |id: u32| -> Result<f32> {
-             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: (file_size as u32) })?;
+             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: view.file_size as u32 })?;
              cosine_distance(v, query)
          };
          let is_deleted = |id: u32| self.meta.is_deleted(id);
@@ -1649,12 +1573,9 @@ impl VectorDb {
              return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
          }
 
-         let ptr = self.mmap().as_ptr();
-         let dim = self.cfg.dim;
-         let file_size = self.mmap().len();
-         let view = VectorView { ptr, dim, file_size };
+         let view = self.vector_view();
          let dist = |id: u32| -> Result<f32> {
-             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: (file_size as u32) })?;
+             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: view.file_size as u32 })?;
              cosine_distance(v, query)
          };
          let is_deleted = |id: u32| self.meta.is_deleted(id);
@@ -1962,967 +1883,4 @@ pub struct SearchHitOwned {
     pub metadata: Vec<u8>,
 }
 
-// ============================================================================
-//  Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn cleanup(path: &str) {
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(format!("{}.hnsw", path));
-        let _ = fs::remove_file(format!("{}.meta", path));
-        let _ = fs::remove_file(format!("{}.wal", path));
-        // Clean up numbered WAL segments
-        let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
-        let prefix = format!("{}.wal.", std::path::Path::new(path).file_name().unwrap().to_string_lossy());
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with(&prefix) {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_config_builder() {
-        let cfg = Config::new(16)
-            .with_m(4)
-            .with_max_level(12)
-            .with_ef_construction(128)
-            .with_capacity(512)
-            .with_seed(42);
-
-        assert_eq!(cfg.dim, 16);
-        assert_eq!(cfg.m, 4);
-        assert_eq!(cfg.m0, 8);
-        assert_eq!(cfg.max_level, 12);
-        assert_eq!(cfg.ef_construction, 128);
-        assert_eq!(cfg.initial_capacity, 512);
-        assert_eq!(cfg.seed, 42);
-    }
-
-    #[test]
-    fn test_cosine_distance() {
-        let a = vec![1.0, 0.0];
-        let b = vec![1.0, 0.0];
-        let dist = cosine_distance(&a, &b).unwrap();
-        assert!(dist < 0.001);
-
-        let a = vec![1.0, 0.0];
-        let b = vec![0.0, 1.0];
-        let dist = cosine_distance(&a, &b).unwrap();
-        assert!((dist - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_cosine_distance_nan() {
-        let a = vec![f32::NAN, 1.0];
-        let b = vec![1.0, 1.0];
-        assert!(cosine_distance(&a, &b).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_metadata_simple() -> Result<()> {
-        cleanup("test_meta_simple.db");
-        {
-            let cfg = Config::new(3).with_capacity(16);
-            let mut db = VectorDb::open("test_meta_simple.db", cfg).await?;
-
-            let id = db.insert(&[1.0, 2.0, 3.0], Some(b"mydata"))?;
-            
-            let meta = db.get_meta(id)?;
-            assert_eq!(meta.map(|m| m.to_vec()), Some(b"mydata".to_vec()), "Metadata should match");
-            
-            db.flush().await?;
-            
-            let meta = db.get_meta(id)?;
-            assert_eq!(meta.map(|m| m.to_vec()), Some(b"mydata".to_vec()), "Metadata should persist after flush");
-        }
-        cleanup("test_meta_simple.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_vectordb_insert_single() -> Result<()> {
-        cleanup("test_vec.db");
-        {
-            let cfg = Config::new(3).with_capacity(16);
-            let mut db = VectorDb::open("test_vec.db", cfg).await?;
-
-            let v = vec![1.0, 2.0, 3.0];
-            let id = db.insert(&v, Some(b"test"))?;
-
-            assert_eq!(id, 0);
-            assert_eq!(db.len(), 1);
-            assert_eq!(db.live_len(), 1);
-            assert_eq!(db.get(id)?, Some(vec![1.0, 2.0, 3.0]));
-        }
-        cleanup("test_vec.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_vectordb_dimension_mismatch() -> Result<()> {
-        cleanup("test_dim.db");
-        {
-            let cfg = Config::new(3);
-            let mut db = VectorDb::open("test_dim.db", cfg).await?;
-
-            let v = vec![1.0, 2.0];
-            let result = db.insert(&v, None);
-            assert!(matches!(result, Err(VectorDbError::DimensionMismatch { .. })));
-        }
-        cleanup("test_dim.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_vectordb_delete() -> Result<()> {
-        cleanup("test_del.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_del.db", cfg).await?;
-
-            let id = db.insert(&[1.0, 2.0], None)?;
-            assert!(!db.is_deleted(id));
-            assert_eq!(db.live_len(), 1);
-
-            let deleted = db.delete(id)?;
-            assert!(deleted);
-            assert!(db.is_deleted(id));
-            assert_eq!(db.get(id)?, None);
-            assert_eq!(db.live_len(), 0);
-        }
-        cleanup("test_del.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_vectordb_search_basic() -> Result<()> {
-        cleanup("test_search.db");
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let mut db = VectorDb::open("test_search.db", cfg).await?;
-
-            db.insert(&[1.0, 0.0], None)?;
-            db.insert(&[0.0, 1.0], None)?;
-            db.insert(&[1.0, 1.0], None)?;
-
-            let query = vec![1.0, 0.0];
-            let results = db.search(&query, 2, 32)?;
-
-            assert!(results.len() <= 2);
-            assert!(results.iter().all(|h| !db.is_deleted(h.id)));
-        }
-        cleanup("test_search.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_async_insert_concurrent() -> Result<()> {
-        cleanup("test_async.db");
-        {
-            let cfg = Config::new(4).with_capacity(32);
-            let db = AsyncVectorDb::open("test_async.db", cfg).await?;
-
-            let mut handles = vec![];
-            for i in 0..10 {
-                let db = db.clone();
-                let handle = tokio::spawn(async move {
-                    let v = vec![(i as f32) * 0.1; 4];
-                    db.insert(&v, None).await
-                });
-                handles.push(handle);
-            }
-
-            for handle in handles {
-                let _ = handle.await;
-            }
-
-            let len = db.len().await;
-            assert_eq!(len, 10);
-        }
-        cleanup("test_async.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_async_search() -> Result<()> {
-        cleanup("test_async_search.db");
-        {
-            let cfg = Config::new(2);
-            let db = AsyncVectorDb::open("test_async_search.db", cfg).await?;
-
-            db.insert(&[1.0, 0.0], None).await?;
-            db.insert(&[0.0, 1.0], None).await?;
-
-            let results = db.search(&[1.0, 0.0], 2, 32).await?;
-            assert!(!results.is_empty());
-        }
-        cleanup("test_async_search.db");
-        Ok(())
-    }
-
-    // ========== WAL and Recovery Tests ==========
-
-    #[tokio::test]
-    async fn test_wal_crash_insert_before_flush() -> Result<()> {
-        cleanup("test_wal_crash.db");
-        
-        // Stage 1: Insert vectors and flush (ensuring WAL makes it to disk)
-        {
-            let cfg = Config::new(4).with_capacity(32);
-            let mut db = VectorDb::open("test_wal_crash.db", cfg).await?;
-            
-            db.insert(&[0.1, 0.2, 0.3, 0.4], Some(b"vec1"))?;
-            db.insert(&[0.5, 0.6, 0.7, 0.8], Some(b"vec2"))?;
-            db.insert(&[0.9, 0.1, 0.2, 0.3], Some(b"vec3"))?;
-            
-            // Flush to write WAL and checkpoint
-            db.flush().await?;
-        }
-        
-        // Stage 2: Reopen and verify all data is persisted
-        {
-            let cfg = Config::new(4).with_capacity(32);
-            let db = VectorDb::open("test_wal_crash.db", cfg).await?;
-            
-            // All 3 vectors should be persisted
-            assert_eq!(db.len(), 3, "Should have 3 vectors");
-            assert_eq!(db.live_len(), 3);
-            
-            assert_eq!(db.get(0)?, Some(vec![0.1, 0.2, 0.3, 0.4]));
-            assert_eq!(db.get(1)?, Some(vec![0.5, 0.6, 0.7, 0.8]));
-            assert_eq!(db.get(2)?, Some(vec![0.9, 0.1, 0.2, 0.3]));
-            
-            assert_eq!(db.get_meta(0)?.map(|m| m.to_vec()), Some(b"vec1".to_vec()));
-            assert_eq!(db.get_meta(1)?.map(|m| m.to_vec()), Some(b"vec2".to_vec()));
-            assert_eq!(db.get_meta(2)?.map(|m| m.to_vec()), Some(b"vec3".to_vec()));
-        }
-        
-        cleanup("test_wal_crash.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_crash_delete_before_flush() -> Result<()> {
-        cleanup("test_wal_delete_crash.db");
-        
-        // Stage 1: Create database and insert vectors
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let mut db = VectorDb::open("test_wal_delete_crash.db", cfg).await?;
-            
-            db.insert(&[1.0, 0.0, 0.0], None)?;
-            db.insert(&[0.0, 1.0, 0.0], None)?;
-            db.insert(&[0.0, 0.0, 1.0], None)?;
-            db.flush().await?; // Flush initial inserts
-        }
-        
-        // Stage 2: Delete one and simulate crash
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let mut db = VectorDb::open("test_wal_delete_crash.db", cfg).await?;
-            
-            assert_eq!(db.live_len(), 3);
-            db.delete(1)?; // Delete middle vector
-            
-            // Simulate crash: don't flush
-        }
-        
-        // Stage 3: Reopen and verify deletion was recovered
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let db = VectorDb::open("test_wal_delete_crash.db", cfg).await?;
-            
-            assert_eq!(db.len(), 3, "All vectors still tracked");
-            assert_eq!(db.live_len(), 2, "One vector deleted");
-            assert_eq!(db.is_deleted(0), false);
-            assert_eq!(db.is_deleted(1), true, "Deletion should be recovered");
-            assert_eq!(db.is_deleted(2), false);
-        }
-        
-        cleanup("test_wal_delete_crash.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_crash_update_before_flush() -> Result<()> {
-        cleanup("test_wal_update_crash.db");
-        
-        // Stage 1: Create database and insert
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let mut db = VectorDb::open("test_wal_update_crash.db", cfg).await?;
-            
-            db.insert(&[1.0, 0.0], Some(b"original"))?;
-            db.flush().await?;
-        }
-        
-        // Stage 2: Update and flush
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let mut db = VectorDb::open("test_wal_update_crash.db", cfg).await?;
-            
-            db.update(0, &[2.0, 3.0], Some(b"updated"))?;
-            db.flush().await?; // Flush to make the update durable
-        }
-        
-        // Stage 3: Reopen and verify update persisted
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let db = VectorDb::open("test_wal_update_crash.db", cfg).await?;
-            
-            assert_eq!(db.get(0)?, Some(vec![2.0, 3.0]), "Update should be persisted");
-            assert_eq!(db.get_meta(0)?.map(|m| m.to_vec()), Some(b"updated".to_vec()));
-        }
-        
-        cleanup("test_wal_update_crash.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_mixed_operations_crash() -> Result<()> {
-        cleanup("test_wal_mixed.db");
-        
-        // Stage 1: Setup database
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let mut db = VectorDb::open("test_wal_mixed.db", cfg).await?;
-            
-            // Insert 5 vectors
-            for i in 0..5 {
-                let v = vec![(i as f32) * 0.1, 0.5, 0.9];
-                db.insert(&v, Some(format!("vec{}", i).as_bytes()))?;
-            }
-            db.flush().await?;
-        }
-        
-        // Stage 2: Mixed operations with flush
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let mut db = VectorDb::open("test_wal_mixed.db", cfg).await?;
-            
-            // Insert new
-            db.insert(&[0.2, 0.3, 0.4], Some(b"vec5"))?;
-            
-            // Update existing
-            db.update(1, &[1.0, 2.0, 3.0], Some(b"updated1"))?;
-            
-            // Delete one
-            db.delete(3)?;
-            
-            db.flush().await?; // Flush to persist all changes
-        }
-        
-        // Stage 3: Verify all operations persisted
-        {
-            let cfg = Config::new(3).with_capacity(32);
-            let db = VectorDb::open("test_wal_mixed.db", cfg).await?;
-            
-            assert_eq!(db.len(), 6, "Should have 6 vectors total");
-            assert_eq!(db.live_len(), 5, "One should be deleted");
-            
-            // Check insert was persisted
-            assert_eq!(db.get(5)?, Some(vec![0.2, 0.3, 0.4]));
-            
-            // Check update was persisted
-            assert_eq!(db.get(1)?, Some(vec![1.0, 2.0, 3.0]));
-            assert_eq!(db.get_meta(1)?.map(|m| m.to_vec()), Some(b"updated1".to_vec()));
-            
-            // Check delete was persisted
-            assert_eq!(db.is_deleted(3), true);
-            assert_eq!(db.get(3)?, None);
-            
-            // Original vectors intact
-            assert_eq!(db.is_deleted(0), false);
-            assert_eq!(db.is_deleted(2), false);
-            assert_eq!(db.is_deleted(4), false);
-        }
-        
-        cleanup("test_wal_mixed.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_rotation_creates_segments() -> Result<()> {
-        cleanup("test_wal_rotation.db");
-
-        // Use a very small segment size to trigger rotation quickly
-        let cfg = Config::new(4)
-            .with_capacity(32)
-            .with_max_wal_segment_size(256) // 256 bytes - very small to trigger rotation
-            .with_max_total_wal_size(0); // No total size limit
-
-        {
-            let mut db = VectorDb::open("test_wal_rotation.db", cfg).await?;
-
-            // Insert enough vectors to exceed 256 bytes and trigger rotation
-            for i in 0..20u32 {
-                let v = vec![i as f32, 0.1, 0.2, 0.3];
-                db.insert(&v, Some(&i.to_le_bytes()))?;
-            }
-
-            // Small delay to let the async WAL writer process all queued messages
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            // Count all files matching the WAL pattern in the current directory
-            let mut segment_count = 0;
-            if let Ok(entries) = fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with("test_wal_rotation.db.wal.") {
-                        segment_count += 1;
-                    }
-                }
-            }
-            assert!(segment_count >= 1, "Expected at least 1 WAL segment, found {}", segment_count);
-        }
-
-        // Reopen and verify all data is recovered
-        {
-            let cfg = Config::new(4)
-                .with_capacity(32)
-                .with_max_wal_segment_size(256)
-                .with_max_total_wal_size(0);
-            let db = VectorDb::open("test_wal_rotation.db", cfg).await?;
-            assert_eq!(db.len(), 20, "Should recover all 20 vectors from multi-segment WAL");
-        }
-
-        cleanup("test_wal_rotation.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_total_size_cleanup() -> Result<()> {
-        cleanup("test_wal_cleanup.db");
-
-        // Use small segment and total size limits
-        let cfg = Config::new(4)
-            .with_capacity(32)
-            .with_max_wal_segment_size(200) // Small segment
-            .with_max_total_wal_size(600); // Total limit - should force cleanup of old segments
-
-        {
-            let mut db = VectorDb::open("test_wal_cleanup.db", cfg).await?;
-
-            // Batch 1: insert and flush to create checkpoint
-            for i in 0..10 {
-                let v = vec![i as f32, 0.0, 0.0, 0.0];
-                db.insert(&v, None)?;
-            }
-            db.flush().await?; // This creates a checkpoint
-
-            // Batch 2: insert more to trigger rotation and cleanup
-            for i in 10..30 {
-                let v = vec![i as f32, 0.1, 0.1, 0.1];
-                db.insert(&v, None)?;
-            }
-            db.flush().await?;
-
-            // Batch 3: more inserts
-            for i in 30..50 {
-                let v = vec![i as f32, 0.2, 0.2, 0.2];
-                db.insert(&v, None)?;
-            }
-            db.flush().await?;
-        }
-
-        // Verify we can still recover
-        {
-            let cfg = Config::new(4)
-                .with_capacity(32)
-                .with_max_wal_segment_size(200)
-                .with_max_total_wal_size(600);
-            let db = VectorDb::open("test_wal_cleanup.db", cfg).await?;
-            assert_eq!(db.len(), 50, "Should recover all 50 vectors after cleanup");
-        }
-
-        cleanup("test_wal_cleanup.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_multi_segment_recovery() -> Result<()> {
-        cleanup("test_wal_multi.db");
-
-        let cfg = Config::new(4)
-            .with_capacity(64)
-            .with_max_wal_segment_size(300) // Force frequent rotation
-            .with_max_total_wal_size(0);    // No cleanup
-
-        {
-            let mut db = VectorDb::open("test_wal_multi.db", cfg).await?;
-
-            // Insert enough to create multiple segments
-            for i in 0..30u32 {
-                let v = vec![i as f32, (i * 2) as f32, (i * 3) as f32, (i * 4) as f32];
-                db.insert(&v, Some(&i.to_le_bytes()))?;
-            }
-
-            // Don't flush - simulates crash with unflushed WAL data
-        }
-
-        // Reopen and verify recovery from multiple segments
-        {
-            let cfg = Config::new(4)
-                .with_capacity(64)
-                .with_max_wal_segment_size(300)
-                .with_max_total_wal_size(0);
-            let db = VectorDb::open("test_wal_multi.db", cfg).await?;
-            assert_eq!(db.len(), 30, "Should recover all 30 vectors from multiple WAL segments");
-        }
-
-        cleanup("test_wal_multi.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_no_cleanup_uncheckpointed_segments() -> Result<()> {
-        cleanup("test_wal_no_cleanup.db");
-
-        let cfg = Config::new(4)
-            .with_capacity(32)
-            .with_max_wal_segment_size(200)
-            .with_max_total_wal_size(400); // Very small total limit
-
-        {
-            let mut db = VectorDb::open("test_wal_no_cleanup.db", cfg).await?;
-
-            // Insert and create a segment but don't checkpoint
-            for i in 0..15 {
-                let v = vec![i as f32, 0.0, 0.0, 0.0];
-                db.insert(&v, None)?;
-            }
-
-            // Don't flush - the segment should NOT be deleted since it has no checkpoint
-        }
-
-        // Reopen and verify all data is still there
-        {
-            let cfg = Config::new(4)
-                .with_capacity(32)
-                .with_max_wal_segment_size(200)
-                .with_max_total_wal_size(400);
-            let db = VectorDb::open("test_wal_no_cleanup.db", cfg).await?;
-            assert_eq!(db.len(), 15, "Uncheckpointed segments should not be deleted");
-        }
-
-        cleanup("test_wal_no_cleanup.db");
-        Ok(())
-    }
-
-    // WAL clear after checkpoint - verifies data persists across multiple flush cycles
-    #[tokio::test]
-    async fn test_wal_clear_after_checkpoint() -> Result<()> {
-        cleanup("test_wal_clear.db");
-        
-        // Insert and flush multiple times
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let mut db = VectorDb::open("test_wal_clear.db", cfg).await?;
-            
-            for batch in 0..3 {
-                for i in 0..2 {
-                    let v = vec![(batch as f32) + (i as f32) * 0.1, 0.5];
-                    db.insert(&v, None)?;
-                }
-                db.flush().await?; // Checkpoints written to WAL
-            }
-            
-            assert_eq!(db.len(), 6);
-        }
-        
-        // Small delay to let WAL writer process truncate
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        
-        // Reopen: recovery should load based on last checkpoint
-        {
-            let cfg = Config::new(2).with_capacity(16);
-            let db = VectorDb::open("test_wal_clear.db", cfg).await?;
-            
-            // All vectors should still be there (persisted before last checkpoint)
-            assert_eq!(db.len(), 6);
-            assert_eq!(db.live_len(), 6);
-        }
-        
-        cleanup("test_wal_clear.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_wal_metrics_tracking() -> Result<()> {
-        cleanup("test_wal_metrics.db");
-
-        let cfg = Config::new(4).with_capacity(32);
-        {
-            let mut db = VectorDb::open("test_wal_metrics.db", cfg).await?;
-
-            // Insert some vectors
-            for i in 0..5 {
-                let v = vec![i as f32, 0.0, 0.0, 0.0];
-                db.insert(&v, None)?;
-            }
-
-            // Flush to ensure WAL writer processes all records and creates checkpoint
-            db.flush().await?;
-
-            // Verify data persisted correctly
-            assert_eq!(db.len(), 5, "Should have 5 vectors");
-        }
-
-        // Reopen and verify recovery
-        {
-            let cfg = Config::new(4).with_capacity(32);
-            let db = VectorDb::open("test_wal_metrics.db", cfg).await?;
-            assert_eq!(db.len(), 5, "Should recover all 5 vectors");
-        }
-
-        cleanup("test_wal_metrics.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_deleted_count_stability_across_recovery() -> Result<()> {
-        cleanup("test_deleted_stability.db");
-
-        // Stage 1: Insert and delete some vectors, then flush
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let mut db = VectorDb::open("test_deleted_stability.db", cfg).await?;
-
-            for i in 0..5 {
-                let v = vec![i as f32, 0.5];
-                db.insert(&v, None)?;
-            }
-            db.flush().await?;
-
-            // Delete 2 vectors
-            db.delete(1)?;
-            db.delete(3)?;
-            db.flush().await?;
-
-            let deleted = db.deleted_count;
-            let live = db.live_len();
-            assert_eq!(deleted, 2, "Should have 2 deleted vectors");
-            assert_eq!(live, 3, "Should have 3 live vectors");
-        }
-
-        // Stage 2: Reopen (recovery) and verify deleted_count is stable
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
-
-            let deleted = db.deleted_count;
-            let live = db.live_len();
-            assert_eq!(deleted, 2, "After recovery: should have 2 deleted vectors, got {}", deleted);
-            assert_eq!(live, 3, "After recovery: should have 3 live vectors, got {}", live);
-        }
-
-        // Stage 3: Reopen again to verify stability
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
-
-            let deleted = db.deleted_count;
-            let live = db.live_len();
-            assert_eq!(deleted, 2, "After second recovery: should have 2 deleted vectors, got {}", deleted);
-            assert_eq!(live, 3, "After second recovery: should have 3 live vectors, got {}", live);
-        }
-
-        cleanup("test_deleted_stability.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_flush_order_data_before_checkpoint() -> Result<()> {
-        cleanup("test_flush_order.db");
-
-        // Stage 1: Insert vectors and flush
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let mut db = VectorDb::open("test_flush_order.db", cfg).await?;
-
-            db.insert(&[1.0, 0.0], Some(b"first"))?;
-            db.insert(&[0.0, 1.0], Some(b"second"))?;
-            db.flush().await?;
-        }
-
-        // Stage 2: Add more vectors, crash before flush
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let mut db = VectorDb::open("test_flush_order.db", cfg).await?;
-
-            assert_eq!(db.len(), 2, "Should have 2 vectors from first stage");
-            db.insert(&[0.5, 0.5], Some(b"third"))?;
-
-            // Simulate crash: don't flush
-        }
-
-        // Stage 3: Reopen - recovery should replay the insert
-        {
-            let cfg = Config::new(2).with_capacity(32);
-            let db = VectorDb::open("test_flush_order.db", cfg).await?;
-
-            assert_eq!(db.len(), 3, "After recovery: should have 3 vectors");
-            assert_eq!(db.get(2)?, Some(vec![0.5, 0.5]));
-            assert_eq!(db.get_meta(2)?.map(|m| m.to_vec()), Some(b"third".to_vec()));
-        }
-
-        cleanup("test_flush_order.db");
-        Ok(())
-    }
-
-    // ========== Search Quality Tests ==========
-
-    #[tokio::test]
-    async fn test_score_range_clamping() -> Result<()> {
-        cleanup("test_score_range.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_score_range.db", cfg).await?;
-
-            // Insert orthogonal and parallel vectors
-            db.insert(&[1.0, 0.0], None)?;  // id=0
-            db.insert(&[0.0, 1.0], None)?;  // id=1 (orthogonal)
-            db.insert(&[1.0, 0.0], None)?;  // id=2 (identical)
-
-            // Search for first vector
-            let results = db.search(&[1.0, 0.0], 3, 32)?;
-
-            // All scores must be in [0.0, 1.0]
-            for hit in &results {
-                assert!(hit.score >= 0.0, "score must be >= 0.0, got {}", hit.score);
-                assert!(hit.score <= 1.0, "score must be <= 1.0, got {}", hit.score);
-            }
-
-            // Best match should have highest score
-            if results.len() >= 2 {
-                assert!(results[0].score >= results[1].score, "results should be ordered by score");
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_score_range.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_ordering_correctness() -> Result<()> {
-        cleanup("test_search_order.db");
-        {
-            let cfg = Config::new(3);
-            let mut db = VectorDb::open("test_search_order.db", cfg).await?;
-
-            // Insert vectors at varying distances from query
-            db.insert(&[1.0, 0.0, 0.0], None)?;  // id=0 (closest)
-            db.insert(&[0.5, 0.5, 0.5], None)?;  // id=1 (medium)
-            db.insert(&[0.0, 0.0, 1.0], None)?;  // id=2 (far)
-            db.insert(&[0.9, 0.0, 0.0], None)?;  // id=3 (very close)
-
-            let query = vec![1.0, 0.0, 0.0];
-            let results = db.search(&query, 4, 32)?;
-
-            // Verify results are ordered: best match first
-            assert!(results.len() > 0);
-            for i in 0..results.len()-1 {
-                assert!(
-                    results[i].score >= results[i+1].score,
-                    "results must be sorted by score descending, got scores: {:?}",
-                    results.iter().map(|h| h.score).collect::<Vec<_>>()
-                );
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_search_order.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_skip_deleted_vectors() -> Result<()> {
-        cleanup("test_search_deleted.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_search_deleted.db", cfg).await?;
-
-            db.insert(&[1.0, 0.0], None)?;  // id=0
-            db.insert(&[0.0, 1.0], None)?;  // id=1
-            db.insert(&[1.0, 0.0], None)?;  // id=2
-            db.insert(&[0.5, 0.5], None)?;  // id=3
-
-            // Delete vector id=0 (would be top match)
-            db.delete(0)?;
-            assert!(db.is_deleted(0));
-
-            let results = db.search(&[1.0, 0.0], 2, 32)?;
-
-            // Should not return deleted vector
-            for hit in &results {
-                assert!(!db.is_deleted(hit.id), "search returned deleted vector id={}", hit.id);
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_search_deleted.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_deletion_stats_tracking() -> Result<()> {
-        cleanup("test_del_stats.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_del_stats.db", cfg).await?;
-
-            // Insert 10 vectors
-            for i in 0..10 {
-                let v = vec![(i as f32) * 0.1, 0.5];
-                db.insert(&v, None)?;
-            }
-
-            // Check initial stats
-            let (deleted, total, ratio) = db.deletion_stats();
-            assert_eq!(deleted, 0);
-            assert_eq!(total, 10);
-            assert_eq!(ratio, 0.0);
-
-            // Delete 3 vectors
-            db.delete(0)?;
-            db.delete(5)?;
-            db.delete(9)?;
-
-            let (deleted, total, ratio) = db.deletion_stats();
-            assert_eq!(deleted, 3);
-            assert_eq!(total, 10);
-            assert!((ratio - 0.3).abs() < 0.01, "expected ratio ~0.3, got {}", ratio);
-
-            // Check should_compact threshold
-            assert!(!db.should_compact(), "should not compact at 30% boundary");
-            
-            // Delete one more (31%)
-            db.delete(7)?;
-            assert!(db.should_compact(), "should compact at 40% deletion");
-
-            db.flush().await?;
-        }
-        cleanup("test_del_stats.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_with_high_deletions() -> Result<()> {
-        cleanup("test_search_high_del.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_search_high_del.db", cfg).await?;
-
-            // Insert vectors
-            for i in 0..20 {
-                let v = vec![(i as f32) * 0.05, 0.5];
-                db.insert(&v, None)?;
-            }
-
-            // Delete 50% of vectors (leaving search index fragmented)
-            for i in (0..20).step_by(2) {
-                db.delete(i as u32)?;
-            }
-
-            let (_deleted, _total, ratio) = db.deletion_stats();
-            assert!(ratio >= 0.45, "should have ~50% deletion, got {}", ratio);
-
-            // Search should still work and return only live vectors
-            let results = db.search(&[0.5, 0.5], 5, 32)?;
-
-            assert!(!results.is_empty(), "search should return results despite deletions");
-            for hit in &results {
-                assert!(!db.is_deleted(hit.id), "returned deleted vector");
-                assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_search_high_del.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_empty_database() -> Result<()> {
-        cleanup("test_search_empty.db");
-        {
-            let cfg = Config::new(2);
-            let db = VectorDb::open("test_search_empty.db", cfg).await?;
-
-            let results = db.search(&[1.0, 0.0], 5, 32)?;
-            assert!(results.is_empty(), "search on empty database should return no results");
-        }
-        cleanup("test_search_empty.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_k_greater_than_size() -> Result<()> {
-        cleanup("test_search_k_large.db");
-        {
-            let cfg = Config::new(2);
-            let mut db = VectorDb::open("test_search_k_large.db", cfg).await?;
-
-            db.insert(&[1.0, 0.0], None)?;
-            db.insert(&[0.0, 1.0], None)?;
-
-            // Request k=100 but only 2 vectors exist
-            let results = db.search(&[1.0, 0.0], 100, 32)?;
-
-            assert_eq!(results.len(), 2, "should return all available vectors when k > size");
-            for hit in &results {
-                assert!(hit.score >= 0.0 && hit.score <= 1.0, "score out of range");
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_search_k_large.db");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_search_with_source_filter() -> Result<()> {
-        cleanup("test_source_filter.db");
-        {
-            let cfg = Config::new(2);
-            let db = AsyncVectorDb::open("test_source_filter.db", cfg).await?;
-
-            // Insert with metadata containing different sources
-            let meta1 = br#"{"source":"file1.txt","text":"hello"}"#;
-            let meta2 = br#"{"source":"file2.txt","text":"world"}"#;
-            let meta3 = br#"{"source":"file1.txt","text":"foo"}"#;
-
-            db.insert(&[1.0, 0.0], Some(meta1)).await?;
-            db.insert(&[0.0, 1.0], Some(meta2)).await?;
-            db.insert(&[1.0, 0.0], Some(meta3)).await?;
-
-            // Search for file1.txt only
-            let results = db.search_with_source_filter(&[1.0, 0.0], 10, 32, "file1.txt").await?;
-
-            // Should only return vectors from file1.txt
-            for hit in &results {
-                if let Ok(meta_obj) = serde_json::from_slice::<serde_json::Value>(&hit.metadata) {
-                    if let Some(source) = meta_obj.get("source").and_then(|s| s.as_str()) {
-                        assert_eq!(source, "file1.txt", "filtered result has wrong source");
-                    }
-                }
-            }
-
-            db.flush().await?;
-        }
-        cleanup("test_source_filter.db");
-        Ok(())
-    }
-}
 
