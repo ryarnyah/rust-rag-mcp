@@ -44,6 +44,7 @@ use tracing;
 use ndarray::ArrayView1;
 use std::cmp::Reverse;
 use ordered_float::OrderedFloat;
+use fs2::FileExt;
 
 use crate::wal::{WriteAheadLog, WalRecord, WalOpType};
 
@@ -99,7 +100,7 @@ pub struct Config {
     pub dim: usize,
     /// Maximum number of bidirectional connections per node (layers 1+)
     pub m: usize,
-    /// Maximum connections for layer 0 (always 2*m)
+    /// Maximum connections for layer 0 (default: 1.5*m, or 2*m when set via with_m)
     pub m0: usize,
     /// Maximum layer level for new nodes
     pub max_level: usize,
@@ -113,6 +114,8 @@ pub struct Config {
     pub max_wal_segment_size: u64,
     /// Maximum total WAL size across all segments in bytes before cleanup (0 = no limit)
     pub max_total_wal_size: u64,
+    /// Maximum number of WAL segments before cleanup (0 = no limit)
+    pub max_wal_segments: u32,
 }
 
 impl Config {
@@ -120,7 +123,7 @@ impl Config {
     ///
     /// # Defaults (HNSW parameters):
     /// - `m`: 20 (connections per layer)
-    /// - `m_max`: 30 (max connections for layer 0)
+    /// - `m0`: 30 (max connections for layer 0, ~1.5*m)
     /// - `max_level`: 7 (maximum tree depth)
     /// - `ef_construction`: 150 (search expansion during construction)
     /// - `max_wal_segment_size`: 64 MB (rotate WAL when segment exceeds this)
@@ -158,6 +161,7 @@ impl Config {
             initial_capacity: 1024,
             max_wal_segment_size: 64 * 1024 * 1024, // 64 MB per segment
             max_total_wal_size: 256 * 1024 * 1024,  // 256 MB total across all segments
+            max_wal_segments: 16,                    // max 16 WAL segments
         }
     }
 
@@ -207,6 +211,15 @@ impl Config {
     /// the oldest checkpointed segments are deleted. Set to 0 to disable cleanup.
     pub fn with_max_total_wal_size(mut self, max_total_wal_size: u64) -> Self {
         self.max_total_wal_size = max_total_wal_size;
+        self
+    }
+
+    /// Set maximum number of WAL segments before cleanup
+    ///
+    /// When the number of segments exceeds this limit, the oldest checkpointed
+    /// segments are deleted. Set to 0 to disable.
+    pub fn with_max_wal_segments(mut self, max_wal_segments: u32) -> Self {
+        self.max_wal_segments = max_wal_segments;
         self
     }
 }
@@ -604,6 +617,7 @@ impl HnswIndex {
                 initial_capacity: cfg.initial_capacity,
                 max_wal_segment_size: cfg.max_wal_segment_size,
                 max_total_wal_size: cfg.max_total_wal_size,
+                max_wal_segments: cfg.max_wal_segments,
             };
 
             if on_disk.m != cfg.m || on_disk.m0 != cfg.m0 || on_disk.max_level != cfg.max_level {
@@ -1129,6 +1143,8 @@ pub struct VectorDb {
     meta: MetadataStore,
     deleted_count: usize,
     wal: WriteAheadLog,
+    /// Advisory file lock to prevent concurrent access from multiple processes
+    _lock_file: File,
 }
 
 impl VectorDb {
@@ -1178,7 +1194,22 @@ impl VectorDb {
 
         let index = HnswIndex::open(hnsw_path(&path), &cfg).await?;
         let meta = MetadataStore::open(meta_path(&path)).await?;
-        let wal = WriteAheadLog::new(&path, cfg.max_wal_segment_size, cfg.max_total_wal_size).await.map_err(VectorDbError::Io)?;
+        let wal = WriteAheadLog::new(&path, cfg.max_wal_segment_size, cfg.max_total_wal_size, cfg.max_wal_segments).await.map_err(VectorDbError::Io)?;
+
+        // Prod 1 fix: Acquire exclusive advisory lock to prevent multi-process corruption
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(VectorDbError::Io)?;
+        lock_file.try_lock_exclusive().map_err(|_e| {
+            VectorDbError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Cannot open database: another process has an exclusive lock on {:?}", lock_path),
+            ))
+        })?;
 
         let mut db = Self {
             path: path.clone(),
@@ -1189,6 +1220,7 @@ impl VectorDb {
             meta,
             deleted_count: 0,
             wal,
+            _lock_file: lock_file,
         };
 
         for id in 0..db.len() as u32 {
@@ -1213,36 +1245,53 @@ impl VectorDb {
             return Ok(());
         }
 
+        tracing::info!("WAL recovery: replaying {} records", records.len());
+
         let mut recovered_count = 0;
         for record in records {
             match record.op_type {
                 WalOpType::Insert => {
                     if (record.vector_id as usize) >= self.len() {
-                        // Vector wasn't saved to disk yet, re-insert it
-                        let _ = self.insert_from_wal(&record)?;
+                        self.insert_from_wal(&record)?;
                         recovered_count += 1;
                     }
                 }
                 WalOpType::Delete => {
-                    if (record.vector_id as usize) < self.len() && !self.meta.is_deleted(record.vector_id) {
-                        let _ = self.delete(record.vector_id)?;
+                    if (record.vector_id as usize) < self.len()
+                        && !self.meta.is_deleted(record.vector_id)
+                    {
+                        // Bug 3 fix: Apply delete directly without WAL logging
+                        let prev = self.meta.get(record.vector_id)
+                            .map(|b| b.to_vec())
+                            .unwrap_or_default();
+                        self.meta.put(record.vector_id, META_FLAG_DELETED, &prev)?;
+                        self.index.mark_deleted(record.vector_id);
+                        self.deleted_count += 1;
                         recovered_count += 1;
                     }
                 }
                 WalOpType::Update => {
-                    if (record.vector_id as usize) < self.len() && !self.meta.is_deleted(record.vector_id) {
-                        // Update: re-apply from WAL
-                        self.row_mut(record.vector_id as usize).copy_from_slice(&record.vector_data);
+                    if (record.vector_id as usize) < self.len()
+                        && !self.meta.is_deleted(record.vector_id)
+                    {
+                        // Bug 4 fix: Update vector data, metadata, AND rebuild HNSW edges
+                        self.row_mut(record.vector_id as usize)
+                            .copy_from_slice(&record.vector_data);
                         self.meta.put(record.vector_id, 0, &record.metadata)?;
+
+                        // Rebuild HNSW edges for this node with the new vector data
+                        self.rebuild_hnsw_node(record.vector_id)?;
+
                         recovered_count += 1;
                     }
                 }
                 WalOpType::Checkpoint => {
                     // Checkpoint marker: all prior ops are safe on disk
-                    // Continue to load any records after this checkpoint (in case of new ops before crash)
                 }
             }
         }
+
+        tracing::info!("WAL recovery: recovered {} records", recovered_count);
 
         if recovered_count > 0 {
             self.flush().await?;
@@ -1251,17 +1300,90 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Rebuild HNSW edges for a single node after vector data changed
+    fn rebuild_hnsw_node(&mut self, id: u32) -> Result<()> {
+        let ptr = self.mmap().as_ptr();
+        let dim = self.cfg.dim;
+        let file_size = self.mmap().len();
+        let view = VectorView { ptr, dim, file_size };
+        let dist = |a: u32, b: u32| view.distance(a, b);
+        let is_deleted = |id: u32| self.meta.is_deleted(id);
+
+        // Re-insert the node to rebuild its edges at all layers
+        // First clear existing edges
+        let node_level = self.index.mmap.as_ref().unwrap()[self.index.node_offset(id)];
+        for layer in 0..=node_level as usize {
+            self.index.set_layer_count(id, layer, 0);
+        }
+
+        // Find nearest entry point for re-linking
+        let entry = self.index.entry_point();
+        if entry == NONE || entry == id {
+            return Ok(());
+        }
+
+        let mut ep = entry;
+        let mut ep_dist = dist(id, ep)?;
+
+        // Greedy descent to find closest entry point
+        let cur_max = self.index.max_level() as usize;
+        for layer in (1..=cur_max).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for n in self.index.layer_neighbors_iter(ep, layer) {
+                    if is_deleted(n) || n == id {
+                        continue;
+                    }
+                    let d = dist(id, n)?;
+                    if d < ep_dist {
+                        ep_dist = d;
+                        ep = n;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Re-link at each layer of this node
+        for layer in (0..=node_level as usize).rev() {
+            let to_new = |n: u32| dist(id, n);
+            let candidates = self.index.search_layer(
+                ep, layer, self.cfg.ef_construction, &to_new, &is_deleted,
+            )?;
+            let cap = HnswIndex::layer_capacity(&self.cfg, layer);
+            let ordered: Vec<u32> = candidates.iter().map(|&(_, id)| id).collect();
+            let selected = self.index.select_neighbors_heuristic(
+                id, &ordered, cap, &dist,
+            )?;
+            for &n in &selected {
+                self.index.add_link(id, layer, n, &dist)?;
+                self.index.add_link(n, layer, id, &dist)?;
+            }
+            if let Some(&(_, e)) = candidates.first() {
+                ep = e;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Insert from WAL record (used during recovery)
     fn insert_from_wal(&mut self, record: &WalRecord) -> Result<u32> {
+        self.insert_raw(&record.vector_data, &record.metadata)
+    }
+
+    /// Insert vector without WAL logging (used for compaction and recovery)
+    fn insert_raw(&mut self, v: &[f32], metadata: &[u8]) -> Result<u32> {
         let n = self.len();
+        let id = n as u32;
+
         if n == self.capacity() {
             self.grow()?;
         }
-        self.row_mut(n).copy_from_slice(&record.vector_data);
+        self.row_mut(n).copy_from_slice(v);
         self.set_len_field(n + 1);
-
-        let id = n as u32;
-        self.meta.put(id, 0, &record.metadata)?;
+        self.meta.put(id, 0, metadata)?;
 
         let ptr = self.mmap().as_ptr();
         let dim = self.cfg.dim;
@@ -1425,6 +1547,10 @@ impl VectorDb {
         // Now apply to database
         self.row_mut(id as usize).copy_from_slice(v);
         self.meta.put(id, 0, meta_bytes)?;
+
+        // Rebuild HNSW edges for this node with the new vector data
+        self.rebuild_hnsw_node(id)?;
+
         Ok(())
     }
 
@@ -1590,7 +1716,8 @@ impl VectorDb {
                 }
                 let v = self.row(id as usize).to_vec();
                 let meta = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
-                fresh.insert(&v, Some(&meta))?;
+                // Prod 4 fix: Use insert_raw to bypass WAL logging during compaction
+                fresh.insert_raw(&v, &meta)?;
             }
             fresh.flush().await?;
         }
@@ -1616,7 +1743,7 @@ impl VectorDb {
     /// Flush all pending changes to disk
     pub async fn flush(&mut self) -> Result<()> {
         // Write checkpoint to WAL and wait for fsync confirmation
-        self.wal.checkpoint(1).await
+        self.wal.checkpoint().await
             .map_err(VectorDbError::Io)?;
         
         // Then sync all data files
@@ -1625,7 +1752,7 @@ impl VectorDb {
         self.meta.flush()?;
         
         // Clear WAL after successful checkpoint
-        self.wal.clear()
+        self.wal.clear().await
             .map_err(VectorDbError::Io)?;
         
         Ok(())

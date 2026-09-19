@@ -4,3 +4,8 @@
 .rag-db
 .rag-cache
 .DS_Store
+# Test artifacts
+*.lock
+test_*.db
+
+*.db.wal*
