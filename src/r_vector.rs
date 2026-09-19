@@ -1236,6 +1236,10 @@ impl VectorDb {
     }
 
     /// Recover from Write-Ahead Log after crash
+    ///
+    /// Recovery is idempotent: records that were already applied to data files
+    /// before the crash are safely skipped. The flush() call at the end writes
+    /// a new checkpoint, so the WAL is truncated after successful recovery.
     async fn recover_from_wal(&mut self, db_path: &Path) -> Result<()> {
         let records = WriteAheadLog::load_for_recovery(db_path)
             .await
@@ -1251,16 +1255,17 @@ impl VectorDb {
         for record in records {
             match record.op_type {
                 WalOpType::Insert => {
+                    // Skip if already applied (idempotent)
                     if (record.vector_id as usize) >= self.len() {
                         self.insert_from_wal(&record)?;
                         recovered_count += 1;
                     }
                 }
                 WalOpType::Delete => {
+                    // Skip if already deleted or out of bounds (idempotent)
                     if (record.vector_id as usize) < self.len()
                         && !self.meta.is_deleted(record.vector_id)
                     {
-                        // Bug 3 fix: Apply delete directly without WAL logging
                         let prev = self.meta.get(record.vector_id)
                             .map(|b| b.to_vec())
                             .unwrap_or_default();
@@ -1271,10 +1276,10 @@ impl VectorDb {
                     }
                 }
                 WalOpType::Update => {
+                    // Skip if deleted or out of bounds (idempotent)
                     if (record.vector_id as usize) < self.len()
                         && !self.meta.is_deleted(record.vector_id)
                     {
-                        // Bug 4 fix: Update vector data, metadata, AND rebuild HNSW edges
                         self.row_mut(record.vector_id as usize)
                             .copy_from_slice(&record.vector_data);
                         self.meta.put(record.vector_id, 0, &record.metadata)?;
@@ -1741,20 +1746,32 @@ impl VectorDb {
     }
 
     /// Flush all pending changes to disk
+    ///
+    /// Order is critical for crash safety:
+    /// 1. Sync data files first (so data is durable on disk)
+    /// 2. Write WAL checkpoint marker + fsync (marks data as safe)
+    /// 3. Clear WAL (remove old records, safe since data is persisted)
+    ///
+    /// If a crash occurs between step 1 and step 2, recovery will replay
+    /// WAL records into already-flushed data files. The replay is idempotent:
+    /// - Inserts: skipped if vector_id < len (already applied)
+    /// - Deletes: skipped if already tombstoned
+    /// - Updates: re-applied (idempotent, same data written again)
     pub async fn flush(&mut self) -> Result<()> {
-        // Write checkpoint to WAL and wait for fsync confirmation
-        self.wal.checkpoint().await
-            .map_err(VectorDbError::Io)?;
-        
-        // Then sync all data files
+        // Step 1: Sync all data files to disk BEFORE checkpoint
         self.mmap().flush().map_err(VectorDbError::Io)?;
         self.index.flush()?;
         self.meta.flush()?;
-        
-        // Clear WAL after successful checkpoint
+
+        // Step 2: Write checkpoint to WAL and wait for fsync confirmation
+        // This marks all prior records as safely persisted
+        self.wal.checkpoint().await
+            .map_err(VectorDbError::Io)?;
+
+        // Step 3: Clear WAL after successful checkpoint
         self.wal.clear().await
             .map_err(VectorDbError::Io)?;
-        
+
         Ok(())
     }
 }
@@ -2537,6 +2554,126 @@ mod tests {
         }
         
         cleanup("test_wal_clear.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wal_metrics_tracking() -> Result<()> {
+        cleanup("test_wal_metrics.db");
+
+        let cfg = Config::new(4).with_capacity(32);
+        {
+            let mut db = VectorDb::open("test_wal_metrics.db", cfg).await?;
+
+            // Insert some vectors
+            for i in 0..5 {
+                let v = vec![i as f32, 0.0, 0.0, 0.0];
+                db.insert(&v, None)?;
+            }
+
+            // Flush to ensure WAL writer processes all records and creates checkpoint
+            db.flush().await?;
+
+            // Now metrics should reflect the writes and checkpoint
+            let records = db.wal.metrics().records_written.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(records >= 5, "Should have at least 5 records written, got {}", records);
+
+            let checkpoints = db.wal.metrics().checkpoints.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(checkpoints >= 1, "Should have at least 1 checkpoint, got {}", checkpoints);
+        }
+
+        cleanup("test_wal_metrics.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deleted_count_stability_across_recovery() -> Result<()> {
+        cleanup("test_deleted_stability.db");
+
+        // Stage 1: Insert and delete some vectors, then flush
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let mut db = VectorDb::open("test_deleted_stability.db", cfg).await?;
+
+            for i in 0..5 {
+                let v = vec![i as f32, 0.5];
+                db.insert(&v, None)?;
+            }
+            db.flush().await?;
+
+            // Delete 2 vectors
+            db.delete(1)?;
+            db.delete(3)?;
+            db.flush().await?;
+
+            let deleted = db.deleted_count;
+            let live = db.live_len();
+            assert_eq!(deleted, 2, "Should have 2 deleted vectors");
+            assert_eq!(live, 3, "Should have 3 live vectors");
+        }
+
+        // Stage 2: Reopen (recovery) and verify deleted_count is stable
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
+
+            let deleted = db.deleted_count;
+            let live = db.live_len();
+            assert_eq!(deleted, 2, "After recovery: should have 2 deleted vectors, got {}", deleted);
+            assert_eq!(live, 3, "After recovery: should have 3 live vectors, got {}", live);
+        }
+
+        // Stage 3: Reopen again to verify stability
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
+
+            let deleted = db.deleted_count;
+            let live = db.live_len();
+            assert_eq!(deleted, 2, "After second recovery: should have 2 deleted vectors, got {}", deleted);
+            assert_eq!(live, 3, "After second recovery: should have 3 live vectors, got {}", live);
+        }
+
+        cleanup("test_deleted_stability.db");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_order_data_before_checkpoint() -> Result<()> {
+        cleanup("test_flush_order.db");
+
+        // Stage 1: Insert vectors and flush
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let mut db = VectorDb::open("test_flush_order.db", cfg).await?;
+
+            db.insert(&[1.0, 0.0], Some(b"first"))?;
+            db.insert(&[0.0, 1.0], Some(b"second"))?;
+            db.flush().await?;
+        }
+
+        // Stage 2: Add more vectors, crash before flush
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let mut db = VectorDb::open("test_flush_order.db", cfg).await?;
+
+            assert_eq!(db.len(), 2, "Should have 2 vectors from first stage");
+            db.insert(&[0.5, 0.5], Some(b"third"))?;
+
+            // Simulate crash: don't flush
+        }
+
+        // Stage 3: Reopen - recovery should replay the insert
+        {
+            let cfg = Config::new(2).with_capacity(32);
+            let db = VectorDb::open("test_flush_order.db", cfg).await?;
+
+            assert_eq!(db.len(), 3, "After recovery: should have 3 vectors");
+            assert_eq!(db.get(2)?, Some(vec![0.5, 0.5]));
+            assert_eq!(db.get_meta(2)?.map(|m| m.to_vec()), Some(b"third".to_vec()));
+        }
+
+        cleanup("test_flush_order.db");
         Ok(())
     }
 
