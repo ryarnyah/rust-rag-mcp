@@ -397,6 +397,10 @@ impl RagCore {
         Ok(())
     }
 
+    pub async fn flush(&self) -> Result<()> {
+        self.vectors_db.flush().await.map_err(|e| anyhow::anyhow!("Flush failed: {}", e))
+    }
+
     /**
      * Retrieves the status of the document associated with the specified source path.
      * Returns None if the document is not found.
