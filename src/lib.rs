@@ -4,6 +4,7 @@ pub mod embeddings;
 pub mod mcp;
 pub mod r_vector;
 pub mod rag;
+pub mod schemar_ext;
 pub mod syntax_chunker;
 pub mod wal;
 

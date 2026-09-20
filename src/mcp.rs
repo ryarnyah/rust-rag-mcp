@@ -1,6 +1,7 @@
 use crate::IndexResult;
 use crate::docs;
 use crate::rag::RagCore;
+use crate::schemar_ext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, NumberOrString, ProgressNotificationParam, ProgressToken,
@@ -60,11 +61,11 @@ pub struct SearchRequest {
     #[schemars(
         description = "Maximum results to return (default: 5). Higher values return more candidates but take longer."
     )]
-    pub top_k: Option<usize>,
+    pub top_k: schemar_ext::Nullable<usize>,
     #[schemars(
         description = "Optional exact source path filter to restrict search to a single document."
     )]
-    pub source_filter: Option<String>,
+    pub source_filter: schemar_ext::Nullable<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
