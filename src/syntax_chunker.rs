@@ -58,7 +58,7 @@ fn parse_and_chunk(
     let mut stack: Vec<Node> = vec![tree.root_node()];
 
     while let Some(node) = stack.pop() {
-        if node.is_extra() || node.is_error() || node.is_missing() {
+        if node.is_extra() || node.is_error() || node.is_missing() || !node.is_named() {
             continue;
         }
 
@@ -157,6 +157,9 @@ fn is_top_level_node(kind: &str) -> bool {
             | "function"
         // C / C++
             | "struct_specifier" | "enum_specifier"
+            | "preproc_include" | "preproc_def" | "preproc_ifdef"
+            | "preproc_ifndef" | "preproc_if" | "preproc_else"
+            | "preproc_endif" | "preproc_function_def"
         // Java
             | "record_declaration" | "annotation_type_declaration"
         // C#
