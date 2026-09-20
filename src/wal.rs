@@ -88,8 +88,8 @@ impl WalRecord {
 
     fn write_to(&self, buf: &mut Vec<u8>) {
         let payload_len = self.vector_data.len() * 4 + self.metadata.len();
-        buf.reserve(RECORD_HEADER_LEN + payload_len + FOOTER_LEN - buf.len());
         buf.clear();
+        buf.reserve(RECORD_HEADER_LEN + payload_len + FOOTER_LEN);
 
         buf.extend_from_slice(&self.lsn.0.to_le_bytes());
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
@@ -522,7 +522,11 @@ impl WalWriter {
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WalMessage::Record(rec) => { let _ = self.write_record(&rec); }
+                WalMessage::Record(rec) => {
+                    if let Err(e) = self.write_record(&rec) {
+                        tracing::error!("WAL drain write failed: {}", e);
+                    }
+                }
                 WalMessage::Checkpoint { generation, ack } => { let _ = ack.send(self.do_checkpoint(generation)); }
                 WalMessage::Truncate { ack } => { let _ = ack.send(self.do_truncate()); }
                 WalMessage::Shutdown { .. } => {}
@@ -590,17 +594,18 @@ impl WalWriter {
         self.file.flush()?;
         self.file.sync_all()?;
 
-        // Rename current WAL to numbered segment
-        let old_path = self.wal_path.clone();
+        // Drop old handle, rename to segment, create new WAL
+        drop(std::mem::replace(&mut self.file, {
+            // Temporary dummy — immediately replaced below
+            OpenOptions::new().read(true).open("/dev/null")?
+        }));
+
         let seg_path = WriteAheadLog::segment_path(Path::new(&self.db_path_prefix), self.next_segment_id);
-
-        // Create new WAL first, then rename old to segment
-        let new_file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&self.wal_path)?;
-
-        // Release old handle, rename, adopt new handle
-        self.file = new_file;
-        fs::rename(&old_path, &seg_path)?;
+        fs::rename(&self.wal_path, &seg_path)?;
         self.next_segment_id += 1;
+
+        let new_file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&self.wal_path)?;
+        self.file = new_file;
 
         // Write header to new WAL with current checkpoint state
         let hdr = WalHeader {
