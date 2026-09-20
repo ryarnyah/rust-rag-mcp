@@ -1,12 +1,12 @@
+use crate::IndexResult;
 use crate::docs;
 use crate::rag::RagCore;
-use crate::IndexResult;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, NumberOrString, ProgressNotificationParam, ProgressToken,
 };
 use rmcp::service::RequestContext;
-use rmcp::{schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler};
+use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

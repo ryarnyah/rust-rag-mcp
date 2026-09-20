@@ -2,7 +2,7 @@ use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
 use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig};
-use crate::syntax_chunker::{language_for_extension, SyntaxChunker};
+use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
 use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -419,19 +419,16 @@ impl RagCore {
      */
     pub async fn document_status(&self, source_path: &str) -> Result<Option<DocumentStatus>> {
         // P3: Use metadata index for O(1) lookup instead of O(n) full table scan
-        if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await {
-            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(doc_id).await {
-                if let Ok(doc_meta) =
-                    serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes)
-                {
-                    return Ok(Some(DocumentStatus {
-                        source_path: doc_meta.source_path,
-                        content_hash: doc_meta.content_hash,
-                        indexed_at: doc_meta.indexed_at,
-                        chunk_count: doc_meta.chunk_count,
-                    }));
-                }
-            }
+        if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await
+            && let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(doc_id).await
+            && let Ok(doc_meta) = serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes)
+        {
+            return Ok(Some(DocumentStatus {
+                source_path: doc_meta.source_path,
+                content_hash: doc_meta.content_hash,
+                indexed_at: doc_meta.indexed_at,
+                chunk_count: doc_meta.chunk_count,
+            }));
         }
         Ok(None)
     }

@@ -1,4 +1,4 @@
-use rust_rag_mcp::r_vector::{cosine_distance, Config, VectorDb};
+use rust_rag_mcp::r_vector::{Config, VectorDb, cosine_distance};
 use rust_rag_mcp::wal::{Lsn, WalOpType, WalRecord};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -20,37 +20,41 @@ struct CountingAllocator {
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.inner.alloc(layout);
-        if !ptr.is_null() {
-            let size = layout.size() as u64;
-            self.allocated.fetch_add(size, Ordering::Relaxed);
-            let prev = self.current.fetch_add(size as i64, Ordering::Relaxed);
-            let cur = prev + size as i64;
-            if cur > 0 {
-                let cur = cur as u64;
-                loop {
-                    let old = self.peak.load(Ordering::Relaxed);
-                    if cur <= old {
-                        break;
-                    }
-                    if self
-                        .peak
-                        .compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        break;
+        unsafe {
+            let ptr = self.inner.alloc(layout);
+            if !ptr.is_null() {
+                let size = layout.size() as u64;
+                self.allocated.fetch_add(size, Ordering::Relaxed);
+                let prev = self.current.fetch_add(size as i64, Ordering::Relaxed);
+                let cur = prev + size as i64;
+                if cur > 0 {
+                    let cur = cur as u64;
+                    loop {
+                        let old = self.peak.load(Ordering::Relaxed);
+                        if cur <= old {
+                            break;
+                        }
+                        if self
+                            .peak
+                            .compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            break;
+                        }
                     }
                 }
             }
+            ptr
         }
-        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.inner.dealloc(ptr, layout);
-        let size = layout.size() as u64;
-        self.freed.fetch_add(size, Ordering::Relaxed);
-        self.current.fetch_sub(size as i64, Ordering::Relaxed);
+        unsafe {
+            self.inner.dealloc(ptr, layout);
+            let size = layout.size() as u64;
+            self.freed.fetch_add(size, Ordering::Relaxed);
+            self.current.fetch_sub(size as i64, Ordering::Relaxed);
+        }
     }
 }
 

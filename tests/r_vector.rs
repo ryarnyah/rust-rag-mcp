@@ -1,5 +1,5 @@
 use rust_rag_mcp::r_vector::Result;
-use rust_rag_mcp::r_vector::{cosine_distance, AsyncVectorDb, Config, VectorDb, VectorDbError};
+use rust_rag_mcp::r_vector::{AsyncVectorDb, Config, VectorDb, VectorDbError, cosine_distance};
 use std::fs;
 
 fn cleanup(path: &str) {

@@ -1,7 +1,7 @@
 [package]
 name = "rust-rag-mcp"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 description = "RAG MCP server using rig, fastembed, LanceDB, unpdf, undoc"
 

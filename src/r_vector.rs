@@ -604,11 +604,7 @@ impl HnswIndex {
 
     /// Capacity (max connections) for a specific layer
     fn layer_capacity(cfg: &Config, layer: usize) -> usize {
-        if layer == 0 {
-            cfg.m0
-        } else {
-            cfg.m
-        }
+        if layer == 0 { cfg.m0 } else { cfg.m }
     }
 
     /// Open or create HNSW index
@@ -1828,18 +1824,17 @@ impl VectorDb {
         for (id, d) in raw_results {
             let metadata = self.meta.get(id).unwrap_or(&[]);
             // Try to extract source field from metadata JSON for filtering
-            if let Ok(json_obj) = serde_json::from_slice::<serde_json::Value>(metadata) {
-                if let Some(source) = json_obj.get("source").and_then(|v| v.as_str()) {
-                    if source == source_filter {
-                        filtered.push(SearchHit {
-                            id,
-                            score: (1.0 - d).clamp(0.0, 1.0),
-                            metadata,
-                        });
-                        if filtered.len() >= k {
-                            break;
-                        }
-                    }
+            if let Ok(json_obj) = serde_json::from_slice::<serde_json::Value>(metadata)
+                && let Some(source) = json_obj.get("source").and_then(|v| v.as_str())
+                && source == source_filter
+            {
+                filtered.push(SearchHit {
+                    id,
+                    score: (1.0 - d).clamp(0.0, 1.0),
+                    metadata,
+                });
+                if filtered.len() >= k {
+                    break;
                 }
             }
         }

@@ -7,8 +7,8 @@ use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 
@@ -398,11 +398,11 @@ impl WriteAheadLog {
     }
 
     pub async fn checkpoint(&self) -> io::Result<()> {
-        let gen = self.checkpoint_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let r#gen = self.checkpoint_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(WalMessage::Checkpoint {
-                generation: gen,
+                generation: r#gen,
                 ack: ack_tx,
             })
             .await
@@ -514,12 +514,11 @@ impl WriteAheadLog {
         let mut max = 0u64;
         if let Ok(entries) = fs::read_dir(dir) {
             for e in entries.flatten() {
-                if let Some(s) = e.file_name().to_string_lossy().strip_prefix(&prefix) {
-                    if let Ok(id) = s.parse::<u64>() {
-                        if id >= max {
-                            max = id + 1;
-                        }
-                    }
+                if let Some(s) = e.file_name().to_string_lossy().strip_prefix(&prefix)
+                    && let Ok(id) = s.parse::<u64>()
+                    && id >= max
+                {
+                    max = id + 1;
                 }
             }
         }
@@ -754,13 +753,12 @@ impl WalWriter {
 
             if let Ok(mut f) = File::open(path) {
                 let mut hdr = [0u8; WAL_HEADER_SIZE];
-                if f.read_exact(&mut hdr).is_ok() {
-                    if let Ok(h) = WalHeader::from_bytes(&hdr) {
-                        if h.last_checkpoint_lsn > 0 {
-                            let _ = fs::remove_file(path);
-                            total -= size;
-                        }
-                    }
+                if f.read_exact(&mut hdr).is_ok()
+                    && let Ok(h) = WalHeader::from_bytes(&hdr)
+                    && h.last_checkpoint_lsn > 0
+                {
+                    let _ = fs::remove_file(path);
+                    total -= size;
                 }
             }
         }

@@ -1,5 +1,5 @@
-use crate::chunker::Chunker;
 use crate::DocumentChunk;
+use crate::chunker::Chunker;
 use std::cell::RefCell;
 use tree_sitter::{Language, Node, Parser};
 
