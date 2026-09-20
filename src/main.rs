@@ -190,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            core.flush().await?;
         }
 
         Commands::Search {

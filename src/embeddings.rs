@@ -176,7 +176,7 @@ impl EmbeddingService {
         .collect()
     }
 
-    pub async fn embed_chunks(&self, chunks: Vec<DocumentChunk>) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub async fn embed_chunks(&self, chunks: &[DocumentChunk]) -> anyhow::Result<Vec<Vec<f32>>> {
         let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
 
         let embeddings_data = self.model.lock().await.embed(texts, None)?;
@@ -237,7 +237,7 @@ mod tests {
             start_offset: 0,
             end_offset: 11,
         }];
-        let embeddings = svc.embed_chunks(chunks).await.unwrap();
+        let embeddings = svc.embed_chunks(&chunks).await.unwrap();
         assert_eq!(embeddings.len(), 1);
         assert_eq!(embeddings[0].len(), svc.dimensions());
     }
