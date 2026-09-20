@@ -630,11 +630,12 @@ async fn test_deleted_count_stability_across_recovery() -> Result<()> {
         let live = db.live_len();
         assert_eq!(deleted, 2, "Should have 2 deleted vectors");
         assert_eq!(live, 3, "Should have 3 live vectors");
+        db.close().await?;
     }
 
     {
         let cfg = Config::new(2).with_capacity(32);
-        let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
+        let mut db = VectorDb::open("test_deleted_stability.db", cfg).await?;
 
         let deleted = db.deleted_count();
         let live = db.live_len();
@@ -648,11 +649,12 @@ async fn test_deleted_count_stability_across_recovery() -> Result<()> {
             "After recovery: should have 3 live vectors, got {}",
             live
         );
+        db.close().await?;
     }
 
     {
         let cfg = Config::new(2).with_capacity(32);
-        let db = VectorDb::open("test_deleted_stability.db", cfg).await?;
+        let mut db = VectorDb::open("test_deleted_stability.db", cfg).await?;
 
         let deleted = db.deleted_count();
         let live = db.live_len();
@@ -666,6 +668,7 @@ async fn test_deleted_count_stability_across_recovery() -> Result<()> {
             "After second recovery: should have 3 live vectors, got {}",
             live
         );
+        db.close().await?;
     }
 
     cleanup("test_deleted_stability.db");

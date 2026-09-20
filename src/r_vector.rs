@@ -1931,6 +1931,13 @@ impl VectorDb {
 
         Ok(())
     }
+
+    /// Properly shut down the database, waiting for WAL writer to finish
+    /// and release all file locks
+    pub async fn close(&mut self) -> Result<()> {
+        self.wal.shutdown().await.map_err(VectorDbError::Io)?;
+        Ok(())
+    }
 }
 
 /// Search result with vector ID, similarity score, and metadata
