@@ -924,7 +924,8 @@ impl HnswIndex {
     }
 
     /// Search layer for candidates similar to entry node.
-    /// Uses pre-allocated scratch buffers to avoid per-call heap allocations.
+    /// Results are written into scratch.search_output (sorted by distance).
+    /// Caller must read from scratch before the next search_layer call.
     fn search_layer<F, D>(
         &self,
         entry: u32,
@@ -932,18 +933,15 @@ impl HnswIndex {
         ef: usize,
         dist: &F,
         is_deleted: &D,
-    ) -> Result<Vec<(f32, u32)>>
-    where
+    ) where
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
     {
-        // SAFETY: scratch is only used within this method call chain,
-        // and VectorDb is behind RwLock preventing concurrent access.
         let scratch = unsafe { &mut *self.scratch.get() };
         scratch.visited.clear();
         scratch.visited.insert(entry);
 
-        let d0 = dist(entry)?;
+        let d0 = dist(entry).unwrap_or(f32::INFINITY);
         
         scratch.candidates.clear();
         scratch.candidates.push(Reverse((OrderedFloat(d0), entry)));
@@ -967,7 +965,10 @@ impl HnswIndex {
                 if !scratch.visited.insert(n) {
                     continue;
                 }
-                let d = dist(n)?;
+                let d = match dist(n) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
                 let worst = scratch.results
                     .peek()
                     .map(|(d, _)| d.into_inner())
@@ -990,7 +991,6 @@ impl HnswIndex {
             scratch.results.drain().map(|(d, id)| (d.into_inner(), id))
         );
         scratch.search_output.sort_by(|a, b| distance_cmp(a.0, b.0));
-        Ok(std::mem::take(&mut scratch.search_output))
     }
 
     /// Insert new node into index (must be called with proper distance function)
@@ -1047,18 +1047,23 @@ impl HnswIndex {
         let start_layer = level.min(cur_max);
         for layer in (0..=start_layer).rev() {
             let to_new = |n: u32| dist(new_id, n);
-            let candidates = self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
+            self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted);
 
             let cap = Self::layer_capacity(&self.cfg, layer);
             let selected = {
                 let scratch = unsafe { &mut *self.scratch.get() };
                 scratch.dists.clear();
-                scratch.dists.extend(candidates.iter().map(|&(d, id)| (id, d)));
+                scratch.dists.extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-                let dists = std::mem::take(&mut scratch.dists);
-                let r = Self::select_neighbors_heuristic(&dists, cap, dist, Some(scratch))?;
-                scratch.dists = dists;
-                r
+                let (dists_ptr, scratch_ptr) = {
+                    let d = &scratch.dists as *const Vec<(u32, f32)>;
+                    let s = scratch as *mut SearchBuffers;
+                    (d, s)
+                };
+                Self::select_neighbors_heuristic(
+                    unsafe { &*dists_ptr }, cap, dist,
+                    Some(unsafe { &mut *scratch_ptr }),
+                )?
             };
 
             for &n in &selected {
@@ -1066,7 +1071,8 @@ impl HnswIndex {
                 self.add_link(n, layer, new_id, &dist)?;
             }
 
-            if let Some(&(_, e)) = candidates.first() {
+            let scratch = unsafe { &*self.scratch.get() };
+            if let Some(&(_, e)) = scratch.search_output.first() {
                 ep = e;
             }
         }
@@ -1116,10 +1122,11 @@ impl HnswIndex {
              }
          }
 
-        self.search_layer(ep, 0, ef.max(k), &dist, is_deleted)?
-            .into_iter()
+        self.search_layer(ep, 0, ef.max(k), &dist, is_deleted);
+        let scratch = unsafe { &*self.scratch.get() };
+        scratch.search_output.iter()
             .take(k)
-            .map(|(d, id)| Ok((id, d)))
+            .map(|&(d, id)| Ok((id, d)))
             .collect()
     }
 
@@ -1387,24 +1394,31 @@ impl VectorDb {
         // Re-link at each layer of this node
         for layer in (0..=node_level as usize).rev() {
             let to_new = |n: u32| dist(id, n);
-            let candidates = self.index.search_layer(
+            self.index.search_layer(
                 ep, layer, self.cfg.ef_construction, &to_new, &is_deleted,
-            )?;
+            );
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
             {
                 let scratch = unsafe { &mut *self.index.scratch.get() };
                 scratch.dists.clear();
-                scratch.dists.extend(candidates.iter().map(|&(d, id)| (id, d)));
+                scratch.dists.extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-                let dists = std::mem::take(&mut scratch.dists);
-                let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, dist, Some(scratch))?;
-                scratch.dists = dists;
+                let (dists_ptr, scratch_ptr) = {
+                    let d = &scratch.dists as *const Vec<(u32, f32)>;
+                    let s = scratch as *mut SearchBuffers;
+                    (d, s)
+                };
+                let selected = HnswIndex::select_neighbors_heuristic(
+                    unsafe { &*dists_ptr }, cap, dist,
+                    Some(unsafe { &mut *scratch_ptr }),
+                )?;
                 for &n in &selected {
                     self.index.add_link(id, layer, n, &dist)?;
                     self.index.add_link(n, layer, id, &dist)?;
                 }
             }
-            if let Some(&(_, e)) = candidates.first() {
+            let scratch = unsafe { &*self.index.scratch.get() };
+            if let Some(&(_, e)) = scratch.search_output.first() {
                 ep = e;
             }
         }
