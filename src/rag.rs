@@ -404,6 +404,15 @@ impl RagCore {
             .map_err(|e| anyhow::anyhow!("Flush failed: {}", e))
     }
 
+    /// Properly shut down the database, waiting for WAL writer to finish
+    /// and release all file locks
+    pub async fn close(&self) -> Result<()> {
+        self.vectors_db
+            .close()
+            .await
+            .map_err(|e| anyhow::anyhow!("Close failed: {}", e))
+    }
+
     /**
      * Retrieves the status of the document associated with the specified source path.
      * Returns None if the document is not found.

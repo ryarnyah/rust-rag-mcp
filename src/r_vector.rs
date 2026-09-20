@@ -2120,6 +2120,13 @@ impl AsyncVectorDb {
     pub async fn flush(&self) -> Result<()> {
         self.db.write().await.flush().await
     }
+
+    /// Properly shut down the database, waiting for WAL writer to finish
+    /// and release all file locks
+    pub async fn close(&self) -> Result<()> {
+        let mut db = self.db.write().await;
+        db.close().await
+    }
 }
 
 /// Owned version of SearchHit for async API

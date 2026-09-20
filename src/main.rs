@@ -193,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             core.flush().await?;
+            core.close().await?;
         }
 
         Commands::Search {
@@ -222,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            core.close().await?;
         }
 
         Commands::Sources {
@@ -253,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             for source in &sources {
                 println!("  - {}", source);
             }
+            core.close().await?;
         }
 
         Commands::Delete {
@@ -266,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(()) => println!("Deleted: {}", source_path),
                 Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),
             }
+            core.close().await?;
         }
 
         Commands::Models => {
