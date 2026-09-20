@@ -66,7 +66,7 @@ memmap2 = "0.9"
 arrow-array = "60"
 arrow-schema = "60"
 ndarray = "0.15"
-ordered-float = "4.0"
+ordered-float = "5.5"
 fs2 = "0.4"
 
 [dev-dependencies]
