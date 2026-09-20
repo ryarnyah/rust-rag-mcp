@@ -1,7 +1,11 @@
 use crate::chunker::Chunker;
 use crate::DocumentChunk;
-use anyhow::Result;
+use std::cell::RefCell;
 use tree_sitter::{Language, Node, Parser};
+
+thread_local! {
+    static PARSER_CACHE: RefCell<Option<(Language, Parser)>> = const { RefCell::new(None) };
+}
 
 #[derive(Default)]
 pub struct SyntaxChunker {
@@ -35,17 +39,25 @@ fn parse_and_chunk(
     source: &str,
     language: Language,
     max_chunk_size: usize,
-) -> Result<Vec<DocumentChunk>> {
-    let mut parser = Parser::new();
-    parser.set_language(&language)?;
-    let tree = parser
-        .parse(text, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse"))?;
+) -> Result<Vec<DocumentChunk>, anyhow::Error> {
+    let tree = PARSER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let needs_init = cache.as_ref().is_none_or(|(lang, _)| *lang != language);
+        if needs_init {
+            let mut parser = Parser::new();
+            parser.set_language(&language)?;
+            *cache = Some((language, parser));
+        }
+        let (_, parser) = cache.as_mut().unwrap();
+        parser
+            .parse(text, None)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse"))
+    })?;
 
-    let mut chunks = Vec::new();
-    let mut stack: Vec<(Node, usize)> = vec![(tree.root_node(), 0)];
+    let mut chunks: Vec<DocumentChunk> = Vec::new();
+    let mut stack: Vec<Node> = vec![tree.root_node()];
 
-    while let Some((node, depth)) = stack.pop() {
+    while let Some(node) = stack.pop() {
         if node.is_extra() || node.is_error() || node.is_missing() {
             continue;
         }
@@ -53,14 +65,12 @@ fn parse_and_chunk(
         let kind = node.kind();
 
         if is_top_level_node(kind) {
-            let nt = node_text(node, text);
-            let trimmed = nt.trim();
-            let word_count = trimmed.split_whitespace().count();
+            let word_count = count_words(text, node.start_byte(), node.end_byte());
 
             if word_count > 0 && word_count <= max_chunk_size {
                 chunks.push(DocumentChunk {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    text: nt,
+                    id: String::new(),
+                    text: String::new(),
                     source: source.to_string(),
                     chunk_index: chunks.len() as u32,
                     start_offset: node.start_byte(),
@@ -69,155 +79,123 @@ fn parse_and_chunk(
                 continue;
             }
 
-            for i in (0..node.child_count()).rev() {
-                if let Some(child) = node.child(i) {
-                    stack.push((child, depth + 1));
-                }
-            }
+            push_children(&mut stack, node);
             continue;
         }
 
-        if depth > 0 && node.child_count() > 0 {
-            for i in (0..node.child_count()).rev() {
-                if let Some(child) = node.child(i) {
-                    stack.push((child, depth + 1));
-                }
-            }
+        if node.child_count() > 0 {
+            push_children(&mut stack, node);
             continue;
         }
 
-        let nt = node_text(node, text);
-        let word_count = nt.split_whitespace().count();
+        let start = node.start_byte();
+        let end = node.end_byte();
+        let word_count = count_words(text, start, end);
 
         if word_count > 0
             && chunks
                 .last()
-                .is_none_or(|c: &DocumentChunk| c.end_offset < node.start_byte())
+                .is_none_or(|c: &DocumentChunk| c.end_offset < start)
         {
-            if word_count <= max_chunk_size {
-                chunks.push(DocumentChunk {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    text: nt,
-                    source: source.to_string(),
-                    chunk_index: chunks.len() as u32,
-                    start_offset: node.start_byte(),
-                    end_offset: node.end_byte(),
-                });
-            } else {
-                for i in (0..node.child_count()).rev() {
-                    if let Some(child) = node.child(i) {
-                        stack.push((child, depth + 1));
-                    }
-                }
-            }
+            chunks.push(DocumentChunk {
+                id: String::new(),
+                text: String::new(),
+                source: source.to_string(),
+                chunk_index: chunks.len() as u32,
+                start_offset: start,
+                end_offset: end,
+            });
         }
+    }
+
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        chunk.chunk_index = i as u32;
+        chunk.text = text[chunk.start_offset..chunk.end_offset].to_string();
     }
 
     Ok(chunks)
 }
 
-fn node_text(node: Node, text: &str) -> String {
-    text[node.start_byte()..node.end_byte()].to_string()
+fn push_children<'a>(stack: &mut Vec<Node<'a>>, node: Node<'a>) {
+    for i in (0..node.child_count()).rev() {
+        if let Some(child) = node.child(i) {
+            stack.push(child);
+        }
+    }
+}
+
+fn count_words(text: &str, start: usize, end: usize) -> usize {
+    let slice = &text[start..end.min(text.len())];
+    let mut count = 0;
+    let mut in_word = false;
+    for byte in slice.bytes() {
+        if byte.is_ascii_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            count += 1;
+        }
+    }
+    count
 }
 
 fn is_top_level_node(kind: &str) -> bool {
     matches!(
         kind,
+        // Root
+        "source_file" | "program" | "compilation_unit" | "module_definition" | "document"
         // Rust
-        "function_item"
-            | "function_signature_item"
-            | "struct_item"
-            | "enum_item"
-            | "impl_item"
-            | "trait_item"
-            | "type_item"
-            | "mod_item"
-            | "macro_definition"
+            | "function_item" | "function_signature_item" | "struct_item"
+            | "enum_item" | "impl_item" | "trait_item" | "type_item"
+            | "mod_item" | "macro_definition"
         // Python
-            | "expression_statement"
             | "decorated_definition"
         // JavaScript / TypeScript
-            | "method_definition"
-            | "type_alias_declaration"
-            | "export_statement"
-            | "generator_function_declaration"
-            | "arrow_function"
+            | "method_definition" | "type_alias_declaration" | "export_statement"
+            | "generator_function_declaration" | "arrow_function"
         // Go
             | "function"
         // C / C++
-            | "struct_specifier"
-            | "enum_specifier"
-            | "declaration"
+            | "struct_specifier" | "enum_specifier"
         // Java
-            | "record_declaration"
-            | "annotation_type_declaration"
+            | "record_declaration" | "annotation_type_declaration"
         // C#
-            | "namespace_declaration"
-            | "struct_declaration"
+            | "namespace_declaration" | "struct_declaration"
         // Ruby
-            | "class"
-            | "method"
-            | "singleton_method"
+            | "class" | "module" | "method" | "singleton_method"
         // PHP
-            | "namespace_definition"
-            | "interface_definition"
+            | "namespace_definition" | "interface_definition"
         // Scala
-            | "object_definition"
-            | "val_definition"
+            | "object_definition" | "val_definition"
         // HTML
-            | "element"
-            | "script_element"
-            | "style_element"
+            | "element" | "script_element" | "style_element"
         // CSS
-            | "rule_set"
-            | "media_statement"
-            | "keyframes_statement"
-        // JSON
-            | "pair"
+            | "rule_set" | "media_statement" | "keyframes_statement"
         // YAML
-            | "block_mapping_pair"
-            | "block_sequence_item"
+            | "block_mapping" | "block_sequence"
         // Lua
-            | "local_function_declaration"
-            | "local_variable_declaration"
+            | "local_function_declaration" | "local_variable_declaration"
         // Zig
             | "decl"
         // Elixir
-            | "call"
-            | "def_module"
-            | "def_function"
-            | "defp_function"
+            | "def_module" | "def_function" | "defp_function"
         // Erlang
             | "function_clause"
         // HCL
             | "block"
         // Protobuf
-            | "message_definition"
-            | "service_definition"
-            | "enum_definition"
-        // Bash
-            | "command_substitution"
+            | "message_definition" | "service_definition" | "enum_definition"
         // CMake
-            | "function_def"
-            | "macro_def"
+            | "function_def" | "macro_def"
         // Make
-            | "rule"
-            | "variable_assignment"
-        // Shared across multiple languages (unique entries)
-            | "function_definition"
-            | "class_definition"
-            | "class_declaration"
-            | "method_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "constructor_declaration"
-            | "type_definition"
-            | "module"
-            | "import_statement"
-            | "function_declaration"
-            | "trait_definition"
-            | "attribute"
-            | "variable_declaration"
+            | "rule" | "variable_assignment"
+        // Shared across multiple languages (deduplicated)
+            | "function_definition" | "function_declaration"
+            | "class_definition" | "class_declaration"
+            | "interface_declaration" | "enum_declaration"
+            | "method_declaration" | "constructor_declaration"
+            | "type_definition" | "trait_definition"
+            | "variable_declaration" | "attribute"
     )
 }
 
@@ -395,11 +373,12 @@ type Point struct {
     }
 
     #[test]
-    fn test_json_chunking() {
-        let code = r#"{"name": "test", "value": 42}"#;
+    fn test_json_not_split_by_pair() {
+        let code = r#"{"name": "Alice", "age": 30, "scores": [1, 2, 3]}"#;
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "test.json");
-        assert!(!chunks.is_empty());
+        assert_eq!(chunks.len(), 1, "JSON object should be one chunk, not split by pair");
+        assert_eq!(chunks[0].text, code);
     }
 
     #[test]
