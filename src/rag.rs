@@ -206,6 +206,7 @@ impl RagCore {
             self.chunker.chunk_text(&text, &source_path)
         };
         let count = chunks.len();
+        drop(text);
         self.index_chunks(chunks).await?;
 
         let now = chrono_free_timestamp();
@@ -253,28 +254,28 @@ impl RagCore {
             return Ok(());
         }
 
-        let embeddings_result = self.embedding.embed_chunks(&chunks).await?;
+        const BATCH_SIZE: usize = 64;
 
-        // Insert each chunk with its embedding
-        for (chunk, embedding) in chunks.iter().zip(embeddings_result.iter()) {
-            // Serialize chunk metadata
-            let chunk_meta = ChunkMetadata {
-                id: chunk.id.clone(),
-                text: chunk.text.clone(),
-                source: chunk.source.clone(),
-                chunk_index: chunk.chunk_index,
-                start_offset: chunk.start_offset as u64,
-                end_offset: chunk.end_offset as u64,
-            };
-            let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
+        for batch in chunks.chunks(BATCH_SIZE) {
+            let embeddings_result = self.embedding.embed_chunks(batch).await?;
 
-            // Insert vector with metadata
-            let vec_id = self.vectors_db
-                .insert(embedding, Some(&metadata_bytes))
-                .await?;
-            
-            // P3: Update metadata index for O(1) source lookups
-            self.metadata_index.add_chunk(chunk.source.clone(), vec_id).await;
+            for (chunk, embedding) in batch.iter().zip(embeddings_result.iter()) {
+                let chunk_meta = ChunkMetadata {
+                    id: chunk.id.clone(),
+                    text: chunk.text.clone(),
+                    source: chunk.source.clone(),
+                    chunk_index: chunk.chunk_index,
+                    start_offset: chunk.start_offset as u64,
+                    end_offset: chunk.end_offset as u64,
+                };
+                let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
+
+                let vec_id = self.vectors_db
+                    .insert(embedding, Some(&metadata_bytes))
+                    .await?;
+
+                self.metadata_index.add_chunk(chunk.source.clone(), vec_id).await;
+            }
         }
 
         self.vectors_db.flush().await?;
