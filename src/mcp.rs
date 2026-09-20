@@ -34,10 +34,7 @@ impl RagServer {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexPathRequest {
     #[schemars(
-        description = "Absolute or relative path to a file or directory to index. 
-            If a directory is given, all supported files within it (recursively) are indexed. 
-            Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. 
-            Files unchanged since last index are skipped automatically."
+        description = "Absolute or relative path to a file or directory to index recursively. Supports PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. Unchanged files are skipped."
     )]
     pub path: String,
 }
@@ -45,13 +42,11 @@ pub struct IndexPathRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexTextRequest {
     #[schemars(
-        description = "Raw text content to index. The text is chunked, embedded, and stored. 
-            If the same source was previously indexed with identical content, indexing is skipped."
+        description = "Raw text content to index. Chunked, embedded, and stored for semantic search."
     )]
     pub text: String,
     #[schemars(
-        description = "A unique identifier for this text (e.g. 'docs/api.md', 'clipboard', or any logical name). 
-            Used as the key for deduplication — re-indexing the same source with the same text is a no-op."
+        description = "Unique identifier for this text (e.g. 'docs/api.md', 'clipboard'). Used for deduplication — identical content with same source is skipped."
     )]
     pub source: String,
 }
@@ -59,16 +54,15 @@ pub struct IndexTextRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
     #[schemars(
-        description = "Natural language search query. The query is embedded and compared against stored document chunks using cosine similarity."
+        description = "Natural language query. Embedded and compared against stored chunks via cosine similarity."
     )]
     pub query: String,
     #[schemars(
-        description = "Maximum number of results to return. Higher values return more candidates but take longer. Default: 5."
+        description = "Maximum results to return (default: 5). Higher values return more candidates but take longer."
     )]
     pub top_k: Option<usize>,
     #[schemars(
-        description = "Optional filter to restrict results to a specific source. Must match the exact source path used during indexing. 
-            Useful when searching within a single document."
+        description = "Optional exact source path filter to restrict search to a single document."
     )]
     pub source_filter: Option<String>,
 }
@@ -76,8 +70,7 @@ pub struct SearchRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteSourceRequest {
     #[schemars(
-        description = "The full source path of the document to remove from the index. Must match the exact path used during indexing. 
-            All chunks and metadata for this source will be deleted."
+        description = "Exact source path used during indexing. All chunks and metadata for this source are permanently deleted."
     )]
     pub source_path: String,
 }
@@ -85,18 +78,18 @@ pub struct DeleteSourceRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DocumentStatusRequest {
     #[schemars(
-        description = "The full source path of the document to check. Must match the exact path used during indexing."
+        description = "Exact source path used during indexing. Returns content hash, last indexed timestamp, and chunk count."
     )]
     pub source_path: String,
 }
 
 #[tool_router]
 impl RagServer {
-    #[tool(description = "Index a file or directory into the RAG knowledge base. 
-            If a file is given, it is read, split into chunks, embedded using a local model, and stored for semantic search. 
-            If a directory is given, all supported files within it are indexed recursively. 
-            Supported formats: PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. 
-            Files unchanged since last index are skipped automatically. Returns a summary of indexed, skipped, and failed files.")]
+    #[tool(description = "\
+        Index a file or directory into the RAG knowledge base. \
+        Reads, chunks, embeds, and stores for semantic search. \
+        Supports PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. \
+        Unchanged files skipped. Returns summary of indexed/skipped/failed.")]
     async fn index_path(
         &self,
         Parameters(req): Parameters<IndexPathRequest>,
@@ -170,11 +163,11 @@ impl RagServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
-    #[tool(description = "Index raw text content into the RAG knowledge base. 
-            The text is split into chunks, embedded, and stored for semantic search. 
-            Use this for content that is not in a file (e.g. clipboard text, generated content, API responses). 
-            The source parameter serves as a unique key — re-indexing the same source with identical text is automatically 
-            skipped (deduplication via content hash). Returns the number of chunks created, or a skip message.")]
+    #[tool(description = "\
+        Index raw text into the RAG knowledge base. \
+        Text is chunked, embedded, and stored for semantic search. \
+        Use for non-file content (clipboard, generated text, API responses). \
+        Source parameter is a unique key — identical content with same source is skipped.")]
     async fn index_text(
         &self,
         Parameters(req): Parameters<IndexTextRequest>,
@@ -203,13 +196,11 @@ impl RagServer {
         }
     }
 
-    #[tool(
-        description = "Search the RAG knowledge base using semantic similarity. 
-            The query is embedded into a vector and compared against all stored document chunks using cosine distance. 
-            Results are ranked by similarity score (0.0 to 1.0, where 1.0 is a perfect match). 
-            Each result includes the matching text chunk, its source document, chunk index, and similarity score. 
-            Use source_filter to restrict searches to a specific document."
-    )]
+    #[tool(description = "\
+        Search the RAG knowledge base using semantic similarity. \
+        Query is embedded and compared against stored chunks via cosine similarity. \
+        Results ranked by score (0.0-1.0) with matching text, source, chunk index, and score. \
+        Use source_filter to restrict to a specific document.")]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -248,11 +239,10 @@ impl RagServer {
         }
     }
 
-    #[tool(
-        description = "List all source documents currently indexed in the knowledge base. 
-            Returns one source path per line. These are the full absolute paths of files or logical source names used during indexing. 
-            Use this to see what is available for search or to get source paths for the document_status or delete_source tools."
-    )]
+    #[tool(description = "\
+        List all indexed source documents. \
+        Returns one full source path per line (file paths or logical names). \
+        Use to see available documents for search or get source paths for document_status/delete_source.")]
     async fn list_sources(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = {
             let core = self.core.read().await;
@@ -277,11 +267,10 @@ impl RagServer {
         }
     }
 
-    #[tool(
-        description = "Get the total number of indexed chunks across all documents. 
-            Each document is split into multiple chunks during indexing. 
-            This count reflects the total number of searchable units in the knowledge base."
-    )]
+    #[tool(description = "\
+        Get total number of indexed chunks across all documents. \
+        Each document is split into multiple chunks during indexing. \
+        This count reflects total searchable units in the knowledge base.")]
     async fn chunk_count(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = {
             let core = self.core.read().await;
@@ -299,12 +288,10 @@ impl RagServer {
         }
     }
 
-    #[tool(
-        description = "Permanently remove all indexed chunks and metadata for a specific source document from the knowledge base. 
-            After deletion, the document will no longer appear in search results. 
-            The source_path must match exactly the path used during indexing (use list_sources to see current source paths). 
-            This operation cannot be undone — re-index the file to restore it."
-    )]
+    #[tool(description = "\
+        Permanently delete all chunks and metadata for a source document. \
+        Source path must match exactly (use list_sources to see current paths). \
+        Irreversible — re-index to restore.")]
     async fn delete_source(
         &self,
         Parameters(req): Parameters<DeleteSourceRequest>,
@@ -325,9 +312,11 @@ impl RagServer {
         }
     }
 
-    #[tool(description = "Check the indexing status of a specific document. 
-            Returns the content hash (SHA-256), the timestamp when it was last indexed, and the number of chunks it was split into. 
-            Useful for verifying whether a document is up-to-date or needs re-indexing. Returns 'not found' if the source has not been indexed.")]
+    #[tool(description = "\
+        Check indexing status of a document. \
+        Returns content hash (SHA-256), last indexed timestamp, and chunk count. \
+        Use to verify if document is up-to-date or needs re-indexing. \
+        Returns 'not found' if never indexed.")]
     async fn document_status(
         &self,
         Parameters(req): Parameters<DocumentStatusRequest>,
