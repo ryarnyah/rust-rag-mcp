@@ -123,6 +123,7 @@ fn node_text(node: Node, text: &str) -> String {
 fn is_top_level_node(kind: &str) -> bool {
     matches!(
         kind,
+        // Rust
         "function_item"
             | "function_signature_item"
             | "struct_item"
@@ -132,37 +133,91 @@ fn is_top_level_node(kind: &str) -> bool {
             | "type_item"
             | "mod_item"
             | "macro_definition"
+        // Python
             | "expression_statement"
-            | "function_definition"
-            | "class_definition"
-            | "method_definition"
             | "decorated_definition"
-            | "module"
-            | "import_statement"
-            | "function_declaration"
-            | "class_declaration"
-            | "method_declaration"
-            | "interface_declaration"
+        // JavaScript / TypeScript
+            | "method_definition"
             | "type_alias_declaration"
             | "export_statement"
             | "generator_function_declaration"
             | "arrow_function"
+        // Go
             | "function"
-            | "type_definition"
-            | "func_declaration"
-            | "type_spec"
-            | "method_spec"
-            | "interface_type"
-            | "compilation_unit"
-            | "source_file"
-            | "program"
-            | "module_definition"
-            | "struct_specification"
-            | "interface_specification"
+        // C / C++
+            | "struct_specifier"
+            | "enum_specifier"
+            | "declaration"
+        // Java
+            | "record_declaration"
+            | "annotation_type_declaration"
+        // C#
+            | "namespace_declaration"
+            | "struct_declaration"
+        // Ruby
+            | "class"
+            | "method"
+            | "singleton_method"
+        // PHP
+            | "namespace_definition"
+            | "interface_definition"
+        // Scala
+            | "object_definition"
+            | "val_definition"
+        // HTML
+            | "element"
+            | "script_element"
+            | "style_element"
+        // CSS
+            | "rule_set"
+            | "media_statement"
+            | "keyframes_statement"
+        // JSON
+            | "pair"
+        // YAML
+            | "block_mapping_pair"
+            | "block_sequence_item"
+        // Lua
+            | "local_function_declaration"
+            | "local_variable_declaration"
+        // Zig
+            | "decl"
+        // Elixir
+            | "call"
+            | "def_module"
+            | "def_function"
+            | "defp_function"
+        // Erlang
+            | "function_clause"
+        // HCL
+            | "block"
+        // Protobuf
+            | "message_definition"
+            | "service_definition"
+            | "enum_definition"
+        // Bash
+            | "command_substitution"
+        // CMake
+            | "function_def"
+            | "macro_def"
+        // Make
+            | "rule"
+            | "variable_assignment"
+        // Shared across multiple languages (unique entries)
+            | "function_definition"
+            | "class_definition"
+            | "class_declaration"
+            | "method_declaration"
+            | "interface_declaration"
             | "enum_declaration"
-            | "component_definition"
-            | "signal"
-            | "state_machine"
+            | "constructor_declaration"
+            | "type_definition"
+            | "module"
+            | "import_statement"
+            | "function_declaration"
+            | "trait_definition"
+            | "attribute"
+            | "variable_declaration"
     )
 }
 
@@ -174,6 +229,25 @@ pub fn language_for_extension(ext: &str) -> Option<Language> {
         "ts" | "tsx" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        "cs" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+        "scala" | "sc" => Some(tree_sitter_scala::LANGUAGE.into()),
+        "html" | "htm" => Some(tree_sitter_html::LANGUAGE.into()),
+        "css" | "scss" | "less" => Some(tree_sitter_css::LANGUAGE.into()),
+        "json" => Some(tree_sitter_json::LANGUAGE.into()),
+        "yaml" | "yml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+        "lua" => Some(tree_sitter_lua::LANGUAGE.into()),
+        "zig" => Some(tree_sitter_zig::LANGUAGE.into()),
+        "ex" | "exs" => Some(tree_sitter_elixir::LANGUAGE.into()),
+        "erl" | "hrl" => Some(tree_sitter_erlang::LANGUAGE.into()),
+        "hcl" | "tf" | "tfvars" => Some(tree_sitter_hcl::LANGUAGE.into()),
+        "proto" => Some(tree_sitter_proto::LANGUAGE.into()),
+        "sh" | "bash" | "zsh" => Some(tree_sitter_bash::LANGUAGE.into()),
+        "cmake" => Some(tree_sitter_cmake::LANGUAGE.into()),
+        "mk" | "makefile" | "Makefile" => Some(tree_sitter_make::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -268,6 +342,90 @@ class Point:
         let code = format!("fn big() {{\n{body}\n}}");
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(&code, "test.rs");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_cpp_chunking() {
+        let code = r#"
+class Animal {
+public:
+    virtual void speak() = 0;
+};
+
+class Dog : public Animal {
+    void speak() override { printf("woof\n"); }
+};
+"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.cpp");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_java_chunking() {
+        let code = r#"
+public class Calculator {
+    public int add(int a, int b) {
+        return a + b;
+    }
+}
+"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.java");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_go_chunking() {
+        let code = r#"
+package main
+
+func add(a, b int) int {
+    return a + b
+}
+
+type Point struct {
+    X, Y float64
+}
+"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.go");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_json_chunking() {
+        let code = r#"{"name": "test", "value": 42}"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.json");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_html_chunking() {
+        let code = r#"
+<html>
+<body>
+  <h1>Title</h1>
+  <p>Content</p>
+</body>
+</html>
+"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.html");
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_lua_chunking() {
+        let code = r#"
+function greet(name)
+    print("Hello, " .. name)
+end
+"#;
+        let chunker = SyntaxChunker::new(512, 64);
+        let chunks = chunker.chunk_text(code, "test.lua");
         assert!(!chunks.is_empty());
     }
 }
