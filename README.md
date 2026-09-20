@@ -1,6 +1,6 @@
 # rust-rag-mcp
 
-RAG MCP server using rig, fastembed, LanceDB, unpdf, undoc.
+RAG MCP server with custom HNSW vector DB, mmap storage, and PostgreSQL-style WAL.
 
 ## Features
 
@@ -9,6 +9,7 @@ RAG MCP server using rig, fastembed, LanceDB, unpdf, undoc.
 - **Syntax-Aware Code Chunking** - Uses tree-sitter to parse source code into AST, chunking by semantic boundaries (functions, structs, classes) instead of word count
 - **Semantic Search** - Search indexed documents using fastembed embeddings
 - **Multiple Models** - Supports various embedding models via fastembed
+- **Custom Vector DB** - HNSW index with mmap storage, cosine distance, WAL for crash safety
 
 ## Installation
 
@@ -50,14 +51,33 @@ Source code files are automatically parsed with tree-sitter and chunked by
 semantic boundaries (functions, structs, classes, modules) rather than word count.
 This produces higher-quality embeddings for code search.
 
-| Language    | Extensions              |
-|-------------|-------------------------|
-| Rust        | `.rs`                   |
-| Python      | `.py`                   |
-| JavaScript  | `.js`, `.jsx`           |
-| TypeScript  | `.ts`, `.tsx`           |
-| Go          | `.go`                   |
-| C           | `.c`, `.h`              |
+| Language    | Extensions                   |
+|-------------|------------------------------|
+| Rust        | `.rs`                        |
+| Python      | `.py`                        |
+| JavaScript  | `.js`, `.jsx`                |
+| TypeScript  | `.ts`, `.tsx`                |
+| Go          | `.go`                        |
+| C           | `.c`, `.h`                   |
+| C++         | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh` |
+| Java        | `.java`                      |
+| C#          | `.cs`                        |
+| Ruby        | `.rb`                        |
+| PHP         | `.php`                       |
+| Scala       | `.scala`, `.sc`              |
+| HTML        | `.html`, `.htm`              |
+| CSS         | `.css`, `.scss`, `.less`     |
+| JSON        | `.json`                      |
+| YAML        | `.yaml`, `.yml`              |
+| Lua         | `.lua`                       |
+| Zig         | `.zig`                       |
+| Elixir      | `.ex`, `.exs`                |
+| Erlang      | `.erl`, `.hrl`               |
+| HCL         | `.hcl`, `.tf`, `.tfvars`     |
+| Protobuf    | `.proto`                     |
+| Bash        | `.sh`, `.bash`, `.zsh`       |
+| CMake       | `.cmake`                     |
+| Make        | `.mk`, `Makefile`            |
 
 Non-code files (PDF, DOCX, plain text, etc.) fall back to word-count chunking.
 
