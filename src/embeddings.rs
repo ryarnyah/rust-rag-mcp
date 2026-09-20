@@ -192,6 +192,7 @@ impl std::fmt::Debug for EmbeddingService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_list_models() {
@@ -201,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_new_invalid_model() {
         // fastembed uses default model regardless of input
         let svc =
@@ -209,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_new_valid_model() {
         let svc =
             EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR.into()).unwrap();
@@ -216,6 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_embed_chunks() {
         let svc =
             EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR.into()).unwrap();

@@ -73,6 +73,7 @@ fs2 = "0.4"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+serial_test = "4"
 
 #[profile.release]
 #opt-level = 3
