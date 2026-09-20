@@ -200,14 +200,16 @@ impl RagCore {
             .unwrap_or("")
             .to_lowercase();
 
-        let chunks = if language_for_extension(&ext).is_some() {
-            self.syntax_chunker.chunk_text(&text, &source_path)
-        } else {
-            self.chunker.chunk_text(&text, &source_path)
+        let count = {
+            let chunks = if language_for_extension(&ext).is_some() {
+                self.syntax_chunker.chunk_text(&text, &source_path)
+            } else {
+                self.chunker.chunk_text(&text, &source_path)
+            };
+            let count = chunks.len();
+            self.index_chunks(chunks).await?;
+            count
         };
-        let count = chunks.len();
-        drop(text);
-        self.index_chunks(chunks).await?;
 
         let now = chrono_free_timestamp();
         self.upsert_metadata(&source_path, &content_hash, now, count as u32)
@@ -314,7 +316,7 @@ impl RagCore {
 
           // P5: Adaptive ef_search based on k
           // Small k: use lower ef (faster), large k: use higher ef (more thorough)
-          let ef = (top_k as u32 * 4).max(40).min(200);
+           let ef = (top_k as u32 * 4).clamp(40, 200);
 
           // Search vectors with optional source filter
           let search_results = if let Some(filter) = source_filter {

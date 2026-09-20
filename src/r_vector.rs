@@ -425,13 +425,14 @@ impl MetadataStore {
 
             // Truncate any bytes beyond the flushed records (leftover from grow()
             // that were never committed via flush())
-            drop(m);
             if pos < len {
+                drop(m);
                 store.file.set_len(pos as u64).map_err(VectorDbError::Io)?;
+                let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
+                store.mmap = Some(m);
+            } else {
+                store.mmap = Some(m);
             }
-            let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
-
-            store.mmap = Some(m);
             store.file_len = pos;
         }
         Ok(store)
@@ -679,6 +680,10 @@ impl HnswIndex {
         HNSW_HEADER + id as usize * Self::node_bytes(&self.cfg)
     }
 
+    fn node_level(&self, id: u32) -> u8 {
+        self.mmap()[self.node_offset(id)]
+    }
+
     fn set_level(&mut self, id: u32, l: u8) {
         let off = self.node_offset(id);
         self.mmap_mut()[off] = l;
@@ -823,7 +828,7 @@ impl HnswIndex {
             .collect::<Result<Vec<_>>>()?;
         dists.sort_by(|a, b| distance_cmp(a.1, b.1));
 
-        let selected = Self::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
+        let selected = Self::select_neighbors_heuristic(&dists, cap, dist)?;
 
         self.set_layer_count(id, layer, selected.len());
         for (i, n) in selected.iter().enumerate() {
@@ -962,7 +967,7 @@ impl HnswIndex {
             let cap = Self::layer_capacity(&self.cfg, layer);
             let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
             dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-            let selected = Self::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
+        let selected = Self::select_neighbors_heuristic(&dists, cap, dist)?;
 
             for &n in &selected {
                 self.add_link(new_id, layer, n, &dist)?;
@@ -1253,7 +1258,7 @@ impl VectorDb {
 
         // Re-insert the node to rebuild its edges at all layers
         // First clear existing edges
-        let node_level = self.index.mmap.as_ref().unwrap()[self.index.node_offset(id)];
+        let node_level = self.index.node_level(id);
         for layer in 0..=node_level as usize {
             self.index.set_layer_count(id, layer, 0);
         }
@@ -1296,7 +1301,7 @@ impl VectorDb {
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
             let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
             dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-            let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, |a, b| dist(a, b))?;
+            let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, dist)?;
             for &n in &selected {
                 self.index.add_link(id, layer, n, &dist)?;
                 self.index.add_link(n, layer, id, &dist)?;

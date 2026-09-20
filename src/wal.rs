@@ -218,7 +218,7 @@ impl WriteAheadLog {
         let wal_path = Self::wal_path(db_path);
         let exists = wal_path.exists();
 
-        let mut file = OpenOptions::new().create(true).read(true).write(true).open(&wal_path)?;
+        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&wal_path)?;
         file.try_lock_exclusive().map_err(|e| {
             io::Error::new(io::ErrorKind::WouldBlock, format!("WAL locked: {}", e))
         })?;
@@ -414,7 +414,12 @@ impl WriteAheadLog {
     }
 
     fn segment_prefix(db_path: &Path) -> String {
-        format!("{}.wal.", db_path.file_name().unwrap().to_string_lossy())
+        format!(
+            "{}.wal.",
+            db_path
+                .file_name()
+                .map_or_else(|| "wal".into(), |f| f.to_string_lossy())
+        )
     }
 
     fn find_max_segment_id(db_path: &Path) -> u64 {
@@ -585,7 +590,7 @@ impl WalWriter {
         let new_file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&self.wal_path)?;
 
         // Release old handle, rename, adopt new handle
-        drop(std::mem::replace(&mut self.file, new_file));
+        self.file = new_file;
         fs::rename(&old_path, &seg_path)?;
         self.next_segment_id += 1;
 
