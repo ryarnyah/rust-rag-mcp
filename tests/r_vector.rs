@@ -342,6 +342,7 @@ async fn test_wal_mixed_operations_crash() -> Result<()> {
             db.insert(&v, Some(format!("vec{}", i).as_bytes()))?;
         }
         db.flush().await?;
+        db.close().await?;
     }
 
     {
@@ -353,6 +354,7 @@ async fn test_wal_mixed_operations_crash() -> Result<()> {
         db.delete(3)?;
 
         db.flush().await?;
+        db.close().await?;
     }
 
     {
