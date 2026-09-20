@@ -1,16 +1,21 @@
 use rust_rag_mcp::r_vector::{Config, VectorDb, cosine_distance};
 use rust_rag_mcp::wal::{WalRecord, WalOpType, Lsn};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::time::Instant;
 
 // ── Allocation counter ───────────────────────────────────────────────────────
+//
+// Counts bytes allocated/freed globally. Peak tracks the high-water mark.
+// Uses AtomicI64 for `current` to handle the case where deallocs from other
+// threads (e.g. WAL writer) free memory allocated before reset_counters().
+// When current goes negative, we skip the peak update since it's meaningless.
 struct CountingAllocator {
     inner: System,
     allocated: AtomicU64,
     freed: AtomicU64,
     peak: AtomicU64,
-    current: AtomicU64,
+    current: AtomicI64,
 }
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -19,12 +24,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if !ptr.is_null() {
             let size = layout.size() as u64;
             self.allocated.fetch_add(size, Ordering::Relaxed);
-            let cur = self.current.fetch_add(size, Ordering::Relaxed) + size;
-            loop {
-                let old = self.peak.load(Ordering::Relaxed);
-                if cur <= old { break; }
-                if self.peak.compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    break;
+            let prev = self.current.fetch_add(size as i64, Ordering::Relaxed);
+            let cur = prev + size as i64;
+            if cur > 0 {
+                let cur = cur as u64;
+                loop {
+                    let old = self.peak.load(Ordering::Relaxed);
+                    if cur <= old { break; }
+                    if self.peak.compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                        break;
+                    }
                 }
             }
         }
@@ -35,7 +44,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         self.inner.dealloc(ptr, layout);
         let size = layout.size() as u64;
         self.freed.fetch_add(size, Ordering::Relaxed);
-        self.current.fetch_sub(size, Ordering::Relaxed);
+        self.current.fetch_sub(size as i64, Ordering::Relaxed);
     }
 }
 
@@ -45,7 +54,7 @@ static ALLOC: CountingAllocator = CountingAllocator {
     allocated: AtomicU64::new(0),
     freed: AtomicU64::new(0),
     peak: AtomicU64::new(0),
-    current: AtomicU64::new(0),
+    current: AtomicI64::new(0),
 };
 
 fn reset_counters() {
