@@ -22,7 +22,7 @@
 
 Most RAG solutions bolt together a vector database, an embedding service, and a document parser. **rust-rag-mcp** is different:
 
-- **The vector DB is yours.** Custom HNSW index with mmap storage, SIMD-optimized distance computation, and PostgreSQL-style WAL — all ~2,700 lines of Rust, zero external dependencies.
+- **The vector DB is yours.** Custom HNSW index with mmap storage, SIMD-optimized distance computation, and PostgreSQL-style WAL — all ~4,200 lines of Rust, zero external dependencies.
 - **Code-aware chunking.** Tree-sitter parses your source into an AST and chunks by semantic boundaries (functions, structs, classes), not arbitrary word counts.
 - **Runs 100% locally.** 40+ ONNX embedding models via fastembed. No API keys, no network calls, no vendor lock-in.
 - **Crash-safe by design.** WAL with CRC32 integrity checks, idempotent recovery, and a three-step flush protocol — the same guarantees you'd expect from a production database.
@@ -104,7 +104,8 @@ rust-rag-mcp serve [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--db-path <PATH>` | `.rig-rag-db` | Database path |
+| `--db-path <PATH>` | `.rag-db` | Database path |
+| `--cache-path <PATH>` | `.rag-cache` | Cache path |
 | `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
 | `--chunk-size <N>` | `512` | Chunk size |
 | `--overlap <N>` | `64` | Chunk overlap |
@@ -114,6 +115,14 @@ rust-rag-mcp serve [OPTIONS]
 ```bash
 rust-rag-mcp index <PATHS>... [OPTIONS]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--db-path <PATH>` | `.rag-db` | Database path |
+| `--cache-path <PATH>` | `.rag-cache` | Cache path |
+| `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
+| `--chunk-size <N>` | `512` | Chunk size |
+| `--overlap <N>` | `64` | Chunk overlap |
 
 ```bash
 # Index a Rust project
@@ -136,16 +145,31 @@ rust-rag-mcp search <QUERY>... [OPTIONS]
 |--------|---------|-------------|
 | `--top-k <N>` | `5` | Number of results |
 | `--source <SOURCE>` | — | Filter by source |
-| `--db-path <PATH>` | — | Database path |
-| `--model <MODEL>` | — | Embedding model |
+| `--db-path <PATH>` | `.rag-db` | Database path |
+| `--cache-path <PATH>` | `.rag-cache` | Cache path |
+| `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
+
+### Delete Source
+
+```bash
+rust-rag-mcp delete <SOURCE_PATH> [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--db-path <PATH>` | `.rag-db` | Database path |
+| `--cache-path <PATH>` | `.rag-cache` | Cache path |
+| `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
 
 ### Other Commands
 
 ```bash
-rust-rag-mcp sources    # List indexed sources
-rust-rag-mcp stats      # Show database statistics
-rust-rag-mcp models     # List available embedding models
+rust-rag-mcp sources [OPTIONS]    # List indexed sources
+rust-rag-mcp stats [OPTIONS]      # Show database statistics
+rust-rag-mcp models               # List available embedding models
 ```
+
+`sources` and `stats` accept `--db-path`, `--cache-path`, and `--model` options (same defaults as above).
 
 ## MCP Integration
 
@@ -153,10 +177,14 @@ rust-rag-mcp models     # List available embedding models
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "rag": {
-      "command": "rust-rag-mcp",
-      "args": ["serve", "--db-path", ".rig-rag-db"]
+      "command": [
+        "rust-rag-mcp",
+        "serve",
+        "--db-path", "/home/user/.rag-db",
+        "--cache-path", "/home/user/.rag-db",
+      ]
     }
   }
 }
@@ -171,7 +199,7 @@ Add to `~/.config/opencode/opencode.json`.
   "mcpServers": {
     "rag": {
       "command": "rust-rag-mcp",
-      "args": ["serve", "--db-path", ".rig-rag-db"]
+      "args": ["serve", "--db-path", ".rag-db"]
     }
   }
 }
@@ -186,7 +214,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`.
   "servers": {
     "rag": {
       "command": "rust-rag-mcp",
-      "args": ["serve", "--db-path", ".rig-rag-db"]
+      "args": ["serve", "--db-path", ".rag-db"]
     }
   }
 }
@@ -217,7 +245,7 @@ rust-rag-mcp
 └── mcp         MCP server (8 tools over stdio)
 ```
 
-All ~2,700 lines of the vector database are written from scratch. No wrappers. No hidden dependencies.
+All ~4,200 lines of the vector database are written from scratch. No wrappers. No hidden dependencies.
 
 ## License
 
