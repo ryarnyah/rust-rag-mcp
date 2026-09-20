@@ -17,7 +17,7 @@ use fs2::FileExt;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lsn(u64);
+pub struct Lsn(pub u64);
 
 impl Lsn {
     pub fn as_u64(self) -> u64 { self.0 }
@@ -78,6 +78,14 @@ pub struct WalRecord {
 }
 
 impl WalRecord {
+    /// Serialize record to bytes (for benchmarking)
+    #[doc(hidden)]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to(&mut buf);
+        buf
+    }
+
     fn write_to(&self, buf: &mut Vec<u8>) {
         let payload_len = self.vector_data.len() * 4 + self.metadata.len();
         buf.reserve(RECORD_HEADER_LEN + payload_len + FOOTER_LEN - buf.len());
