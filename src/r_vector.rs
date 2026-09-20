@@ -34,6 +34,7 @@
 
 use memmap2::{MmapMut, MmapOptions};
 use std::collections::{HashMap, HashSet, BinaryHeap};
+use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -523,6 +524,45 @@ struct HnswIndex {
     mmap: Option<MmapMut>,
     cfg: Config,
     rng: Rng,
+    /// Reusable scratch buffers for search_layer and insert to avoid per-call allocations.
+    /// Safety: only accessed within &self or &mut self methods, never across threads.
+    /// VectorDb is behind RwLock, so concurrent access is prevented externally.
+    scratch: UnsafeCell<SearchBuffers>,
+}
+
+// SAFETY: HnswIndex is only accessed through VectorDb which is behind RwLock,
+// preventing concurrent access to scratch buffers.
+unsafe impl Sync for HnswIndex {}
+
+/// Pre-allocated scratch buffers reused across HNSW operations.
+/// Eliminates ~50 heap allocations per insert/search by clearing
+/// instead of dropping and recreating.
+struct SearchBuffers {
+    visited: HashSet<u32>,
+    candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, u32)>>,
+    results: BinaryHeap<(OrderedFloat<f32>, u32)>,
+    search_output: Vec<(f32, u32)>,
+    select_result: Vec<u32>,
+    select_seen: HashSet<u32>,
+    cross_cache: HashMap<(u32, u32), f32>,
+    dists: Vec<(u32, f32)>,
+}
+
+impl SearchBuffers {
+    fn new(cfg: &Config) -> Self {
+        let ef = cfg.ef_construction;
+        Self {
+            visited: HashSet::with_capacity(ef * 2),
+            candidates: BinaryHeap::with_capacity(ef),
+            results: BinaryHeap::with_capacity(ef + 1),
+            search_output: Vec::with_capacity(ef),
+            select_result: Vec::with_capacity(cfg.m0),
+            select_seen: HashSet::with_capacity(cfg.m0 * 2),
+            cross_cache: HashMap::new(),
+            dists: Vec::with_capacity(ef),
+        }
+    }
+
 }
 
 impl HnswIndex {
@@ -588,6 +628,7 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: *cfg,
                 rng: Rng::new(cfg.seed),
+                scratch: UnsafeCell::new(SearchBuffers::new(cfg)),
             })
         } else {
             // Load existing index
@@ -636,6 +677,7 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: on_disk,
                 rng: Rng::new(seed),
+                scratch: UnsafeCell::new(SearchBuffers::new(&on_disk)),
             })
         }
     }
@@ -759,54 +801,98 @@ impl HnswIndex {
     ///
     /// `dists` must be pre-sorted by distance to the reference node (ascending).
     /// Each entry is `(neighbor_id, distance_to_ref)`.
+    /// When `scratch` is provided, reuses pre-allocated buffers.
     fn select_neighbors_heuristic(
         dists: &[(u32, f32)],
         m: usize,
         cross_dist: impl Fn(u32, u32) -> Result<f32>,
+        scratch: Option<&mut SearchBuffers>,
     ) -> Result<Vec<u32>> {
         if dists.len() <= m {
             return Ok(dists.iter().map(|(n, _)| *n).collect());
         }
 
-        let mut result: Vec<u32> = Vec::with_capacity(m);
-        let mut seen: HashSet<u32> = HashSet::new();
-        let mut cross_cache: HashMap<(u32, u32), f32> = HashMap::new();
+        if let Some(scratch) = scratch {
+            scratch.select_result.clear();
+            scratch.select_seen.clear();
+            scratch.cross_cache.clear();
 
-        for &(neighbor_id, d_ref_n) in dists {
-            if result.len() >= m {
-                break;
-            }
-            let mut keep = true;
-            for &r in &result {
-                let d = if let Some(&cached) = cross_cache.get(&(neighbor_id, r)) {
-                    cached
-                } else {
-                    let d = cross_dist(neighbor_id, r)?;
-                    cross_cache.insert((neighbor_id, r), d);
-                    d
-                };
-                if d < d_ref_n {
-                    keep = false;
+            for &(neighbor_id, d_ref_n) in dists {
+                if scratch.select_result.len() >= m {
                     break;
                 }
+                let mut keep = true;
+                for &r in &scratch.select_result {
+                    let d = if let Some(&cached) = scratch.cross_cache.get(&(neighbor_id, r)) {
+                        cached
+                    } else {
+                        let d = cross_dist(neighbor_id, r)?;
+                        scratch.cross_cache.insert((neighbor_id, r), d);
+                        d
+                    };
+                    if d < d_ref_n {
+                        keep = false;
+                        break;
+                    }
+                }
+                if keep && scratch.select_seen.insert(neighbor_id) {
+                    scratch.select_result.push(neighbor_id);
+                }
             }
-            if keep && seen.insert(neighbor_id) {
-                result.push(neighbor_id);
-            }
-        }
 
-        if result.len() < m {
-            for &(neighbor_id, _) in dists {
+            if scratch.select_result.len() < m {
+                for &(neighbor_id, _) in dists {
+                    if scratch.select_result.len() >= m {
+                        break;
+                    }
+                    if scratch.select_seen.insert(neighbor_id) {
+                        scratch.select_result.push(neighbor_id);
+                    }
+                }
+            }
+
+            Ok(std::mem::take(&mut scratch.select_result))
+        } else {
+            let mut result: Vec<u32> = Vec::with_capacity(m);
+            let mut seen: HashSet<u32> = HashSet::new();
+            let mut cross_cache: HashMap<(u32, u32), f32> = HashMap::new();
+
+            for &(neighbor_id, d_ref_n) in dists {
                 if result.len() >= m {
                     break;
                 }
-                if seen.insert(neighbor_id) {
+                let mut keep = true;
+                for &r in &result {
+                    let d = if let Some(&cached) = cross_cache.get(&(neighbor_id, r)) {
+                        cached
+                    } else {
+                        let d = cross_dist(neighbor_id, r)?;
+                        cross_cache.insert((neighbor_id, r), d);
+                        d
+                    };
+                    if d < d_ref_n {
+                        keep = false;
+                        break;
+                    }
+                }
+                if keep && seen.insert(neighbor_id) {
                     result.push(neighbor_id);
                 }
             }
-        }
 
-        Ok(result)
+            if result.len() < m {
+                for &(neighbor_id, _) in dists {
+                    if result.len() >= m {
+                        break;
+                    }
+                    if seen.insert(neighbor_id) {
+                        result.push(neighbor_id);
+                    }
+                }
+            }
+
+            Ok(result)
+        }
     }
 
     /// Add bidirectional link between two nodes at given layer
@@ -828,7 +914,7 @@ impl HnswIndex {
             .collect::<Result<Vec<_>>>()?;
         dists.sort_by(|a, b| distance_cmp(a.1, b.1));
 
-        let selected = Self::select_neighbors_heuristic(&dists, cap, dist)?;
+        let selected = Self::select_neighbors_heuristic(&dists, cap, dist, None)?;
 
         self.set_layer_count(id, layer, selected.len());
         for (i, n) in selected.iter().enumerate() {
@@ -837,7 +923,8 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Search layer for candidates similar to entry node
+    /// Search layer for candidates similar to entry node.
+    /// Uses pre-allocated scratch buffers to avoid per-call heap allocations.
     fn search_layer<F, D>(
         &self,
         entry: u32,
@@ -850,62 +937,60 @@ impl HnswIndex {
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
     {
-        let mut visited: HashSet<u32> = HashSet::new();
-        visited.insert(entry);
+        // SAFETY: scratch is only used within this method call chain,
+        // and VectorDb is behind RwLock preventing concurrent access.
+        let scratch = unsafe { &mut *self.scratch.get() };
+        scratch.visited.clear();
+        scratch.visited.insert(entry);
 
         let d0 = dist(entry)?;
         
-        // Use BinaryHeap (min-heap via Reverse) for candidates
-        // This eliminates O(n log n) sorting in the main loop
-        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, u32)>> = BinaryHeap::new();
-        candidates.push(Reverse((OrderedFloat(d0), entry)));
+        scratch.candidates.clear();
+        scratch.candidates.push(Reverse((OrderedFloat(d0), entry)));
         
-        // Results heap - max-heap to efficiently track worst result
-        let mut results: BinaryHeap<(OrderedFloat<f32>, u32)> = BinaryHeap::new();
+        scratch.results.clear();
         if !is_deleted(entry) {
-            results.push((OrderedFloat(d0), entry));
+            scratch.results.push((OrderedFloat(d0), entry));
         }
 
-        while let Some(Reverse((OrderedFloat(cd), c))) = candidates.pop() {
-            let worst_result = results
+        while let Some(Reverse((OrderedFloat(cd), c))) = scratch.candidates.pop() {
+            let worst_result = scratch.results
                 .peek()
                 .map(|(d, _)| d.into_inner())
                 .unwrap_or(f32::NEG_INFINITY);
             
-            if results.len() >= ef && cd > worst_result {
+            if scratch.results.len() >= ef && cd > worst_result {
                 break;
-             }
+            }
 
-             // P6: Use iterator to avoid Vec allocation
-             for n in self.layer_neighbors_iter(c, layer) {
-                 if !visited.insert(n) {
-                     continue;
-                 }
-                 let d = dist(n)?;
-                 let worst = results
-                     .peek()
-                     .map(|(d, _)| d.into_inner())
-                     .unwrap_or(f32::NEG_INFINITY);
-                 
-                 if results.len() < ef || d < worst {
-                     candidates.push(Reverse((OrderedFloat(d), n)));
-                     if !is_deleted(n) {
-                        results.push((OrderedFloat(d), n));
-                        if results.len() > ef {
-                            results.pop();
+            for n in self.layer_neighbors_iter(c, layer) {
+                if !scratch.visited.insert(n) {
+                    continue;
+                }
+                let d = dist(n)?;
+                let worst = scratch.results
+                    .peek()
+                    .map(|(d, _)| d.into_inner())
+                    .unwrap_or(f32::NEG_INFINITY);
+                
+                if scratch.results.len() < ef || d < worst {
+                    scratch.candidates.push(Reverse((OrderedFloat(d), n)));
+                    if !is_deleted(n) {
+                        scratch.results.push((OrderedFloat(d), n));
+                        if scratch.results.len() > ef {
+                            scratch.results.pop();
                         }
                     }
                 }
             }
         }
 
-        // Convert heap results back to Vec and sort for output
-        let mut output: Vec<(f32, u32)> = results
-            .into_iter()
-            .map(|(d, id)| (d.into_inner(), id))
-            .collect();
-        output.sort_by(|a, b| distance_cmp(a.0, b.0));
-        Ok(output)
+        scratch.search_output.clear();
+        scratch.search_output.extend(
+            scratch.results.drain().map(|(d, id)| (d.into_inner(), id))
+        );
+        scratch.search_output.sort_by(|a, b| distance_cmp(a.0, b.0));
+        Ok(std::mem::take(&mut scratch.search_output))
     }
 
     /// Insert new node into index (must be called with proper distance function)
@@ -965,9 +1050,16 @@ impl HnswIndex {
             let candidates = self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
 
             let cap = Self::layer_capacity(&self.cfg, layer);
-            let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
-            dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-        let selected = Self::select_neighbors_heuristic(&dists, cap, dist)?;
+            let selected = {
+                let scratch = unsafe { &mut *self.scratch.get() };
+                scratch.dists.clear();
+                scratch.dists.extend(candidates.iter().map(|&(d, id)| (id, d)));
+                scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+                let dists = std::mem::take(&mut scratch.dists);
+                let r = Self::select_neighbors_heuristic(&dists, cap, dist, Some(scratch))?;
+                scratch.dists = dists;
+                r
+            };
 
             for &n in &selected {
                 self.add_link(new_id, layer, n, &dist)?;
@@ -1299,12 +1391,18 @@ impl VectorDb {
                 ep, layer, self.cfg.ef_construction, &to_new, &is_deleted,
             )?;
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
-            let mut dists: Vec<(u32, f32)> = candidates.iter().map(|&(d, id)| (id, d)).collect();
-            dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-            let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, dist)?;
-            for &n in &selected {
-                self.index.add_link(id, layer, n, &dist)?;
-                self.index.add_link(n, layer, id, &dist)?;
+            {
+                let scratch = unsafe { &mut *self.index.scratch.get() };
+                scratch.dists.clear();
+                scratch.dists.extend(candidates.iter().map(|&(d, id)| (id, d)));
+                scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+                let dists = std::mem::take(&mut scratch.dists);
+                let selected = HnswIndex::select_neighbors_heuristic(&dists, cap, dist, Some(scratch))?;
+                scratch.dists = dists;
+                for &n in &selected {
+                    self.index.add_link(id, layer, n, &dist)?;
+                    self.index.add_link(n, layer, id, &dist)?;
+                }
             }
             if let Some(&(_, e)) = candidates.first() {
                 ep = e;
