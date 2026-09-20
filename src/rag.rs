@@ -253,7 +253,7 @@ impl RagCore {
             return Ok(());
         }
 
-        let embeddings_result = self.embedding.embed_chunks(chunks.clone()).await?;
+        let embeddings_result = self.embedding.embed_chunks(&chunks).await?;
 
         // Insert each chunk with its embedding
         for (chunk, embedding) in chunks.iter().zip(embeddings_result.iter()) {
@@ -292,16 +292,17 @@ impl RagCore {
          top_k: usize,
          source_filter: Option<&str>,
      ) -> Result<Vec<SearchResult>> {
+         let query_chunk = vec![DocumentChunk {
+             id: "query".to_string(),
+             text: query.to_string(),
+             source: "query".to_string(),
+             chunk_index: 0,
+             start_offset: 0,
+             end_offset: 0,
+         }];
          let query_embedding_vec = self
              .embedding
-             .embed_chunks(vec![DocumentChunk {
-                 id: "query".to_string(),
-                 text: query.to_string(),
-                 source: "query".to_string(),
-                 chunk_index: 0,
-                 start_offset: 0,
-                 end_offset: 0,
-             }])
+             .embed_chunks(&query_chunk)
              .await?;
 
          if query_embedding_vec.is_empty() || query_embedding_vec[0].is_empty() {
