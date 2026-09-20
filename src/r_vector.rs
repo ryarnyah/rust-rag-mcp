@@ -32,22 +32,22 @@
 //! }
 //! ```
 
+use fs2::FileExt;
 use memmap2::{MmapMut, MmapOptions};
-use std::collections::{HashMap, HashSet, BinaryHeap};
+use ndarray::ArrayView1;
+use ordered_float::OrderedFloat;
 use std::cell::UnsafeCell;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing;
-use ndarray::ArrayView1;
-use std::cmp::Reverse;
-use ordered_float::OrderedFloat;
-use fs2::FileExt;
 
-use crate::wal::{WriteAheadLog, WalRecord, WalOpType};
+use crate::wal::{WalOpType, WalRecord, WriteAheadLog};
 
 // ============================================================================
 //  Error Types
@@ -151,7 +151,7 @@ impl Config {
                 secs.wrapping_mul(0x9E37_79B9) ^ nanos.wrapping_mul(0x7F4A_7C15)
             })
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        
+
         Self {
             dim,
             m: 20,
@@ -162,7 +162,7 @@ impl Config {
             initial_capacity: 1024,
             max_wal_segment_size: 64 * 1024 * 1024, // 64 MB per segment
             max_total_wal_size: 256 * 1024 * 1024,  // 256 MB total across all segments
-            max_wal_segments: 16,                    // max 16 WAL segments
+            max_wal_segments: 16,                   // max 16 WAL segments
         }
     }
 
@@ -239,7 +239,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    
+
     // Use ndarray for automatic SIMD vectorization
     let a_arr = ArrayView1::from(a);
     let b_arr = ArrayView1::from(b);
@@ -377,7 +377,10 @@ impl MetadataStore {
 
         if !exists {
             let total = META_HEADER;
-            store.file.set_len(total as u64).map_err(VectorDbError::Io)?;
+            store
+                .file
+                .set_len(total as u64)
+                .map_err(VectorDbError::Io)?;
             let mut m = unsafe { MmapOptions::new().map_mut(&store.file)? };
             m[0..8].copy_from_slice(&META_MAGIC.to_le_bytes());
             m[8..12].copy_from_slice(&0u32.to_le_bytes()); // count = 0
@@ -391,8 +394,11 @@ impl MetadataStore {
             }
             let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
 
-            let magic = u64::from_le_bytes(m[0..8].try_into()
-                .map_err(|_| VectorDbError::Corruption("metadata file too small".into()))?);
+            let magic = u64::from_le_bytes(
+                m[0..8]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("metadata file too small".into()))?,
+            );
             if magic != META_MAGIC {
                 return Err(VectorDbError::Corruption("invalid metadata magic".into()));
             }
@@ -403,9 +409,11 @@ impl MetadataStore {
             let mut pos = META_HEADER;
             for _ in 0..count as usize {
                 if pos + 16 > len {
-                    return Err(VectorDbError::Corruption(
-                        format!("metadata truncated: expected {} records but only {} bytes available", count, len - META_HEADER)
-                    ));
+                    return Err(VectorDbError::Corruption(format!(
+                        "metadata truncated: expected {} records but only {} bytes available",
+                        count,
+                        len - META_HEADER
+                    )));
                 }
                 let id = u32::from_le_bytes(m[pos..pos + 4].try_into().unwrap());
                 let flags = u32::from_le_bytes(m[pos + 4..pos + 8].try_into().unwrap());
@@ -413,14 +421,19 @@ impl MetadataStore {
 
                 let data_off = pos + 16;
                 if data_off + dlen > len {
-                    return Err(VectorDbError::Corruption("metadata record data extends beyond file".into()));
+                    return Err(VectorDbError::Corruption(
+                        "metadata record data extends beyond file".into(),
+                    ));
                 }
 
-                store.index.insert(id, MetaRecord {
-                    flags,
-                    offset: data_off as u64,
-                    len: dlen as u32,
-                });
+                store.index.insert(
+                    id,
+                    MetaRecord {
+                        flags,
+                        offset: data_off as u64,
+                        len: dlen as u32,
+                    },
+                );
                 pos = data_off + dlen;
             }
 
@@ -477,11 +490,14 @@ impl MetadataStore {
             m[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
             m[off + 16..off + 16 + data.len()].copy_from_slice(data);
         }
-        self.index.insert(id, MetaRecord {
-            flags,
-            offset: (off + 16) as u64,
-            len: data.len() as u32,
-        });
+        self.index.insert(
+            id,
+            MetaRecord {
+                flags,
+                offset: (off + 16) as u64,
+                len: data.len() as u32,
+            },
+        );
         self.record_count += 1;
         self.file_len = off + 16 + data.len();
         Ok(())
@@ -493,7 +509,9 @@ impl MetadataStore {
             m.flush().map_err(VectorDbError::Io)?;
         }
         self.mmap = None;
-        self.file.set_len(new_size as u64).map_err(VectorDbError::Io)?;
+        self.file
+            .set_len(new_size as u64)
+            .map_err(VectorDbError::Io)?;
         self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
         Ok(())
     }
@@ -502,7 +520,9 @@ impl MetadataStore {
         let count = self.record_count;
         self.mmap_mut()[8..12].copy_from_slice(&count.to_le_bytes());
         self.mmap().flush().map_err(VectorDbError::Io)?;
-        self.file.set_len(self.file_len as u64).map_err(VectorDbError::Io)?;
+        self.file
+            .set_len(self.file_len as u64)
+            .map_err(VectorDbError::Io)?;
         self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
         Ok(())
     }
@@ -562,7 +582,6 @@ impl SearchBuffers {
             dists: Vec::with_capacity(ef),
         }
     }
-
 }
 
 impl HnswIndex {
@@ -585,18 +604,22 @@ impl HnswIndex {
 
     /// Capacity (max connections) for a specific layer
     fn layer_capacity(cfg: &Config, layer: usize) -> usize {
-        if layer == 0 { cfg.m0 } else { cfg.m }
+        if layer == 0 {
+            cfg.m0
+        } else {
+            cfg.m
+        }
     }
 
     /// Open or create HNSW index
     async fn open<P: AsRef<Path>>(path: P, cfg: &Config) -> Result<Self> {
         let path = path.as_ref();
-        
+
         // Check if file exists using tokio
         let exists = tokio::fs::try_exists(path)
             .await
             .map_err(VectorDbError::Io)?;
-        
+
         // Open file using std for mmap compatibility
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -635,8 +658,9 @@ impl HnswIndex {
             let m = unsafe { MmapOptions::new().map_mut(&file)? };
 
             // Validate magic
-            let magic = u64::from_le_bytes(m[0..8].try_into()
-                .map_err(|_| VectorDbError::Corruption("file too small for HNSW header".to_string()))?);
+            let magic = u64::from_le_bytes(m[0..8].try_into().map_err(|_| {
+                VectorDbError::Corruption("file too small for HNSW header".to_string())
+            })?);
             if magic != HNSW_MAGIC {
                 return Err(VectorDbError::Corruption("invalid HNSW magic".to_string()));
             }
@@ -644,16 +668,29 @@ impl HnswIndex {
             // Validate config compatibility
             let on_disk = Config {
                 dim: cfg.dim,
-                m: u64::from_le_bytes(m[32..40].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid m value".to_string()))?) as usize,
-                m0: u64::from_le_bytes(m[40..48].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid m0 value".to_string()))?) as usize,
-                max_level: u64::from_le_bytes(m[48..56].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid max_level".to_string()))?) as usize,
-                ef_construction: u64::from_le_bytes(m[56..64].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid ef_construction".to_string()))?) as usize,
-                seed: u64::from_le_bytes(m[64..72].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid seed".to_string()))?),
+                m: u64::from_le_bytes(
+                    m[32..40]
+                        .try_into()
+                        .map_err(|_| VectorDbError::Corruption("invalid m value".to_string()))?,
+                ) as usize,
+                m0: u64::from_le_bytes(
+                    m[40..48]
+                        .try_into()
+                        .map_err(|_| VectorDbError::Corruption("invalid m0 value".to_string()))?,
+                ) as usize,
+                max_level: u64::from_le_bytes(
+                    m[48..56]
+                        .try_into()
+                        .map_err(|_| VectorDbError::Corruption("invalid max_level".to_string()))?,
+                ) as usize,
+                ef_construction: u64::from_le_bytes(m[56..64].try_into().map_err(|_| {
+                    VectorDbError::Corruption("invalid ef_construction".to_string())
+                })?) as usize,
+                seed: u64::from_le_bytes(
+                    m[64..72]
+                        .try_into()
+                        .map_err(|_| VectorDbError::Corruption("invalid seed".to_string()))?,
+                ),
                 initial_capacity: cfg.initial_capacity,
                 max_wal_segment_size: cfg.max_wal_segment_size,
                 max_total_wal_size: cfg.max_total_wal_size,
@@ -661,16 +698,17 @@ impl HnswIndex {
             };
 
             if on_disk.m != cfg.m || on_disk.m0 != cfg.m0 || on_disk.max_level != cfg.max_level {
-                return Err(VectorDbError::ConfigMismatch(
-                    format!(
-                        "file has M={} M0={} max_level={}, requested M={} M0={} max_level={}",
-                        on_disk.m, on_disk.m0, on_disk.max_level, cfg.m, cfg.m0, cfg.max_level,
-                    ),
-                ));
+                return Err(VectorDbError::ConfigMismatch(format!(
+                    "file has M={} M0={} max_level={}, requested M={} M0={} max_level={}",
+                    on_disk.m, on_disk.m0, on_disk.max_level, cfg.m, cfg.m0, cfg.max_level,
+                )));
             }
 
-            let count = u64::from_le_bytes(m[8..16].try_into()
-                .map_err(|_| VectorDbError::Corruption("invalid count".to_string()))?);
+            let count = u64::from_le_bytes(
+                m[8..16]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("invalid count".to_string()))?,
+            );
             let seed = on_disk.seed ^ (count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             Ok(Self {
                 file,
@@ -741,8 +779,7 @@ impl HnswIndex {
         if layer == 0 {
             base
         } else {
-            base + Self::layer_bytes(&self.cfg, 0)
-                + (layer - 1) * Self::layer_bytes(&self.cfg, 1)
+            base + Self::layer_bytes(&self.cfg, 0) + (layer - 1) * Self::layer_bytes(&self.cfg, 1)
         }
     }
 
@@ -767,15 +804,14 @@ impl HnswIndex {
     }
 
     #[inline]
-     fn layer_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
+    fn layer_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
         let c = self.layer_count(id, layer);
         (0..c).map(|i| self.layer_neighbor(id, layer, i)).collect()
     }
-    
+
     /// P6: Iterator version to avoid Vec allocation when just iterating
     #[inline]
-    fn layer_neighbors_iter(&self, id: u32, layer: usize) 
-        -> impl Iterator<Item = u32> + '_ {
+    fn layer_neighbors_iter(&self, id: u32, layer: usize) -> impl Iterator<Item = u32> + '_ {
         let c = self.layer_count(id, layer);
         (0..c).map(move |i| self.layer_neighbor(id, layer, i))
     }
@@ -784,7 +820,9 @@ impl HnswIndex {
         let new_cap = (self.capacity() * 2).max(16);
         let new_size = HNSW_HEADER + new_cap * Self::node_bytes(&self.cfg);
         self.mmap = None;
-        self.file.set_len(new_size as u64).map_err(VectorDbError::Io)?;
+        self.file
+            .set_len(new_size as u64)
+            .map_err(VectorDbError::Io)?;
         let mut m = unsafe { MmapOptions::new().map_mut(&self.file)? };
         m[24..32].copy_from_slice(&(new_cap as u64).to_le_bytes());
         self.mmap = Some(m);
@@ -909,7 +947,8 @@ impl HnswIndex {
             neighbors.push(new);
         }
 
-        let mut dists: Vec<(u32, f32)> = neighbors.iter()
+        let mut dists: Vec<(u32, f32)> = neighbors
+            .iter()
             .map(|&n| dist(id, n).map(|d| (n, d)))
             .collect::<Result<Vec<_>>>()?;
         dists.sort_by(|a, b| distance_cmp(a.1, b.1));
@@ -926,14 +965,8 @@ impl HnswIndex {
     /// Search layer for candidates similar to entry node.
     /// Results are written into scratch.search_output (sorted by distance).
     /// Caller must read from scratch before the next search_layer call.
-    fn search_layer<F, D>(
-        &self,
-        entry: u32,
-        layer: usize,
-        ef: usize,
-        dist: &F,
-        is_deleted: &D,
-    ) where
+    fn search_layer<F, D>(&self, entry: u32, layer: usize, ef: usize, dist: &F, is_deleted: &D)
+    where
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
     {
@@ -942,21 +975,22 @@ impl HnswIndex {
         scratch.visited.insert(entry);
 
         let d0 = dist(entry).unwrap_or(f32::INFINITY);
-        
+
         scratch.candidates.clear();
         scratch.candidates.push(Reverse((OrderedFloat(d0), entry)));
-        
+
         scratch.results.clear();
         if !is_deleted(entry) {
             scratch.results.push((OrderedFloat(d0), entry));
         }
 
         while let Some(Reverse((OrderedFloat(cd), c))) = scratch.candidates.pop() {
-            let worst_result = scratch.results
+            let worst_result = scratch
+                .results
                 .peek()
                 .map(|(d, _)| d.into_inner())
                 .unwrap_or(f32::NEG_INFINITY);
-            
+
             if scratch.results.len() >= ef && cd > worst_result {
                 break;
             }
@@ -969,11 +1003,12 @@ impl HnswIndex {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
-                let worst = scratch.results
+                let worst = scratch
+                    .results
                     .peek()
                     .map(|(d, _)| d.into_inner())
                     .unwrap_or(f32::NEG_INFINITY);
-                
+
                 if scratch.results.len() < ef || d < worst {
                     scratch.candidates.push(Reverse((OrderedFloat(d), n)));
                     if !is_deleted(n) {
@@ -987,9 +1022,9 @@ impl HnswIndex {
         }
 
         scratch.search_output.clear();
-        scratch.search_output.extend(
-            scratch.results.drain().map(|(d, id)| (d.into_inner(), id))
-        );
+        scratch
+            .search_output
+            .extend(scratch.results.drain().map(|(d, id)| (d.into_inner(), id)));
         scratch.search_output.sort_by(|a, b| distance_cmp(a.0, b.0));
     }
 
@@ -1023,22 +1058,22 @@ impl HnswIndex {
 
         // 1. Greedy descent from top layer down to `level + 1`
         let mut l = cur_max;
-         while l > level {
-             let mut changed = true;
-             while changed {
-                 changed = false;
-                 // P6: Use iterator to avoid Vec allocation
-                 for n in self.layer_neighbors_iter(ep, l) {
-                     if is_deleted(n) {
-                         continue;
-                     }
-                     let d = dist(new_id, n)?;
-                     if d < ep_dist {
-                         ep_dist = d;
-                         ep = n;
-                         changed = true;
-                     }
-                 }
+        while l > level {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                // P6: Use iterator to avoid Vec allocation
+                for n in self.layer_neighbors_iter(ep, l) {
+                    if is_deleted(n) {
+                        continue;
+                    }
+                    let d = dist(new_id, n)?;
+                    if d < ep_dist {
+                        ep_dist = d;
+                        ep = n;
+                        changed = true;
+                    }
+                }
             }
             l = l.saturating_sub(1);
         }
@@ -1053,7 +1088,9 @@ impl HnswIndex {
             let selected = {
                 let scratch = unsafe { &mut *self.scratch.get() };
                 scratch.dists.clear();
-                scratch.dists.extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
+                scratch
+                    .dists
+                    .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
                 let (dists_ptr, scratch_ptr) = {
                     let d = &scratch.dists as *const Vec<(u32, f32)>;
@@ -1061,7 +1098,9 @@ impl HnswIndex {
                     (d, s)
                 };
                 Self::select_neighbors_heuristic(
-                    unsafe { &*dists_ptr }, cap, dist,
+                    unsafe { &*dists_ptr },
+                    cap,
+                    dist,
                     Some(unsafe { &mut *scratch_ptr }),
                 )?
             };
@@ -1106,25 +1145,27 @@ impl HnswIndex {
         let mut ep_dist = dist(ep)?;
         let cur_max = self.max_level() as usize;
 
-         for layer in (1..=cur_max).rev() {
-             let mut changed = true;
-             while changed {
-                 changed = false;
-                 // P6: Use iterator to avoid Vec allocation
-                 for n in self.layer_neighbors_iter(ep, layer) {
-                     let d = dist(n)?;
-                     if d < ep_dist && !is_deleted(n) {
-                         ep_dist = d;
-                         ep = n;
-                         changed = true;
-                     }
-                 }
-             }
-         }
+        for layer in (1..=cur_max).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                // P6: Use iterator to avoid Vec allocation
+                for n in self.layer_neighbors_iter(ep, layer) {
+                    let d = dist(n)?;
+                    if d < ep_dist && !is_deleted(n) {
+                        ep_dist = d;
+                        ep = n;
+                        changed = true;
+                    }
+                }
+            }
+        }
 
         self.search_layer(ep, 0, ef.max(k), &dist, is_deleted);
         let scratch = unsafe { &*self.scratch.get() };
-        scratch.search_output.iter()
+        scratch
+            .search_output
+            .iter()
             .take(k)
             .map(|&(d, id)| Ok((id, d)))
             .collect()
@@ -1160,13 +1201,24 @@ impl VectorView {
         if end > self.file_size {
             return None;
         }
-        unsafe { Some(std::slice::from_raw_parts(self.ptr.add(start) as *const f32, self.dim)) }
+        unsafe {
+            Some(std::slice::from_raw_parts(
+                self.ptr.add(start) as *const f32,
+                self.dim,
+            ))
+        }
     }
 
     /// Cosine distance between two vectors with error handling
     fn distance(&self, a: u32, b: u32) -> Result<f32> {
-        let va = self.get(a).ok_or(VectorDbError::IdOutOfBounds { id: a, capacity: (self.file_size as u32) })?;
-        let vb = self.get(b).ok_or(VectorDbError::IdOutOfBounds { id: b, capacity: (self.file_size as u32) })?;
+        let va = self.get(a).ok_or(VectorDbError::IdOutOfBounds {
+            id: a,
+            capacity: (self.file_size as u32),
+        })?;
+        let vb = self.get(b).ok_or(VectorDbError::IdOutOfBounds {
+            id: b,
+            capacity: (self.file_size as u32),
+        })?;
         cosine_distance(va, vb)
     }
 }
@@ -1217,22 +1269,40 @@ impl VectorDb {
             m
         } else {
             let m = unsafe { MmapOptions::new().map_mut(&file)? };
-            let magic = u64::from_le_bytes(m[0..8].try_into()
-                .map_err(|_| VectorDbError::Corruption("vec file too small".to_string()))?);
+            let magic = u64::from_le_bytes(
+                m[0..8]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("vec file too small".to_string()))?,
+            );
             if magic != VEC_MAGIC {
-                return Err(VectorDbError::Corruption("invalid vector magic".to_string()));
+                return Err(VectorDbError::Corruption(
+                    "invalid vector magic".to_string(),
+                ));
             }
-            let stored = u64::from_le_bytes(m[8..16].try_into()
-                .map_err(|_| VectorDbError::Corruption("invalid dim".to_string()))?) as usize;
+            let stored = u64::from_le_bytes(
+                m[8..16]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("invalid dim".to_string()))?,
+            ) as usize;
             if stored != cfg.dim {
-                return Err(VectorDbError::DimensionMismatch { expected: cfg.dim, got: stored });
+                return Err(VectorDbError::DimensionMismatch {
+                    expected: cfg.dim,
+                    got: stored,
+                });
             }
             m
         };
 
         let index = HnswIndex::open(hnsw_path(&path), &cfg).await?;
         let meta = MetadataStore::open(meta_path(&path)).await?;
-        let wal = WriteAheadLog::new(&path, cfg.max_wal_segment_size, cfg.max_total_wal_size, cfg.max_wal_segments).await.map_err(VectorDbError::Io)?;
+        let wal = WriteAheadLog::new(
+            &path,
+            cfg.max_wal_segment_size,
+            cfg.max_total_wal_size,
+            cfg.max_wal_segments,
+        )
+        .await
+        .map_err(VectorDbError::Io)?;
 
         // Prod 1 fix: Acquire exclusive advisory lock to prevent multi-process corruption
         let lock_path = path.with_extension("lock");
@@ -1245,7 +1315,10 @@ impl VectorDb {
         lock_file.try_lock_exclusive().map_err(|_e| {
             VectorDbError::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("Cannot open database: another process has an exclusive lock on {:?}", lock_path),
+                format!(
+                    "Cannot open database: another process has an exclusive lock on {:?}",
+                    lock_path
+                ),
             ))
         })?;
 
@@ -1310,7 +1383,9 @@ impl VectorDb {
                     if (record.vector_id as usize) < self.len()
                         && !self.meta.is_deleted(record.vector_id)
                     {
-                        let prev = self.meta.get(record.vector_id)
+                        let prev = self
+                            .meta
+                            .get(record.vector_id)
                             .map(|b| b.to_vec())
                             .unwrap_or_default();
                         self.meta.put(record.vector_id, META_FLAG_DELETED, &prev)?;
@@ -1394,14 +1469,15 @@ impl VectorDb {
         // Re-link at each layer of this node
         for layer in (0..=node_level as usize).rev() {
             let to_new = |n: u32| dist(id, n);
-            self.index.search_layer(
-                ep, layer, self.cfg.ef_construction, &to_new, &is_deleted,
-            );
+            self.index
+                .search_layer(ep, layer, self.cfg.ef_construction, &to_new, &is_deleted);
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
             {
                 let scratch = unsafe { &mut *self.index.scratch.get() };
                 scratch.dists.clear();
-                scratch.dists.extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
+                scratch
+                    .dists
+                    .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
                 let (dists_ptr, scratch_ptr) = {
                     let d = &scratch.dists as *const Vec<(u32, f32)>;
@@ -1409,7 +1485,9 @@ impl VectorDb {
                     (d, s)
                 };
                 let selected = HnswIndex::select_neighbors_heuristic(
-                    unsafe { &*dists_ptr }, cap, dist,
+                    unsafe { &*dists_ptr },
+                    cap,
+                    dist,
                     Some(unsafe { &mut *scratch_ptr }),
                 )?;
                 for &n in &selected {
@@ -1481,32 +1559,36 @@ impl VectorDb {
         self.len() == 0
     }
 
-     /// Get number of live (non-deleted) vectors
-     pub fn live_len(&self) -> usize {
-         self.len() - self.deleted_count
-     }
+    /// Get number of live (non-deleted) vectors
+    pub fn live_len(&self) -> usize {
+        self.len() - self.deleted_count
+    }
 
-     /// Get number of deleted vectors
-     pub fn deleted_count(&self) -> usize {
-         self.deleted_count
-     }
+    /// Get number of deleted vectors
+    pub fn deleted_count(&self) -> usize {
+        self.deleted_count
+    }
 
-     /// Get deletion statistics
-     ///
-     /// Returns (deleted_count, total_count, deletion_ratio)
-     /// where deletion_ratio = deleted_count / total_count (or 0.0 if empty)
-     pub fn deletion_stats(&self) -> (usize, usize, f32) {
-         let total = self.len();
-         let deleted = self.deleted_count;
-         let ratio = if total > 0 { deleted as f32 / total as f32 } else { 0.0 };
-         (deleted, total, ratio)
-     }
+    /// Get deletion statistics
+    ///
+    /// Returns (deleted_count, total_count, deletion_ratio)
+    /// where deletion_ratio = deleted_count / total_count (or 0.0 if empty)
+    pub fn deletion_stats(&self) -> (usize, usize, f32) {
+        let total = self.len();
+        let deleted = self.deleted_count;
+        let ratio = if total > 0 {
+            deleted as f32 / total as f32
+        } else {
+            0.0
+        };
+        (deleted, total, ratio)
+    }
 
-     /// Check if compaction should be triggered (deletion ratio >= 30%)
-     pub fn should_compact(&self) -> bool {
-         let (_deleted, total, ratio) = self.deletion_stats();
-         total > 0 && ratio > 0.30
-     }
+    /// Check if compaction should be triggered (deletion ratio >= 30%)
+    pub fn should_compact(&self) -> bool {
+        let (_deleted, total, ratio) = self.deletion_stats();
+        total > 0 && ratio > 0.30
+    }
 
     fn capacity(&self) -> usize {
         u64::from_le_bytes(self.mmap()[24..32].try_into().unwrap()) as usize
@@ -1534,7 +1616,9 @@ impl VectorDb {
         let new_cap = (self.capacity() * 2).max(16);
         let new_len = VEC_HEADER + new_cap * self.cfg.dim * 4;
         self.mmap = None;
-        self.file.set_len(new_len as u64).map_err(VectorDbError::Io)?;
+        self.file
+            .set_len(new_len as u64)
+            .map_err(VectorDbError::Io)?;
         let mut m = unsafe { MmapOptions::new().map_mut(&self.file)? };
         m[24..32].copy_from_slice(&(new_cap as u64).to_le_bytes());
         self.mmap = Some(m);
@@ -1557,7 +1641,10 @@ impl VectorDb {
     /// Get metadata for vector
     pub fn get_meta(&self, id: u32) -> Result<Option<&[u8]>> {
         if (id as usize) >= self.len() {
-            return Err(VectorDbError::IdOutOfBounds { id, capacity: self.len() as u32 });
+            return Err(VectorDbError::IdOutOfBounds {
+                id,
+                capacity: self.len() as u32,
+            });
         }
         Ok(self.meta.get(id))
     }
@@ -1565,7 +1652,10 @@ impl VectorDb {
     /// Insert new vector, returns its ID
     pub fn insert(&mut self, v: &[f32], metadata: Option<&[u8]>) -> Result<u32> {
         if v.len() != self.cfg.dim {
-            return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: v.len() });
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.cfg.dim,
+                got: v.len(),
+            });
         }
 
         let n = self.len();
@@ -1573,7 +1663,8 @@ impl VectorDb {
         let meta_bytes = metadata.unwrap_or(&[]);
 
         // Log to WAL before applying changes
-        self.wal.log_insert(id, v, meta_bytes)
+        self.wal
+            .log_insert(id, v, meta_bytes)
             .map_err(VectorDbError::Io)?;
 
         // Now apply to database
@@ -1594,10 +1685,16 @@ impl VectorDb {
     /// Update existing vector (cannot update deleted vectors)
     pub fn update(&mut self, id: u32, v: &[f32], metadata: Option<&[u8]>) -> Result<()> {
         if v.len() != self.cfg.dim {
-            return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: v.len() });
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.cfg.dim,
+                got: v.len(),
+            });
         }
         if (id as usize) >= self.len() {
-            return Err(VectorDbError::IdOutOfBounds { id, capacity: self.len() as u32 });
+            return Err(VectorDbError::IdOutOfBounds {
+                id,
+                capacity: self.len() as u32,
+            });
         }
         if self.meta.is_deleted(id) {
             return Err(VectorDbError::UpdateDeletedVector);
@@ -1606,7 +1703,8 @@ impl VectorDb {
         let meta_bytes = metadata.unwrap_or(&[]);
 
         // Log to WAL before applying changes
-        self.wal.log_update(id, v, meta_bytes)
+        self.wal
+            .log_update(id, v, meta_bytes)
             .map_err(VectorDbError::Io)?;
 
         // Now apply to database
@@ -1619,121 +1717,135 @@ impl VectorDb {
         Ok(())
     }
 
-     /// Soft-delete vector (marks as tombstone)
-     pub fn delete(&mut self, id: u32) -> Result<bool> {
-         if (id as usize) >= self.len() || self.meta.is_deleted(id) {
-             return Ok(false);
-         }
+    /// Soft-delete vector (marks as tombstone)
+    pub fn delete(&mut self, id: u32) -> Result<bool> {
+        if (id as usize) >= self.len() || self.meta.is_deleted(id) {
+            return Ok(false);
+        }
 
-         // Log to WAL before applying deletion
-         let prev = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
-         self.wal.log_delete(id, &prev)
-             .map_err(VectorDbError::Io)?;
+        // Log to WAL before applying deletion
+        let prev = self.meta.get(id).map(|b| b.to_vec()).unwrap_or_default();
+        self.wal.log_delete(id, &prev).map_err(VectorDbError::Io)?;
 
-         self.meta.put(id, META_FLAG_DELETED, &prev)?;
-         self.index.mark_deleted(id);
-         self.deleted_count += 1;
+        self.meta.put(id, META_FLAG_DELETED, &prev)?;
+        self.index.mark_deleted(id);
+        self.deleted_count += 1;
 
-         Ok(true)
-     }
+        Ok(true)
+    }
 
-     /// Search for k nearest neighbors
-     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
-         if query.len() != self.cfg.dim {
-             return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
-         }
+    /// Search for k nearest neighbors
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
+        if query.len() != self.cfg.dim {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.cfg.dim,
+                got: query.len(),
+            });
+        }
 
-         let view = self.vector_view();
-         let dist = |id: u32| -> Result<f32> {
-             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: view.file_size as u32 })?;
-             cosine_distance(v, query)
-         };
-         let is_deleted = |id: u32| self.meta.is_deleted(id);
+        let view = self.vector_view();
+        let dist = |id: u32| -> Result<f32> {
+            let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds {
+                id,
+                capacity: view.file_size as u32,
+            })?;
+            cosine_distance(v, query)
+        };
+        let is_deleted = |id: u32| self.meta.is_deleted(id);
 
-         let ef_actual = if k <= 100 {
-             // For small-to-moderate k, reduce ef inflation
-             ef.max(k * 2) + self.deleted_count.min(32)
-         } else {
-             // For very large k, maintain original formula
-             ef.max(k).max(k * 4) + self.deleted_count.min(64)
-         };
+        let ef_actual = if k <= 100 {
+            // For small-to-moderate k, reduce ef inflation
+            ef.max(k * 2) + self.deleted_count.min(32)
+        } else {
+            // For very large k, maintain original formula
+            ef.max(k).max(k * 4) + self.deleted_count.min(64)
+        };
 
-         self.index
-             .search(k, ef_actual, dist, &is_deleted)?
-             .into_iter()
-             .map(|(id, d)| Ok(SearchHit {
-                 id,
-                 score: (1.0 - d).clamp(0.0, 1.0),
-                 metadata: self.meta.get(id).unwrap_or(&[]),
-             }))
-             .collect()
-     }
+        self.index
+            .search(k, ef_actual, dist, &is_deleted)?
+            .into_iter()
+            .map(|(id, d)| {
+                Ok(SearchHit {
+                    id,
+                    score: (1.0 - d).clamp(0.0, 1.0),
+                    metadata: self.meta.get(id).unwrap_or(&[]),
+                })
+            })
+            .collect()
+    }
 
-     /// Search for k nearest neighbors with source filtering (pre-search filter)
-     ///
-     /// Filters results by source metadata before returning to caller.
-     /// This avoids wasting work searching vectors that will be filtered out.
-     ///
-     /// # Arguments
-     /// * `query` - Query vector
-     /// * `k` - Number of results to return
-     /// * `ef` - Expansion factor for HNSW search
-     /// * `source_filter` - Filter on source field
-     ///
-     /// # Returns
-     /// Results matching both k-NN and source filter. May return fewer than k results
-     /// if filtered results are exhausted before reaching k.
-     pub fn search_with_source_filter(
-         &self,
-         query: &[f32],
-         k: usize,
-         ef: usize,
-         source_filter: &str,
-     ) -> Result<Vec<SearchHit<'_>>> {
-         if query.len() != self.cfg.dim {
-             return Err(VectorDbError::DimensionMismatch { expected: self.cfg.dim, got: query.len() });
-         }
+    /// Search for k nearest neighbors with source filtering (pre-search filter)
+    ///
+    /// Filters results by source metadata before returning to caller.
+    /// This avoids wasting work searching vectors that will be filtered out.
+    ///
+    /// # Arguments
+    /// * `query` - Query vector
+    /// * `k` - Number of results to return
+    /// * `ef` - Expansion factor for HNSW search
+    /// * `source_filter` - Filter on source field
+    ///
+    /// # Returns
+    /// Results matching both k-NN and source filter. May return fewer than k results
+    /// if filtered results are exhausted before reaching k.
+    pub fn search_with_source_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        source_filter: &str,
+    ) -> Result<Vec<SearchHit<'_>>> {
+        if query.len() != self.cfg.dim {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.cfg.dim,
+                got: query.len(),
+            });
+        }
 
-         let view = self.vector_view();
-         let dist = |id: u32| -> Result<f32> {
-             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds { id, capacity: view.file_size as u32 })?;
-             cosine_distance(v, query)
-         };
-         let is_deleted = |id: u32| self.meta.is_deleted(id);
+        let view = self.vector_view();
+        let dist = |id: u32| -> Result<f32> {
+            let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds {
+                id,
+                capacity: view.file_size as u32,
+            })?;
+            cosine_distance(v, query)
+        };
+        let is_deleted = |id: u32| self.meta.is_deleted(id);
 
-         let ef_actual = if k <= 100 {
-             ef.max(k * 2) + self.deleted_count.min(32)
-         } else {
-             ef.max(k).max(k * 4) + self.deleted_count.min(64)
-         };
+        let ef_actual = if k <= 100 {
+            ef.max(k * 2) + self.deleted_count.min(32)
+        } else {
+            ef.max(k).max(k * 4) + self.deleted_count.min(64)
+        };
 
-         // Search with expanded k to account for filtering
-         let expanded_k = (k * 4).max(k + 100);
-         let raw_results = self.index
-             .search(expanded_k, ef_actual, dist, &is_deleted)?;
+        // Search with expanded k to account for filtering
+        let expanded_k = (k * 4).max(k + 100);
+        let raw_results = self
+            .index
+            .search(expanded_k, ef_actual, dist, &is_deleted)?;
 
-         let mut filtered = Vec::new();
-         for (id, d) in raw_results {
-             let metadata = self.meta.get(id).unwrap_or(&[]);
-             // Try to extract source field from metadata JSON for filtering
-             if let Ok(json_obj) = serde_json::from_slice::<serde_json::Value>(metadata) {
-                 if let Some(source) = json_obj.get("source").and_then(|v| v.as_str()) {
-                     if source == source_filter {
-                         filtered.push(SearchHit {
-                             id,
-                             score: (1.0 - d).clamp(0.0, 1.0),
-                             metadata,
-                         });
-                         if filtered.len() >= k {
-                             break;
-                         }
-                     }
-                 }
-             }
-         }
+        let mut filtered = Vec::new();
+        for (id, d) in raw_results {
+            let metadata = self.meta.get(id).unwrap_or(&[]);
+            // Try to extract source field from metadata JSON for filtering
+            if let Ok(json_obj) = serde_json::from_slice::<serde_json::Value>(metadata) {
+                if let Some(source) = json_obj.get("source").and_then(|v| v.as_str()) {
+                    if source == source_filter {
+                        filtered.push(SearchHit {
+                            id,
+                            score: (1.0 - d).clamp(0.0, 1.0),
+                            metadata,
+                        });
+                        if filtered.len() >= k {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
-         Ok(filtered)
-     }
+        Ok(filtered)
+    }
 
     /// Compact database by removing deleted vectors
     pub async fn compact(&mut self) -> Result<()> {
@@ -1773,9 +1885,15 @@ impl VectorDb {
         self.mmap = None;
         self.index.mmap = None;
 
-        tokio::fs::rename(&tmp_vec, &self.path).await.map_err(VectorDbError::Io)?;
-        tokio::fs::rename(&tmp_hnsw, hnsw_path(&self.path)).await.map_err(VectorDbError::Io)?;
-        tokio::fs::rename(&tmp_meta, meta_path(&self.path)).await.map_err(VectorDbError::Io)?;
+        tokio::fs::rename(&tmp_vec, &self.path)
+            .await
+            .map_err(VectorDbError::Io)?;
+        tokio::fs::rename(&tmp_hnsw, hnsw_path(&self.path))
+            .await
+            .map_err(VectorDbError::Io)?;
+        tokio::fs::rename(&tmp_meta, meta_path(&self.path))
+            .await
+            .map_err(VectorDbError::Io)?;
 
         let reopened = VectorDb::open(&self.path, self.cfg).await?;
         self.file = reopened.file;
@@ -1806,12 +1924,10 @@ impl VectorDb {
 
         // Step 2: Write checkpoint to WAL and wait for fsync confirmation
         // This marks all prior records as safely persisted
-        self.wal.checkpoint().await
-            .map_err(VectorDbError::Io)?;
+        self.wal.checkpoint().await.map_err(VectorDbError::Io)?;
 
         // Step 3: Clear WAL after successful checkpoint
-        self.wal.clear().await
-            .map_err(VectorDbError::Io)?;
+        self.wal.clear().await.map_err(VectorDbError::Io)?;
 
         Ok(())
     }
@@ -1906,22 +2022,22 @@ impl AsyncVectorDb {
         self.db.read().await.is_empty()
     }
 
-     /// Get live vector count (excluding deleted)
-     pub async fn live_len(&self) -> usize {
-         self.db.read().await.live_len()
-     }
+    /// Get live vector count (excluding deleted)
+    pub async fn live_len(&self) -> usize {
+        self.db.read().await.live_len()
+    }
 
-     /// Get deletion statistics (async read)
-     ///
-     /// Returns (deleted_count, total_count, deletion_ratio)
-     pub async fn deletion_stats(&self) -> (usize, usize, f32) {
-         self.db.read().await.deletion_stats()
-     }
+    /// Get deletion statistics (async read)
+    ///
+    /// Returns (deleted_count, total_count, deletion_ratio)
+    pub async fn deletion_stats(&self) -> (usize, usize, f32) {
+        self.db.read().await.deletion_stats()
+    }
 
-     /// Check if compaction should be triggered (async read)
-     pub async fn should_compact(&self) -> bool {
-         self.db.read().await.should_compact()
-     }
+    /// Check if compaction should be triggered (async read)
+    pub async fn should_compact(&self) -> bool {
+        self.db.read().await.should_compact()
+    }
 
     /// Check if vector is deleted
     pub async fn is_deleted(&self, id: u32) -> bool {
@@ -1954,40 +2070,46 @@ impl AsyncVectorDb {
         self.db.write().await.delete(id)
     }
 
-     /// Search for k neighbors (async read)
-     pub async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHitOwned>> {
-         let db = self.db.read().await;
-         let hits = db.search(query, k, ef)?;
-         Ok(hits.into_iter().map(|h| SearchHitOwned {
-             id: h.id,
-             score: h.score,
-             metadata: h.metadata.to_vec(),
-         }).collect())
-     }
+    /// Search for k neighbors (async read)
+    pub async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHitOwned>> {
+        let db = self.db.read().await;
+        let hits = db.search(query, k, ef)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| SearchHitOwned {
+                id: h.id,
+                score: h.score,
+                metadata: h.metadata.to_vec(),
+            })
+            .collect())
+    }
 
-     /// Search with source filtering (async read)
-     pub async fn search_with_source_filter(
-         &self,
-         query: &[f32],
-         k: usize,
-         ef: usize,
-         source_filter: &str,
-     ) -> Result<Vec<SearchHitOwned>> {
-         let db = self.db.read().await;
-         let hits = db.search_with_source_filter(query, k, ef, source_filter)?;
-         Ok(hits.into_iter().map(|h| SearchHitOwned {
-             id: h.id,
-             score: h.score,
-             metadata: h.metadata.to_vec(),
-         }).collect())
-     }
+    /// Search with source filtering (async read)
+    pub async fn search_with_source_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        source_filter: &str,
+    ) -> Result<Vec<SearchHitOwned>> {
+        let db = self.db.read().await;
+        let hits = db.search_with_source_filter(query, k, ef, source_filter)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| SearchHitOwned {
+                id: h.id,
+                score: h.score,
+                metadata: h.metadata.to_vec(),
+            })
+            .collect())
+    }
 
-     /// Compact database (async write, exclusive lock)
+    /// Compact database (async write, exclusive lock)
     pub async fn compact(&self) -> Result<()> {
         self.db.write().await.compact().await
     }
 
-     /// Flush changes to disk (async write, exclusive lock)
+    /// Flush changes to disk (async write, exclusive lock)
     pub async fn flush(&self) -> Result<()> {
         self.db.write().await.flush().await
     }
@@ -2002,5 +2124,3 @@ pub struct SearchHitOwned {
     /// Associated metadata bytes (owned)
     pub metadata: Vec<u8>,
 }
-
-

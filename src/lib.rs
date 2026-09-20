@@ -2,10 +2,10 @@ pub mod chunker;
 pub mod docs;
 pub mod embeddings;
 pub mod mcp;
+pub mod r_vector;
 pub mod rag;
 pub mod syntax_chunker;
 pub mod wal;
-pub mod r_vector;
 
 use serde::{Deserialize, Serialize};
 

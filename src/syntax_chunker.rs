@@ -380,7 +380,11 @@ type Point struct {
         let code = r#"{"name": "Alice", "age": 30, "scores": [1, 2, 3]}"#;
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "test.json");
-        assert_eq!(chunks.len(), 1, "JSON object should be one chunk, not split by pair");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "JSON object should be one chunk, not split by pair"
+        );
         assert_eq!(chunks[0].text, code);
     }
 

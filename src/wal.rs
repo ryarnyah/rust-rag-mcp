@@ -3,14 +3,14 @@
 //! LOG-BEFORE-APPLY: record sent to WAL before data applied to files.
 //! On crash, replay WAL from last checkpoint to recover.
 
+use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
-use fs2::FileExt;
 
 // ---------------------------------------------------------------------------
 // LSN
@@ -20,7 +20,9 @@ use fs2::FileExt;
 pub struct Lsn(pub u64);
 
 impl Lsn {
-    pub fn as_u64(self) -> u64 { self.0 }
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +45,10 @@ impl WalOpType {
             2 => Ok(WalOpType::Delete),
             3 => Ok(WalOpType::Update),
             4 => Ok(WalOpType::Checkpoint),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid WAL op type")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid WAL op type",
+            )),
         }
     }
 }
@@ -113,7 +118,10 @@ impl WalRecord {
 
     fn from_bytes(data: &[u8]) -> io::Result<(Self, usize)> {
         if data.len() < RECORD_HEADER_LEN + FOOTER_LEN {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete record"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Incomplete record",
+            ));
         }
 
         let lsn = Lsn(u64::from_le_bytes(data[0..8].try_into().unwrap()));
@@ -129,7 +137,10 @@ impl WalRecord {
         let total = RECORD_HEADER_LEN + payload_len + FOOTER_LEN;
 
         if data.len() < total {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete payload"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Incomplete payload",
+            ));
         }
 
         let footer = u32::from_le_bytes(data[total - 4..total].try_into().unwrap());
@@ -147,7 +158,17 @@ impl WalRecord {
             .collect();
         let metadata = payload[vector_bytes..].to_vec();
 
-        Ok((WalRecord { lsn, timestamp, op_type, vector_id, vector_data, metadata }, total))
+        Ok((
+            WalRecord {
+                lsn,
+                timestamp,
+                op_type,
+                vector_id,
+                vector_data,
+                metadata,
+            },
+            total,
+        ))
     }
 }
 
@@ -157,9 +178,16 @@ impl WalRecord {
 
 enum WalMessage {
     Record(WalRecord),
-    Checkpoint { generation: u64, ack: oneshot::Sender<io::Result<()>> },
-    Truncate { ack: oneshot::Sender<io::Result<()>> },
-    Shutdown { ack: oneshot::Sender<io::Result<()>> },
+    Checkpoint {
+        generation: u64,
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+    Truncate {
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +219,10 @@ impl WalHeader {
     fn from_bytes(buf: &[u8; WAL_HEADER_SIZE]) -> io::Result<Self> {
         let crc = crc32fast::hash(&buf[0..32]);
         if crc != u32::from_le_bytes(buf[32..36].try_into().unwrap()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Header CRC mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Header CRC mismatch",
+            ));
         }
         let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         if magic != WAL_MAGIC {
@@ -226,13 +257,21 @@ impl WriteAheadLog {
         let wal_path = Self::wal_path(db_path);
         let exists = wal_path.exists();
 
-        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&wal_path)?;
-        file.try_lock_exclusive().map_err(|e| {
-            io::Error::new(io::ErrorKind::WouldBlock, format!("WAL locked: {}", e))
-        })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&wal_path)?;
+        file.try_lock_exclusive()
+            .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, format!("WAL locked: {}", e)))?;
 
         if !exists {
-            let header = WalHeader { last_checkpoint_lsn: 0, current_lsn: 0, last_checkpoint_generation: 0 };
+            let header = WalHeader {
+                last_checkpoint_lsn: 0,
+                current_lsn: 0,
+                last_checkpoint_generation: 0,
+            };
             file.write_all(&header.to_bytes())?;
             file.flush()?;
         }
@@ -301,16 +340,24 @@ impl WriteAheadLog {
 
     fn try_log(&self, record: WalRecord) -> io::Result<Lsn> {
         let lsn = record.lsn;
-        self.tx.try_send(WalMessage::Record(record)).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "WAL channel full"),
-            mpsc::error::TrySendError::Closed(_) => io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"),
-        })?;
+        self.tx
+            .try_send(WalMessage::Record(record))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "WAL channel full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down")
+                }
+            })?;
         Ok(lsn)
     }
 
     async fn async_log(&self, record: WalRecord) -> io::Result<Lsn> {
         let lsn = record.lsn;
-        self.tx.send(WalMessage::Record(record)).await
+        self.tx
+            .send(WalMessage::Record(record))
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
         Ok(lsn)
     }
@@ -327,29 +374,53 @@ impl WriteAheadLog {
     }
 
     // Async variants
-    pub async fn log_insert_async(&self, id: u32, vector: &[f32], metadata: &[u8]) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Insert, id, vector, metadata)).await
+    pub async fn log_insert_async(
+        &self,
+        id: u32,
+        vector: &[f32],
+        metadata: &[u8],
+    ) -> io::Result<Lsn> {
+        self.async_log(self.make_record(WalOpType::Insert, id, vector, metadata))
+            .await
     }
     pub async fn log_delete_async(&self, id: u32, metadata: &[u8]) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Delete, id, &[], metadata)).await
+        self.async_log(self.make_record(WalOpType::Delete, id, &[], metadata))
+            .await
     }
-    pub async fn log_update_async(&self, id: u32, vector: &[f32], metadata: &[u8]) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Update, id, vector, metadata)).await
+    pub async fn log_update_async(
+        &self,
+        id: u32,
+        vector: &[f32],
+        metadata: &[u8],
+    ) -> io::Result<Lsn> {
+        self.async_log(self.make_record(WalOpType::Update, id, vector, metadata))
+            .await
     }
 
     pub async fn checkpoint(&self) -> io::Result<()> {
         let gen = self.checkpoint_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx.send(WalMessage::Checkpoint { generation: gen, ack: ack_tx }).await
+        self.tx
+            .send(WalMessage::Checkpoint {
+                generation: gen,
+                ack: ack_tx,
+            })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
-        ack_rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
+        ack_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
     }
 
     pub async fn clear(&self) -> io::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx.send(WalMessage::Truncate { ack: ack_tx }).await
+        self.tx
+            .send(WalMessage::Truncate { ack: ack_tx })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
-        ack_rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
+        ack_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
     }
 
     pub async fn shutdown(&self) -> io::Result<()> {
@@ -373,12 +444,17 @@ impl WriteAheadLog {
             Self::load_segment(&wal, &mut checkpoint_lsn, &mut records)?;
         }
 
-        Ok(records.into_iter()
+        Ok(records
+            .into_iter()
             .filter(|r| r.lsn.0 >= checkpoint_lsn && r.op_type != WalOpType::Checkpoint)
             .collect())
     }
 
-    fn load_segment(path: &Path, checkpoint_lsn: &mut u64, out: &mut Vec<WalRecord>) -> io::Result<()> {
+    fn load_segment(
+        path: &Path,
+        checkpoint_lsn: &mut u64,
+        out: &mut Vec<WalRecord>,
+    ) -> io::Result<()> {
         let mut file = File::open(path)?;
         let mut hdr = [0u8; WAL_HEADER_SIZE];
         file.read_exact(&mut hdr)?;
@@ -395,7 +471,9 @@ impl WriteAheadLog {
         while offset < data.len() {
             match WalRecord::from_bytes(&data[offset..]) {
                 Ok((rec, n)) => {
-                    if rec.lsn.0 != 0 && rec.lsn.0 <= last_lsn { break; }
+                    if rec.lsn.0 != 0 && rec.lsn.0 <= last_lsn {
+                        break;
+                    }
                     last_lsn = rec.lsn.0;
                     out.push(rec);
                     offset += n;
@@ -438,7 +516,9 @@ impl WriteAheadLog {
             for e in entries.flatten() {
                 if let Some(s) = e.file_name().to_string_lossy().strip_prefix(&prefix) {
                     if let Ok(id) = s.parse::<u64>() {
-                        if id >= max { max = id + 1; }
+                        if id >= max {
+                            max = id + 1;
+                        }
                     }
                 }
             }
@@ -467,7 +547,9 @@ impl WriteAheadLog {
 
 impl Drop for WriteAheadLog {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(WalMessage::Shutdown { ack: oneshot::channel().0 });
+        let _ = self.tx.try_send(WalMessage::Shutdown {
+            ack: oneshot::channel().0,
+        });
     }
 }
 
@@ -527,8 +609,12 @@ impl WalWriter {
                         tracing::error!("WAL drain write failed: {}", e);
                     }
                 }
-                WalMessage::Checkpoint { generation, ack } => { let _ = ack.send(self.do_checkpoint(generation)); }
-                WalMessage::Truncate { ack } => { let _ = ack.send(self.do_truncate()); }
+                WalMessage::Checkpoint { generation, ack } => {
+                    let _ = ack.send(self.do_checkpoint(generation));
+                }
+                WalMessage::Truncate { ack } => {
+                    let _ = ack.send(self.do_truncate());
+                }
                 WalMessage::Shutdown { .. } => {}
             }
         }
@@ -540,7 +626,8 @@ impl WalWriter {
         let n = self.write_buf.len() as u64;
         self.file.write_all(&self.write_buf)?;
         self.current_file_size += n;
-        self.last_written_lsn.fetch_max(rec.lsn.0 + 1, Ordering::Release);
+        self.last_written_lsn
+            .fetch_max(rec.lsn.0 + 1, Ordering::Release);
 
         if self.max_wal_segment_size > 0 && self.current_file_size > self.max_wal_segment_size {
             self.rotate()?;
@@ -552,14 +639,25 @@ impl WalWriter {
         let lsn = Lsn(self.last_written_lsn.load(Ordering::Acquire));
 
         // Write checkpoint record
-        let rec = WalRecord { lsn, timestamp: now_ms(), op_type: WalOpType::Checkpoint, vector_id: 0, vector_data: Vec::new(), metadata: Vec::new() };
+        let rec = WalRecord {
+            lsn,
+            timestamp: now_ms(),
+            op_type: WalOpType::Checkpoint,
+            vector_id: 0,
+            vector_data: Vec::new(),
+            metadata: Vec::new(),
+        };
         self.write_buf.clear();
         rec.write_to(&mut self.write_buf);
         self.file.write_all(&self.write_buf)?;
         self.current_file_size += self.write_buf.len() as u64;
 
         // Update header: seek back, write, seek forward, fsync
-        let hdr = WalHeader { last_checkpoint_lsn: lsn.0, current_lsn: lsn.0 + 1, last_checkpoint_generation: generation };
+        let hdr = WalHeader {
+            last_checkpoint_lsn: lsn.0,
+            current_lsn: lsn.0 + 1,
+            last_checkpoint_generation: generation,
+        };
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&hdr.to_bytes())?;
         self.file.seek(SeekFrom::Start(self.current_file_size))?;
@@ -568,9 +666,12 @@ impl WalWriter {
 
         self.current_generation = generation;
         self.last_checkpoint_lsn.store(lsn.0, Ordering::Release);
-        self.last_checkpoint_generation.store(generation, Ordering::Relaxed);
+        self.last_checkpoint_generation
+            .store(generation, Ordering::Relaxed);
 
-        if self.max_total_wal_size > 0 { self.cleanup(); }
+        if self.max_total_wal_size > 0 {
+            self.cleanup();
+        }
         Ok(())
     }
 
@@ -581,7 +682,11 @@ impl WalWriter {
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
         self.file.seek(SeekFrom::Start(0))?;
         let lsn = self.last_written_lsn.load(Ordering::Acquire);
-        let hdr = WalHeader { last_checkpoint_lsn: lsn, current_lsn: lsn, last_checkpoint_generation: self.last_checkpoint_generation.load(Ordering::Relaxed) };
+        let hdr = WalHeader {
+            last_checkpoint_lsn: lsn,
+            current_lsn: lsn,
+            last_checkpoint_generation: self.last_checkpoint_generation.load(Ordering::Relaxed),
+        };
         self.file.write_all(&hdr.to_bytes())?;
         self.file.flush()?;
         self.file.sync_all()?;
@@ -600,11 +705,17 @@ impl WalWriter {
             OpenOptions::new().read(true).open("/dev/null")?
         }));
 
-        let seg_path = WriteAheadLog::segment_path(Path::new(&self.db_path_prefix), self.next_segment_id);
+        let seg_path =
+            WriteAheadLog::segment_path(Path::new(&self.db_path_prefix), self.next_segment_id);
         fs::rename(&self.wal_path, &seg_path)?;
         self.next_segment_id += 1;
 
-        let new_file = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&self.wal_path)?;
+        let new_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&self.wal_path)?;
         self.file = new_file;
 
         // Write header to new WAL with current checkpoint state
@@ -624,16 +735,22 @@ impl WalWriter {
     fn cleanup(&mut self) {
         let segs = WriteAheadLog::list_segments(Path::new(&self.db_path_prefix));
         let mut total = self.current_file_size;
-        let sizes: Vec<(u64, PathBuf)> = segs.iter().filter_map(|(_, p)| {
-            let size = fs::metadata(p).ok()?.len();
-            total += size;
-            Some((size, p.clone()))
-        }).collect();
+        let sizes: Vec<(u64, PathBuf)> = segs
+            .iter()
+            .filter_map(|(_, p)| {
+                let size = fs::metadata(p).ok()?.len();
+                total += size;
+                Some((size, p.clone()))
+            })
+            .collect();
 
         for (size, path) in &sizes {
             let over_size = self.max_total_wal_size > 0 && total > self.max_total_wal_size;
-            let over_count = self.max_wal_segments > 0 && (segs.len() as u32) > self.max_wal_segments;
-            if !over_size && !over_count { break; }
+            let over_count =
+                self.max_wal_segments > 0 && (segs.len() as u32) > self.max_wal_segments;
+            if !over_size && !over_count {
+                break;
+            }
 
             if let Ok(mut f) = File::open(path) {
                 let mut hdr = [0u8; WAL_HEADER_SIZE];
@@ -651,7 +768,10 @@ impl WalWriter {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +784,14 @@ mod tests {
 
     #[test]
     fn test_record_roundtrip() {
-        let rec = WalRecord { lsn: Lsn(1), timestamp: 1234567890, op_type: WalOpType::Insert, vector_id: 42, vector_data: vec![0.1, 0.2, 0.3], metadata: b"test".to_vec() };
+        let rec = WalRecord {
+            lsn: Lsn(1),
+            timestamp: 1234567890,
+            op_type: WalOpType::Insert,
+            vector_id: 42,
+            vector_data: vec![0.1, 0.2, 0.3],
+            metadata: b"test".to_vec(),
+        };
         let mut buf = Vec::new();
         rec.write_to(&mut buf);
         let (decoded, n) = WalRecord::from_bytes(&buf).unwrap();
@@ -677,7 +804,14 @@ mod tests {
 
     #[test]
     fn test_crc_corruption_detected() {
-        let rec = WalRecord { lsn: Lsn(1), timestamp: 0, op_type: WalOpType::Insert, vector_id: 1, vector_data: vec![0.5, 0.6], metadata: b"data".to_vec() };
+        let rec = WalRecord {
+            lsn: Lsn(1),
+            timestamp: 0,
+            op_type: WalOpType::Insert,
+            vector_id: 1,
+            vector_data: vec![0.5, 0.6],
+            metadata: b"data".to_vec(),
+        };
         let mut buf = Vec::new();
         rec.write_to(&mut buf);
         buf[40] ^= 0xFF; // corrupt payload
@@ -686,7 +820,14 @@ mod tests {
 
     #[test]
     fn test_delete_record() {
-        let rec = WalRecord { lsn: Lsn(5), timestamp: 0, op_type: WalOpType::Delete, vector_id: 99, vector_data: Vec::new(), metadata: b"old".to_vec() };
+        let rec = WalRecord {
+            lsn: Lsn(5),
+            timestamp: 0,
+            op_type: WalOpType::Delete,
+            vector_id: 99,
+            vector_data: Vec::new(),
+            metadata: b"old".to_vec(),
+        };
         let mut buf = Vec::new();
         rec.write_to(&mut buf);
         let (decoded, _) = WalRecord::from_bytes(&buf).unwrap();
@@ -696,7 +837,11 @@ mod tests {
 
     #[test]
     fn test_header_roundtrip() {
-        let hdr = WalHeader { last_checkpoint_lsn: 100, current_lsn: 200, last_checkpoint_generation: 5 };
+        let hdr = WalHeader {
+            last_checkpoint_lsn: 100,
+            current_lsn: 200,
+            last_checkpoint_generation: 5,
+        };
         let buf = hdr.to_bytes();
         let decoded = WalHeader::from_bytes(&buf).unwrap();
         assert_eq!(decoded.last_checkpoint_lsn, 100);
@@ -706,7 +851,11 @@ mod tests {
 
     #[test]
     fn test_header_corruption_detected() {
-        let hdr = WalHeader { last_checkpoint_lsn: 100, current_lsn: 200, last_checkpoint_generation: 5 };
+        let hdr = WalHeader {
+            last_checkpoint_lsn: 100,
+            current_lsn: 200,
+            last_checkpoint_generation: 5,
+        };
         let mut buf = hdr.to_bytes();
         buf[10] ^= 0xFF;
         assert!(WalHeader::from_bytes(&buf).is_err());

@@ -1,7 +1,7 @@
-use rust_rag_mcp::r_vector::{Config, VectorDb, cosine_distance};
-use rust_rag_mcp::wal::{WalRecord, WalOpType, Lsn};
+use rust_rag_mcp::r_vector::{cosine_distance, Config, VectorDb};
+use rust_rag_mcp::wal::{Lsn, WalOpType, WalRecord};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 // ── Allocation counter ───────────────────────────────────────────────────────
@@ -30,8 +30,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
                 let cur = cur as u64;
                 loop {
                     let old = self.peak.load(Ordering::Relaxed);
-                    if cur <= old { break; }
-                    if self.peak.compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    if cur <= old {
+                        break;
+                    }
+                    if self
+                        .peak
+                        .compare_exchange_weak(old, cur, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         break;
                     }
                 }
@@ -65,7 +71,10 @@ fn reset_counters() {
 }
 
 fn snapshot() -> (u64, u64) {
-    (ALLOC.allocated.load(Ordering::Relaxed), ALLOC.peak.load(Ordering::Relaxed))
+    (
+        ALLOC.allocated.load(Ordering::Relaxed),
+        ALLOC.peak.load(Ordering::Relaxed),
+    )
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -102,7 +111,11 @@ fn print_row(name: &str, ops: usize, elapsed: std::time::Duration, alloc: u64, p
     let peak_str = human_bytes(peak);
     println!(
         "{:<44} {:>8}  {:>10.0} ns/op  {:>10} alloc  {:>10} peak",
-        name, ops, ns, human_bytes(alloc_per_op), peak_str,
+        name,
+        ops,
+        ns,
+        human_bytes(alloc_per_op),
+        peak_str,
     );
 }
 
@@ -191,7 +204,8 @@ fn main() {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         for &n in &counts {
-            let tmp = std::env::temp_dir().join(format!("bench_insert_{}_{}", std::process::id(), n));
+            let tmp =
+                std::env::temp_dir().join(format!("bench_insert_{}_{}", std::process::id(), n));
             let _ = std::fs::remove_dir_all(&tmp);
             std::fs::create_dir_all(&tmp).unwrap();
             let db_path = tmp.join("vectors.db");
@@ -220,7 +234,11 @@ fn main() {
     {
         let counts = [(500, 500), (2_000, 2_000), (10_000, 1_000), (50_000, 500)];
         for &(preload, n_queries) in &counts {
-            let tmp = std::env::temp_dir().join(format!("bench_search_{}_{}", preload, std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "bench_search_{}_{}",
+                preload,
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&tmp);
             std::fs::create_dir_all(&tmp).unwrap();
             let db_path = tmp.join("vectors.db");
@@ -231,7 +249,9 @@ fn main() {
                 let v = random_vector(dim, &mut seed);
                 db.insert(&v, None).unwrap();
             }
-            let queries: Vec<Vec<f32>> = (0..n_queries).map(|_| random_vector(dim, &mut seed)).collect();
+            let queries: Vec<Vec<f32>> = (0..n_queries)
+                .map(|_| random_vector(dim, &mut seed))
+                .collect();
 
             reset_counters();
             let start = Instant::now();
@@ -242,7 +262,10 @@ fn main() {
             let (alloc, peak) = snapshot();
             print_row(
                 &format!("search k=10 ef=200 (loaded={}, q={})", preload, n_queries),
-                n_queries, elapsed, alloc, peak,
+                n_queries,
+                elapsed,
+                alloc,
+                peak,
             );
             let _ = std::fs::remove_dir_all(&tmp);
         }

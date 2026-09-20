@@ -7,8 +7,8 @@ use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing;
@@ -18,7 +18,7 @@ use tracing;
 #[derive(Clone)]
 struct MetadataIndex {
     source_to_ids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
-    doc_metadata_ids: Arc<RwLock<HashMap<String, u32>>>,  // source -> doc metadata vector ID
+    doc_metadata_ids: Arc<RwLock<HashMap<String, u32>>>, // source -> doc metadata vector ID
 }
 
 impl MetadataIndex {
@@ -52,7 +52,7 @@ impl MetadataIndex {
     async fn remove_source(&self, source: &str) {
         let mut chunk_map = self.source_to_ids.write().await;
         chunk_map.remove(source);
-        
+
         let mut doc_map = self.doc_metadata_ids.write().await;
         doc_map.remove(source);
     }
@@ -94,7 +94,6 @@ struct DocumentMetadataEntry {
 }
 
 impl RagCore {
-
     /**
      * Creates a new instance of RagCore with the specified database path, cache directory,
      * model name, chunk size, and overlap. Initializes the embedding service, chunker,
@@ -107,10 +106,7 @@ impl RagCore {
         chunk_size: usize,
         overlap: usize,
     ) -> Result<Self> {
-        let embedding = EmbeddingService::new(
-            model_name,
-            cache_dir
-        )?;
+        let embedding = EmbeddingService::new(model_name, cache_dir)?;
         let ndims = embedding.dimensions();
 
         // Ensure db_path points to a directory and create db files inside it
@@ -120,7 +116,7 @@ impl RagCore {
 
         // Create vector database for chunks and metadata
         // P4: Adaptive ef_construction based on dataset size
-        let ef_construction = 150;  // Default for initial creation
+        let ef_construction = 150; // Default for initial creation
         let vectors_cfg = VectorDbConfig::new(ndims)
             .with_m(20)
             .with_ef_construction(ef_construction)
@@ -129,7 +125,7 @@ impl RagCore {
 
         // P3: Create metadata index and populate from existing vectors
         let metadata_index = MetadataIndex::new();
-        
+
         // Rebuild index from existing vectors on startup
         let total = vectors_db.len().await;
         for id in 0..total as u32 {
@@ -139,8 +135,12 @@ impl RagCore {
             if let Ok(Some(metadata_bytes)) = vectors_db.get_meta(id).await {
                 if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes) {
                     metadata_index.add_chunk(chunk_meta.source, id).await;
-                } else if let Ok(doc_meta) = serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes) {
-                    metadata_index.add_doc_metadata(doc_meta.source_path, id).await;
+                } else if let Ok(doc_meta) =
+                    serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes)
+                {
+                    metadata_index
+                        .add_doc_metadata(doc_meta.source_path, id)
+                        .await;
                 }
             }
         }
@@ -272,11 +272,14 @@ impl RagCore {
                 };
                 let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
 
-                let vec_id = self.vectors_db
+                let vec_id = self
+                    .vectors_db
                     .insert(embedding, Some(&metadata_bytes))
                     .await?;
 
-                self.metadata_index.add_chunk(chunk.source.clone(), vec_id).await;
+                self.metadata_index
+                    .add_chunk(chunk.source.clone(), vec_id)
+                    .await;
             }
         }
 
@@ -289,76 +292,73 @@ impl RagCore {
      * Performs a semantic search for the given query string, returning the top_k most relevant results.
      * Optionally filters results by the specified source.
      */
-     pub async fn search(
-         &self,
-         query: &str,
-         top_k: usize,
-         source_filter: Option<&str>,
-     ) -> Result<Vec<SearchResult>> {
-         let query_chunk = vec![DocumentChunk {
-             id: "query".to_string(),
-             text: query.to_string(),
-             source: "query".to_string(),
-             chunk_index: 0,
-             start_offset: 0,
-             end_offset: 0,
-         }];
-         let query_embedding_vec = self
-             .embedding
-             .embed_chunks(&query_chunk)
-             .await?;
+    pub async fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        source_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let query_chunk = vec![DocumentChunk {
+            id: "query".to_string(),
+            text: query.to_string(),
+            source: "query".to_string(),
+            chunk_index: 0,
+            start_offset: 0,
+            end_offset: 0,
+        }];
+        let query_embedding_vec = self.embedding.embed_chunks(&query_chunk).await?;
 
-         if query_embedding_vec.is_empty() || query_embedding_vec[0].is_empty() {
-             return Err(anyhow::anyhow!("Failed to generate query embedding"));
-         }
+        if query_embedding_vec.is_empty() || query_embedding_vec[0].is_empty() {
+            return Err(anyhow::anyhow!("Failed to generate query embedding"));
+        }
 
-          let query_embedding = &query_embedding_vec[0];
+        let query_embedding = &query_embedding_vec[0];
 
-          // P5: Adaptive ef_search based on k
-          // Small k: use lower ef (faster), large k: use higher ef (more thorough)
-           let ef = (top_k as u32 * 4).clamp(40, 200);
+        // P5: Adaptive ef_search based on k
+        // Small k: use lower ef (faster), large k: use higher ef (more thorough)
+        let ef = (top_k as u32 * 4).clamp(40, 200);
 
-          // Search vectors with optional source filter
-          let search_results = if let Some(filter) = source_filter {
-              self.vectors_db
-                  .search_with_source_filter(query_embedding, top_k, ef as usize, filter)
-                  .await?
-          } else {
-              self.vectors_db
-                  .search(query_embedding, top_k, ef as usize)
-                  .await?
-          };
+        // Search vectors with optional source filter
+        let search_results = if let Some(filter) = source_filter {
+            self.vectors_db
+                .search_with_source_filter(query_embedding, top_k, ef as usize, filter)
+                .await?
+        } else {
+            self.vectors_db
+                .search(query_embedding, top_k, ef as usize)
+                .await?
+        };
 
-         let mut results = Vec::new();
-         for hit in search_results {
-             // Deserialize chunk metadata
-             match serde_json::from_slice::<ChunkMetadata>(&hit.metadata) {
-                 Ok(chunk_meta) => {
-                     let chunk = DocumentChunk {
-                         id: chunk_meta.id,
-                         text: chunk_meta.text,
-                         source: chunk_meta.source,
-                         chunk_index: chunk_meta.chunk_index,
-                         start_offset: chunk_meta.start_offset as usize,
-                         end_offset: chunk_meta.end_offset as usize,
-                     };
-                     results.push(SearchResult {
-                         score: hit.score as f64,
-                         chunk,
-                     });
-                 }
-                 Err(e) => {
-                     tracing::warn!(
-                         vector_id = hit.id,
-                         error = %e,
-                         "Failed to deserialize chunk metadata, skipping result"
-                     );
-                 }
-             }
-         }
+        let mut results = Vec::new();
+        for hit in search_results {
+            // Deserialize chunk metadata
+            match serde_json::from_slice::<ChunkMetadata>(&hit.metadata) {
+                Ok(chunk_meta) => {
+                    let chunk = DocumentChunk {
+                        id: chunk_meta.id,
+                        text: chunk_meta.text,
+                        source: chunk_meta.source,
+                        chunk_index: chunk_meta.chunk_index,
+                        start_offset: chunk_meta.start_offset as usize,
+                        end_offset: chunk_meta.end_offset as usize,
+                    };
+                    results.push(SearchResult {
+                        score: hit.score as f64,
+                        chunk,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        vector_id = hit.id,
+                        error = %e,
+                        "Failed to deserialize chunk metadata, skipping result"
+                    );
+                }
+            }
+        }
 
-         Ok(results)
-     }
+        Ok(results)
+    }
 
     /**
      * Returns the total number of chunks stored in the database.
@@ -385,12 +385,12 @@ impl RagCore {
         for id in chunk_ids {
             let _ = self.vectors_db.delete(id).await;
         }
-        
+
         // Also delete doc metadata if exists
         if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await {
             let _ = self.vectors_db.delete(doc_id).await;
         }
-        
+
         // Remove from index
         self.metadata_index.remove_source(source_path).await;
 
@@ -398,7 +398,10 @@ impl RagCore {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        self.vectors_db.flush().await.map_err(|e| anyhow::anyhow!("Flush failed: {}", e))
+        self.vectors_db
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Flush failed: {}", e))
     }
 
     /**
@@ -409,7 +412,9 @@ impl RagCore {
         // P3: Use metadata index for O(1) lookup instead of O(n) full table scan
         if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await {
             if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(doc_id).await {
-                if let Ok(doc_meta) = serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes) {
+                if let Ok(doc_meta) =
+                    serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes)
+                {
                     return Ok(Some(DocumentStatus {
                         source_path: doc_meta.source_path,
                         content_hash: doc_meta.content_hash,
@@ -449,12 +454,15 @@ impl RagCore {
 
         // Create a dummy embedding vector for metadata storage
         let dummy_embedding = vec![0.0; self.embedding.dimensions()];
-        let doc_id = self.vectors_db
+        let doc_id = self
+            .vectors_db
             .insert(&dummy_embedding, Some(&metadata_bytes))
             .await?;
-        
+
         // Update index
-        self.metadata_index.add_doc_metadata(source_path.to_string(), doc_id).await;
+        self.metadata_index
+            .add_doc_metadata(source_path.to_string(), doc_id)
+            .await;
 
         Ok(())
     }

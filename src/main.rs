@@ -142,7 +142,8 @@ async fn main() -> anyhow::Result<()> {
             overlap,
         } => {
             tracing::info!("Starting RAG MCP server");
-            let server = mcp::RagServer::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
+            let server =
+                mcp::RagServer::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
             let service = server
                 .serve(rmcp::transport::stdio())
                 .await
@@ -160,7 +161,8 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
+            let core =
+                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
             for path_str in &paths {
                 let path = std::path::Path::new(path_str);
                 if !path.exists() {
@@ -222,7 +224,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Sources { db_path, cache_path, model } => {
+        Commands::Sources {
+            db_path,
+            cache_path,
+            model,
+        } => {
             let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let sources = core.list_sources().await?;
             if sources.is_empty() {
@@ -234,7 +240,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Stats { db_path, cache_path, model } => {
+        Commands::Stats {
+            db_path,
+            cache_path,
+            model,
+        } => {
             let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let count = core.chunk_count().await?;
             let sources = core.list_sources().await?;
