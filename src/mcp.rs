@@ -281,16 +281,6 @@ impl RagServer {
     }
 
     #[tool(
-        description = "List all available embedding models that can be used with this server. Models are local (no API keys needed) and run via ONNX. Examples: Xenova/bge-small-en-v1.5 (default, fast, good quality), sentence-transformers/all-MiniLM-L6-v2 (fastest), Xenova/bge-large-en-v1.5 (higher quality, slower). The model is set at server startup via the --model flag."
-    )]
-    async fn list_models(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let models = RagCore::list_embedding_models();
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            models.join("\n"),
-        )]))
-    }
-
-    #[tool(
         description = "Permanently remove all indexed chunks and metadata for a specific source document from the knowledge base. After deletion, the document will no longer appear in search results. The source_path must match exactly the path used during indexing (use list_sources to see current source paths). This operation cannot be undone — re-index the file to restore it."
     )]
     async fn delete_source(
