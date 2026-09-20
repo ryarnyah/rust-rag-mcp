@@ -277,6 +277,8 @@ impl RagCore {
             self.metadata_index.add_chunk(chunk.source.clone(), vec_id).await;
         }
 
+        self.vectors_db.flush().await?;
+
         Ok(())
     }
 

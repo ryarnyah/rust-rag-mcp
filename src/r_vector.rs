@@ -317,11 +317,11 @@ impl Rng {
 //  Metadata Store (append-only log)
 // ============================================================================
 
-const META_MAGIC: u64 = 0x4D45_5441_0000_0001;
-const META_HEADER: usize = 16;
 pub const META_FLAG_DELETED: u32 = 1;
+const META_MAGIC: u64 = 0x4D45_5441_0000_0002;
+const META_HEADER: usize = 16; // magic(8) + count(4) + reserved(4)
 
-/// Single metadata record descriptor
+/// Single metadata record descriptor (in-memory index, data stays on disk via mmap)
 #[derive(Debug, Clone)]
 struct MetaRecord {
     flags: u32,
@@ -329,34 +329,35 @@ struct MetaRecord {
     len: u32,
 }
 
-/// Thread-safe metadata storage with append-only log semantics
+/// Metadata storage: mmap-backed append-only file with record count in header.
 ///
-/// # File Layout
+/// # File layout
 /// ```text
-/// [0..16)     header: magic u64 | version u64
-/// [16..)      records: id u32 | flags u32 | len u32 | pad u32 | bytes[len]
+/// [0..8)      magic: u64 LE
+/// [8..12)     count: u32 LE  (flushed record count, updated on flush())
+/// [12..16)    reserved: u32 LE
+/// [16..)      records: [ id:u32 | flags:u32 | dlen:u32 | pad:u32 | data:dlen ] × count
 /// ```
 ///
-/// Records with same ID act as overwrites (last-writer-wins).
-/// The `META_FLAG_DELETED` flag marks tombstoned entries.
+/// The in-memory HashMap only stores (id → offset, len, flags) — the actual
+/// metadata bytes live in the mmap and are read on demand via `get()`.
+/// The header count is only updated on `flush()`, so on crash recovery
+/// `open()` reads exactly the flushed records and replays the WAL for the rest.
 struct MetadataStore {
     file: File,
     mmap: Option<MmapMut>,
     index: HashMap<u32, MetaRecord>,
+    record_count: u32,
     file_len: usize,
 }
 
 impl MetadataStore {
-    /// Open or create metadata store at given path
     async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        
-        // Use tokio for async file operations, then convert to std::fs::File for mmap
         let exists = tokio::fs::try_exists(path)
             .await
             .map_err(VectorDbError::Io)?;
-        
-        // Open file using std for mmap compatibility
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -369,61 +370,66 @@ impl MetadataStore {
             file,
             mmap: None,
             index: HashMap::new(),
+            record_count: 0,
             file_len: 0,
         };
 
         if !exists {
-            // Initialize new file
-            store.file.set_len(META_HEADER as u64).map_err(VectorDbError::Io)?;
+            let total = META_HEADER;
+            store.file.set_len(total as u64).map_err(VectorDbError::Io)?;
             let mut m = unsafe { MmapOptions::new().map_mut(&store.file)? };
             m[0..8].copy_from_slice(&META_MAGIC.to_le_bytes());
-            m[8..16].copy_from_slice(&1u64.to_le_bytes());
+            m[8..12].copy_from_slice(&0u32.to_le_bytes()); // count = 0
             m.flush().map_err(VectorDbError::Io)?;
             store.mmap = Some(m);
             store.file_len = META_HEADER;
         } else {
-            // Load existing file
             let len = store.file.metadata().map_err(VectorDbError::Io)?.len() as usize;
+            if len < META_HEADER {
+                return Err(VectorDbError::Corruption("metadata file too small".into()));
+            }
             let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
 
-            // Validate magic number
-            let magic = u64::from_le_bytes(
-                m[0..8].try_into()
-                    .map_err(|_| VectorDbError::Corruption("file too small for header".to_string()))?
-            );
+            let magic = u64::from_le_bytes(m[0..8].try_into()
+                .map_err(|_| VectorDbError::Corruption("metadata file too small".into()))?);
             if magic != META_MAGIC {
-                return Err(VectorDbError::Corruption("invalid metadata magic".to_string()));
+                return Err(VectorDbError::Corruption("invalid metadata magic".into()));
             }
 
-            // Parse records (with bounds checking)
-            let mut pos = META_HEADER;
-            while pos + 16 <= len {
-                if pos + 4 > len || pos + 8 > len || pos + 12 > len {
-                    return Err(VectorDbError::Corruption("truncated metadata record".to_string()));
-                }
+            let count = u32::from_le_bytes(m[8..12].try_into().unwrap());
+            store.record_count = count;
 
-                let id = u32::from_le_bytes(m[pos..pos + 4].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid record ID".to_string()))?);
-                let flags = u32::from_le_bytes(m[pos + 4..pos + 8].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid record flags".to_string()))?);
-                let dlen = u32::from_le_bytes(m[pos + 8..pos + 12].try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid record length".to_string()))?) as usize;
+            let mut pos = META_HEADER;
+            for _ in 0..count as usize {
+                if pos + 16 > len {
+                    return Err(VectorDbError::Corruption(
+                        format!("metadata truncated: expected {} records but only {} bytes available", count, len - META_HEADER)
+                    ));
+                }
+                let id = u32::from_le_bytes(m[pos..pos + 4].try_into().unwrap());
+                let flags = u32::from_le_bytes(m[pos + 4..pos + 8].try_into().unwrap());
+                let dlen = u32::from_le_bytes(m[pos + 8..pos + 12].try_into().unwrap()) as usize;
 
                 let data_off = pos + 16;
                 if data_off + dlen > len {
-                    return Err(VectorDbError::Corruption("record data extends beyond file".to_string()));
+                    return Err(VectorDbError::Corruption("metadata record data extends beyond file".into()));
                 }
 
-                store.index.insert(
-                    id,
-                    MetaRecord {
-                        flags,
-                        offset: data_off as u64,
-                        len: dlen as u32,
-                    },
-                );
+                store.index.insert(id, MetaRecord {
+                    flags,
+                    offset: data_off as u64,
+                    len: dlen as u32,
+                });
                 pos = data_off + dlen;
             }
+
+            // Truncate any bytes beyond the flushed records (leftover from grow()
+            // that were never committed via flush())
+            drop(m);
+            if pos < len {
+                store.file.set_len(pos as u64).map_err(VectorDbError::Io)?;
+            }
+            let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
 
             store.mmap = Some(m);
             store.file_len = pos;
@@ -431,35 +437,30 @@ impl MetadataStore {
         Ok(store)
     }
 
-    /// Get reference to mmap (panics if None - invariant maintained by constructor)
     fn mmap(&self) -> &MmapMut {
         self.mmap.as_ref().expect("metadata mmap present")
     }
 
-    /// Get mutable reference to mmap (panics if None - invariant maintained by constructor)
     fn mmap_mut(&mut self) -> &mut MmapMut {
         self.mmap.as_mut().expect("metadata mmap present")
     }
 
-    /// Check if metadata for ID is tombstoned
     fn is_deleted(&self, id: u32) -> bool {
         self.index
             .get(&id)
             .map(|r| r.flags & META_FLAG_DELETED != 0)
-            .unwrap_or(true) // Non-existent = implicitly deleted
+            .unwrap_or(true)
     }
 
-    /// Retrieve metadata bytes for ID (returns None if deleted or not found)
     fn get(&self, id: u32) -> Option<&[u8]> {
         let r = self.index.get(&id)?;
         if r.flags & META_FLAG_DELETED != 0 {
             return None;
         }
         let off = r.offset as usize;
-         Some(&self.mmap()[off..off + r.len as usize])
-     }
+        Some(&self.mmap()[off..off + r.len as usize])
+    }
 
-     /// Append new metadata record (or update existing by appending new entry)
     fn put(&mut self, id: u32, flags: u32, data: &[u8]) -> Result<()> {
         let need = self.file_len + 16 + data.len();
         if need > self.mmap().len() {
@@ -474,19 +475,16 @@ impl MetadataStore {
             m[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
             m[off + 16..off + 16 + data.len()].copy_from_slice(data);
         }
-        self.index.insert(
-            id,
-            MetaRecord {
-                flags,
-                offset: (off + 16) as u64,
-                len: data.len() as u32,
-            },
-        );
+        self.index.insert(id, MetaRecord {
+            flags,
+            offset: (off + 16) as u64,
+            len: data.len() as u32,
+        });
+        self.record_count += 1;
         self.file_len = off + 16 + data.len();
         Ok(())
     }
 
-    /// Grow mmap to accommodate more data (doubling strategy)
     fn grow(&mut self, need: usize) -> Result<()> {
         let new_size = (need * 2).max(1024);
         if let Some(m) = self.mmap.as_ref() {
@@ -498,11 +496,11 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Flush metadata to disk
     fn flush(&mut self) -> Result<()> {
+        let count = self.record_count;
+        self.mmap_mut()[8..12].copy_from_slice(&count.to_le_bytes());
         self.mmap().flush().map_err(VectorDbError::Io)?;
         self.file.set_len(self.file_len as u64).map_err(VectorDbError::Io)?;
-        // Remap after truncation so subsequent writes go to file-backed pages
         self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
         Ok(())
     }
@@ -1191,9 +1189,15 @@ impl VectorDb {
         for record in records {
             match record.op_type {
                 WalOpType::Insert => {
-                    // Skip if already applied (idempotent)
                     if (record.vector_id as usize) >= self.len() {
+                        // Vector not yet in file, full insert
                         self.insert_from_wal(&record)?;
+                        recovered_count += 1;
+                    } else if self.meta.get(record.vector_id).is_none() {
+                        // Vector data exists but metadata missing (data flushed
+                        // before crash, metadata/metadata not yet flushed).
+                        // Restore metadata from WAL record.
+                        self.meta.put(record.vector_id, 0, &record.metadata)?;
                         recovered_count += 1;
                     }
                 }
@@ -1651,7 +1655,6 @@ impl VectorDb {
         // Unmap before renaming
         self.mmap = None;
         self.index.mmap = None;
-        self.meta.mmap = None;
 
         tokio::fs::rename(&tmp_vec, &self.path).await.map_err(VectorDbError::Io)?;
         tokio::fs::rename(&tmp_hnsw, hnsw_path(&self.path)).await.map_err(VectorDbError::Io)?;

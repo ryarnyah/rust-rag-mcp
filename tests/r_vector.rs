@@ -867,3 +867,116 @@ async fn test_search_with_source_filter() -> Result<()> {
     cleanup("test_source_filter.db");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_wal_recovery_preserves_metadata() -> Result<()> {
+    cleanup("test_wal_meta_preserve.db");
+
+    // Stage 1: Insert and flush (data + metadata on disk, WAL cleared)
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let mut db = VectorDb::open("test_wal_meta_preserve.db", cfg).await?;
+        db.insert(&[1.0, 0.0, 0.0, 0.0], Some(b"first"))?;
+        db.insert(&[0.0, 1.0, 0.0, 0.0], Some(b"second"))?;
+        db.flush().await?;
+    }
+
+    // Stage 2: Insert more without flush (simulates crash before flush)
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let mut db = VectorDb::open("test_wal_meta_preserve.db", cfg).await?;
+        assert_eq!(db.len(), 2);
+        db.insert(&[0.0, 0.0, 1.0, 0.0], Some(b"third"))?;
+        db.insert(&[0.0, 0.0, 0.0, 1.0], Some(b"fourth"))?;
+        // No flush - simulates crash
+    }
+
+    // Stage 3: Reopen and verify all metadata recovered from WAL
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let db = VectorDb::open("test_wal_meta_preserve.db", cfg).await?;
+        assert_eq!(db.len(), 4, "Should have 4 vectors");
+        assert_eq!(db.get_meta(0)?.map(|m| m.to_vec()), Some(b"first".to_vec()));
+        assert_eq!(db.get_meta(1)?.map(|m| m.to_vec()), Some(b"second".to_vec()));
+        assert_eq!(db.get_meta(2)?.map(|m| m.to_vec()), Some(b"third".to_vec()));
+        assert_eq!(db.get_meta(3)?.map(|m| m.to_vec()), Some(b"fourth".to_vec()));
+    }
+
+    cleanup("test_wal_meta_preserve.db");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata() -> Result<()> {
+    cleanup("test_wal_meta_missing.db");
+
+    // Stage 1: Insert vector A and flush (data + metadata on disk, WAL cleared)
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let mut db = VectorDb::open("test_wal_meta_missing.db", cfg).await?;
+        db.insert(&[1.0, 0.0, 0.0, 0.0], Some(b"alpha"))?;
+        db.flush().await?;
+    }
+
+    // Stage 2: Insert vector B (WAL record created for B)
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let mut db = VectorDb::open("test_wal_meta_missing.db", cfg).await?;
+        assert_eq!(db.len(), 1);
+        db.insert(&[0.0, 1.0, 0.0, 0.0], Some(b"beta"))?;
+        // Don't flush - WAL has record for B, but data/metadata only in mmap
+    }
+
+    // Stage 3: Simulate partial flush crash.
+    // Drop db (loses unflushed mmap data). Then manually:
+    //   - Append B's vector bytes to the data file and update count to 2
+    //     (simulates data file being flushed before crash)
+    //   - Leave metadata file with only A's record
+    //     (simulates metadata not being flushed before crash)
+    //   - Leave WAL with B's record (simulates checkpoint not being written)
+    {
+        // Write B's vector into the data file and update count
+        use std::io::{Seek, SeekFrom, Write};
+        let vec_bytes: Vec<u8> = [0.0f32, 1.0, 0.0, 0.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let mut data_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("test_wal_meta_missing.db")?;
+
+        // Update count from 1 to 2 at offset 16..24
+        data_file.seek(SeekFrom::Start(16))?;
+        data_file.write_all(&2u64.to_le_bytes())?;
+
+        // Append B's vector at offset 32 + 1*4*4 = 48
+        data_file.seek(SeekFrom::Start(48))?;
+        data_file.write_all(&vec_bytes)?;
+        data_file.flush()?;
+
+        // Now the data file has 2 vectors but metadata file only has A's record.
+        // WAL still has B's insert record.
+    }
+
+    // Stage 4: Reopen - WAL recovery should detect B's metadata is missing and restore it
+    {
+        let cfg = Config::new(4).with_capacity(32);
+        let db = VectorDb::open("test_wal_meta_missing.db", cfg).await?;
+        assert_eq!(db.len(), 2, "Should have 2 vectors in data file");
+        assert_eq!(
+            db.get_meta(0)?.map(|m| m.to_vec()),
+            Some(b"alpha".to_vec()),
+            "A's metadata should be intact"
+        );
+        assert_eq!(
+            db.get_meta(1)?.map(|m| m.to_vec()),
+            Some(b"beta".to_vec()),
+            "B's metadata should be restored from WAL"
+        );
+    }
+
+    cleanup("test_wal_meta_missing.db");
+    Ok(())
+}
