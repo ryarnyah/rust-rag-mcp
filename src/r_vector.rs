@@ -2113,3 +2113,94 @@ pub struct SearchHitOwned {
     /// Associated metadata bytes (owned)
     pub metadata: Vec<u8>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosine_distance_identical() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let dist = cosine_distance(&a, &b).unwrap();
+        assert!((dist - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_distance_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        let dist = cosine_distance(&a, &b).unwrap();
+        assert!((dist - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_distance_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let dist = cosine_distance(&a, &b).unwrap();
+        assert!((dist - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_distance_zero_vector() {
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        let dist = cosine_distance(&a, &b).unwrap();
+        assert!(dist.is_finite());
+    }
+
+    #[test]
+    fn test_cosine_distance_mismatched_lengths() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        // dot returns 0.0 for mismatched lengths, so distance = 1.0 - 0/(norm_a * norm_b)
+        // but norms use the full slice, so result may vary. Just check it's finite.
+        let dist = cosine_distance(&a, &b);
+        assert!(dist.is_ok());
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let cfg = Config::new(128);
+        assert_eq!(cfg.dim, 128);
+        assert_eq!(cfg.m, 20);
+        assert_eq!(cfg.m0, 30);
+        assert_eq!(cfg.ef_construction, 150);
+        assert_eq!(cfg.max_level, 7);
+    }
+
+    #[test]
+    fn test_config_builder() {
+        let cfg = Config::new(256)
+            .with_m(40)
+            .with_ef_construction(300)
+            .with_capacity(2048)
+            .with_max_level(10);
+        assert_eq!(cfg.dim, 256);
+        assert_eq!(cfg.m, 40);
+        assert_eq!(cfg.m0, 80); // m * 2
+        assert_eq!(cfg.ef_construction, 300);
+        assert_eq!(cfg.initial_capacity, 2048);
+        assert_eq!(cfg.max_level, 10);
+    }
+
+    #[test]
+    fn test_rng_reproducibility() {
+        let mut rng1 = Rng::new(42);
+        let mut rng2 = Rng::new(42);
+        for _ in 0..100 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
+    }
+
+    #[test]
+    fn test_rng_values_in_range() {
+        let mut rng = Rng::new(1);
+        for _ in 0..1000 {
+            let f = rng.next_f64();
+            assert!(f >= 0.0);
+            assert!(f < 1.0);
+        }
+    }
+}

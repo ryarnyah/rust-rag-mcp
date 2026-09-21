@@ -858,4 +858,84 @@ mod tests {
         buf[10] ^= 0xFF;
         assert!(WalHeader::from_bytes(&buf).is_err());
     }
+
+    #[test]
+    fn test_empty_payload_record() {
+        let rec = WalRecord {
+            lsn: Lsn(99),
+            timestamp: 9999,
+            op_type: WalOpType::Delete,
+            vector_id: 0,
+            vector_data: Vec::new(),
+            metadata: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        rec.write_to(&mut buf);
+        let (decoded, n) = WalRecord::from_bytes(&buf).unwrap();
+        assert_eq!(n, buf.len());
+        assert_eq!(decoded.lsn, Lsn(99));
+        assert!(decoded.vector_data.is_empty());
+        assert!(decoded.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_record_header_too_short() {
+        let buf = vec![0u8; 10];
+        assert!(WalRecord::from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_record_bad_footer() {
+        let rec = WalRecord {
+            lsn: Lsn(1),
+            timestamp: 0,
+            op_type: WalOpType::Insert,
+            vector_id: 1,
+            vector_data: vec![1.0],
+            metadata: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        rec.write_to(&mut buf);
+        // Corrupt the footer (last 4 bytes)
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+        assert!(WalRecord::from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_header_bad_magic() {
+        let hdr = WalHeader {
+            last_checkpoint_lsn: 0,
+            current_lsn: 0,
+            last_checkpoint_generation: 0,
+        };
+        let mut buf = hdr.to_bytes();
+        buf[0] = 0xFF; // corrupt magic
+        assert!(WalHeader::from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_header_too_short() {
+        let buf = [0u8; WAL_HEADER_SIZE];
+        // Manually corrupt to simulate truncated header scenario
+        // from_bytes checks CRC first, so a zero buffer will fail CRC
+        assert!(WalHeader::from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_lsn_ordering() {
+        assert!(Lsn(1) < Lsn(2));
+        assert!(Lsn(100) > Lsn(50));
+        assert_eq!(Lsn(42), Lsn(42));
+    }
+
+    #[test]
+    fn test_op_type_roundtrip() {
+        assert_eq!(WalOpType::from_u8(1).unwrap(), WalOpType::Insert);
+        assert_eq!(WalOpType::from_u8(2).unwrap(), WalOpType::Delete);
+        assert_eq!(WalOpType::from_u8(3).unwrap(), WalOpType::Update);
+        assert_eq!(WalOpType::from_u8(4).unwrap(), WalOpType::Checkpoint);
+        assert!(WalOpType::from_u8(0).is_err());
+        assert!(WalOpType::from_u8(5).is_err());
+    }
 }

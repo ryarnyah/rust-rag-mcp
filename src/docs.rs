@@ -41,7 +41,7 @@ pub async fn extract_text(path: &Path) -> Result<String> {
         .unwrap_or("")
         .to_lowercase();
 
-    match ext.to_lowercase().as_str() {
+    match ext.as_str() {
         "pdf" => unpdf::extract_text(path).context("extracting PDF"),
         "docx" | "xlsx" | "pptx" => undoc::extract_text(path).context("extracting Office document"),
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "json"

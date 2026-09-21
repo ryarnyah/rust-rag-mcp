@@ -59,7 +59,6 @@ struct DocumentStatusResponse {
 
 #[derive(Clone)]
 pub struct RagServer {
-    #[allow(dead_code)]
     core: Arc<RwLock<RagCore>>,
 }
 
@@ -70,8 +69,17 @@ impl RagServer {
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
+        ef_construction: usize,
     ) -> anyhow::Result<Self> {
-        let core = RagCore::new(db_path, cache_path, model_name, chunk_size, overlap).await?;
+        let core = RagCore::new(
+            db_path,
+            cache_path,
+            model_name,
+            chunk_size,
+            overlap,
+            ef_construction,
+        )
+        .await?;
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
         })

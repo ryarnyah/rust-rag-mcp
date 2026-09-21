@@ -7,7 +7,7 @@ use rust_rag_mcp::{docs, mcp, rag};
 #[derive(Parser)]
 #[command(
     name = "rust-rag-mcp",
-    about = "RAG MCP server with fastembed, LanceDB, PDF/docx/xlsx/pptx"
+    about = "RAG MCP server with fastembed, HNSW vector DB, PDF/docx/xlsx/pptx"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,6 +32,9 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long, default_value_t = 150)]
+        ef_construction: usize,
     },
 
     /// Index a file or directory (skips unchanged files automatically)
@@ -53,6 +56,9 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long, default_value_t = 150)]
+        ef_construction: usize,
     },
 
     /// Search the knowledge base
@@ -71,6 +77,12 @@ enum Commands {
 
         #[arg(long, default_value_t = 5)]
         top_k: usize,
+
+        #[arg(long, default_value_t = 512)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 64)]
+        overlap: usize,
     },
 
     /// List indexed sources
@@ -83,6 +95,12 @@ enum Commands {
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
+
+        #[arg(long, default_value_t = 512)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 64)]
+        overlap: usize,
     },
 
     /// Show index statistics
@@ -95,6 +113,12 @@ enum Commands {
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
+
+        #[arg(long, default_value_t = 512)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 64)]
+        overlap: usize,
     },
 
     /// Remove a source document from the index
@@ -110,6 +134,12 @@ enum Commands {
 
         #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
         model: String,
+
+        #[arg(long, default_value_t = 512)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 64)]
+        overlap: usize,
     },
 
     /// List available embedding models
@@ -119,11 +149,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-                .add_directive("lance=error".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
@@ -137,10 +163,18 @@ async fn main() -> anyhow::Result<()> {
             model,
             chunk_size,
             overlap,
+            ef_construction,
         } => {
             tracing::info!("Starting RAG MCP server");
-            let server =
-                mcp::RagServer::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
+            let server = mcp::RagServer::new(
+                &db_path,
+                &cache_path,
+                &model,
+                chunk_size,
+                overlap,
+                ef_construction,
+            )
+            .await?;
             let service = server
                 .serve(rmcp::transport::stdio())
                 .await
@@ -157,9 +191,17 @@ async fn main() -> anyhow::Result<()> {
             model,
             chunk_size,
             overlap,
+            ef_construction,
         } => {
-            let core =
-                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap).await?;
+            let core = rag::RagCore::new(
+                &db_path,
+                &cache_path,
+                &model,
+                chunk_size,
+                overlap,
+                ef_construction,
+            )
+            .await?;
             for path_str in &paths {
                 let path = std::path::Path::new(path_str);
                 if !path.exists() {
@@ -199,8 +241,11 @@ async fn main() -> anyhow::Result<()> {
             cache_path,
             model,
             top_k,
+            chunk_size,
+            overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
+            let core =
+                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap, 150).await?;
             let query_str = query.join(" ");
             let results: Vec<rust_rag_mcp::SearchResult> = core.search(&query_str, top_k).await?;
 
@@ -225,8 +270,11 @@ async fn main() -> anyhow::Result<()> {
             db_path,
             cache_path,
             model,
+            chunk_size,
+            overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
+            let core =
+                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap, 150).await?;
             let sources = core.list_sources().await?;
             if sources.is_empty() {
                 println!("No indexed sources.");
@@ -241,8 +289,11 @@ async fn main() -> anyhow::Result<()> {
             db_path,
             cache_path,
             model,
+            chunk_size,
+            overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
+            let core =
+                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap, 150).await?;
             let count = core.chunk_count().await?;
             let sources = core.list_sources().await?;
             println!("Indexed chunks: {}", count);
@@ -258,8 +309,11 @@ async fn main() -> anyhow::Result<()> {
             db_path,
             cache_path,
             model,
+            chunk_size,
+            overlap,
         } => {
-            let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
+            let core =
+                rag::RagCore::new(&db_path, &cache_path, &model, chunk_size, overlap, 150).await?;
             match core.delete_source(&source_path).await {
                 Ok(()) => println!("Deleted: {}", source_path),
                 Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),

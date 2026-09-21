@@ -3,7 +3,7 @@ name = "rust-rag-mcp"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "RAG MCP server using rig, fastembed, LanceDB, unpdf, undoc"
+description = "RAG MCP server using fastembed, custom HNSW vector DB, PDF/docx/xlsx/pptx"
 
 [[bin]]
 name = "rust-rag-mcp"
@@ -75,10 +75,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 serial_test = "4"
 
-#[profile.release]
-#opt-level = 3
-#lto = true
-#codegen-units = 1
-#strip = true
-#panic = "abort"
-#overflow-checks = false
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false

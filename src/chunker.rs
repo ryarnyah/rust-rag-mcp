@@ -34,17 +34,26 @@ impl Chunker {
         }
 
         let mut chunks = Vec::new();
+        let mut char_offset = 0usize;
+        let mut word_positions: Vec<(usize, usize)> = Vec::with_capacity(words.len());
+
+        for word in &words {
+            let start = text[char_offset..]
+                .find(word)
+                .map(|i| i + char_offset)
+                .unwrap_or(char_offset);
+            word_positions.push((start, start + word.len()));
+            char_offset = start + word.len();
+        }
+
         let mut start_word = 0;
 
         while start_word < words.len() {
             let end_word = std::cmp::min(start_word + self.max_chunk_size, words.len());
 
             let chunk_text: String = words[start_word..end_word].join(" ");
-            let start_offset = text.find(words[start_word]).unwrap_or(0);
-            let end_offset = text
-                .find(words[end_word - 1])
-                .map(|pos| pos + words[end_word - 1].len())
-                .unwrap_or(text.len());
+            let start_offset = word_positions[start_word].0;
+            let end_offset = word_positions[end_word - 1].1;
 
             chunks.push(DocumentChunk {
                 id: Uuid::new_v4().to_string(),
@@ -112,6 +121,37 @@ mod tests {
         for chunk in &chunks {
             assert!(chunk.start_offset <= chunk.end_offset);
             assert!(chunk.end_offset <= text.len());
+            // Verify the chunk text matches the slice from the original text
+            assert_eq!(&text[chunk.start_offset..chunk.end_offset], chunk.text);
+        }
+    }
+
+    #[test]
+    fn test_chunk_offsets_with_duplicate_words() {
+        let chunker = Chunker::new(3, 1);
+        let text = "the cat sat on the cat mat";
+        let chunks = chunker.chunk_text(text, "test.txt");
+        for chunk in &chunks {
+            assert_eq!(&text[chunk.start_offset..chunk.end_offset], chunk.text);
+        }
+    }
+
+    #[test]
+    fn test_chunk_offsets_with_overlap() {
+        let chunker = Chunker::new(3, 1);
+        let text = "a b c d e f g h i j";
+        let chunks = chunker.chunk_text(text, "test.txt");
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert_eq!(&text[chunk.start_offset..chunk.end_offset], chunk.text);
+        }
+        // With overlap=1, second chunk should start one word before first chunk ends
+        if chunks.len() >= 2 {
+            let first_end_word_pos = chunks[0].text.rsplit(' ').next().unwrap();
+            let second_start_word_pos =
+                &chunks[1].text[..chunks[1].text.find(' ').unwrap_or(chunks[1].text.len())];
+            // The overlapping word should be the same
+            assert_eq!(first_end_word_pos, second_start_word_pos);
         }
     }
 }

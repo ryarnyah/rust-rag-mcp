@@ -94,17 +94,16 @@ struct DocumentMetadataEntry {
 }
 
 impl RagCore {
-    /**
-     * Creates a new instance of RagCore with the specified database path, cache directory,
-     * model name, chunk size, and overlap. Initializes the embedding service, chunker,
-     * syntax chunker, and sets up the necessary vector database.
-     */
+    /// Creates a new instance of RagCore with the specified database path, cache directory,
+    /// model name, chunk size, overlap, and ef_construction. Initializes the embedding service, chunker,
+    /// syntax chunker, and sets up the necessary vector database.
     pub async fn new(
         db_path: &str,
         cache_dir: &str,
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
+        ef_construction: usize,
     ) -> Result<Self> {
         let embedding = EmbeddingService::new(model_name, cache_dir)?;
         let ndims = embedding.dimensions();
@@ -115,8 +114,6 @@ impl RagCore {
         let db_file_path = db_dir.join("db");
 
         // Create vector database for chunks and metadata
-        // P4: Adaptive ef_construction based on dataset size
-        let ef_construction = 150; // Default for initial creation
         let vectors_cfg = VectorDbConfig::new(ndims)
             .with_m(20)
             .with_ef_construction(ef_construction)
@@ -154,9 +151,7 @@ impl RagCore {
         })
     }
 
-    /**
-     * Computes the SHA-256 hash of the contents of the specified file asynchronously.
-     */
+    /// Computes the SHA-256 hash of the contents of the specified file asynchronously.
     async fn compute_file_hash(path: &Path) -> Result<String> {
         let bytes = tokio::fs::read(path).await?;
         let mut hasher = Sha256::new();
@@ -164,18 +159,14 @@ impl RagCore {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    /**
-     * Computes the SHA-256 hash of the given text synchronously.
-     */
+    /// Computes the SHA-256 hash of the given text synchronously.
     fn compute_text_hash(text: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         hex::encode(hasher.finalize())
     }
 
-    /**
-     * Indexes the specified file by extracting its text, chunking it, and storing the chunks and metadata in the database.
-     */
+    /// Indexes the specified file by extracting its text, chunking it, and storing the chunks and metadata in the database.
     pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
         let source_path = path
             .canonicalize()
@@ -211,16 +202,14 @@ impl RagCore {
             count
         };
 
-        let now = chrono_free_timestamp();
+        let now = current_timestamp()?;
         self.upsert_metadata(&source_path, &content_hash, now, count as u32)
             .await?;
 
         Ok(IndexResult::Indexed(count))
     }
 
-    /**
-     * Indexes the given text by chunking it and storing the chunks and metadata in the database.
-     */
+    /// Indexes the given text by chunking it and storing the chunks and metadata in the database.
     pub async fn index_text(&self, text: &str, source: &str) -> Result<IndexResult> {
         let content_hash = Self::compute_text_hash(text);
 
@@ -241,16 +230,14 @@ impl RagCore {
         let count = chunks.len();
         self.index_chunks(chunks).await?;
 
-        let now = chrono_free_timestamp();
+        let now = current_timestamp()?;
         self.upsert_metadata(source, &content_hash, now, count as u32)
             .await?;
 
         Ok(IndexResult::Indexed(count))
     }
 
-    /**
-     * Indexes the given chunks by generating embeddings and storing them in the database.
-     */
+    /// Indexes the given chunks by generating embeddings and storing them in the database.
     async fn index_chunks(&self, chunks: Vec<DocumentChunk>) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
@@ -288,10 +275,8 @@ impl RagCore {
         Ok(())
     }
 
-    /**
-     * Performs a semantic search for the given query string, returning the top_k most relevant results.
-     * Optionally filters results by the specified source.
-     */
+    /// Performs a semantic search for the given query string, returning the top_k most relevant results.
+    /// Optionally filters results by the specified source.
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let query_chunk = vec![DocumentChunk {
             id: "query".to_string(),
@@ -350,35 +335,33 @@ impl RagCore {
         Ok(results)
     }
 
-    /**
-     * Returns the total number of chunks stored in the database.
-     */
+    /// Returns the total number of chunks stored in the database.
     pub async fn chunk_count(&self) -> Result<usize> {
         Ok(self.vectors_db.len().await)
     }
 
-    /**
-     * Returns a list of all unique sources present in the database.
-     */
+    /// Returns a list of all unique sources present in the database.
     pub async fn list_sources(&self) -> Result<Vec<String>> {
         // P3: Use metadata index for O(1) instead of O(n) full table scan
         Ok(self.metadata_index.get_all_sources().await)
     }
 
-    /**
-     * Deletes all chunks and metadata associated with the specified source path from the database.
-     */
+    /// Deletes all chunks and metadata associated with the specified source path from the database.
     pub async fn delete_source(&self, source_path: &str) -> Result<()> {
         // P3: Use metadata index for O(k) instead of O(n) full table scan
         // k = number of chunks for this source (much smaller than total vectors)
         let chunk_ids = self.metadata_index.get_chunk_ids(source_path).await;
         for id in chunk_ids {
-            let _ = self.vectors_db.delete(id).await;
+            if let Err(e) = self.vectors_db.delete(id).await {
+                tracing::warn!(vector_id = id, error = %e, "Failed to delete vector");
+            }
         }
 
         // Also delete doc metadata if exists
-        if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await {
-            let _ = self.vectors_db.delete(doc_id).await;
+        if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await
+            && let Err(e) = self.vectors_db.delete(doc_id).await
+        {
+            tracing::warn!(vector_id = doc_id, error = %e, "Failed to delete doc metadata vector");
         }
 
         // Remove from index
@@ -403,10 +386,8 @@ impl RagCore {
             .map_err(|e| anyhow::anyhow!("Close failed: {}", e))
     }
 
-    /**
-     * Retrieves the status of the document associated with the specified source path.
-     * Returns None if the document is not found.
-     */
+    /// Retrieves the status of the document associated with the specified source path.
+    /// Returns None if the document is not found.
     pub async fn document_status(&self, source_path: &str) -> Result<Option<DocumentStatus>> {
         // P3: Use metadata index for O(1) lookup instead of O(n) full table scan
         if let Some(doc_id) = self.metadata_index.get_doc_metadata_id(source_path).await
@@ -423,9 +404,7 @@ impl RagCore {
         Ok(None)
     }
 
-    /**
-     * Upserts the metadata for a document, replacing any existing entry with the same source path.
-     */
+    /// Upserts the metadata for a document, replacing any existing entry with the same source path.
     async fn upsert_metadata(
         &self,
         source_path: &str,
@@ -435,8 +414,10 @@ impl RagCore {
     ) -> Result<()> {
         // P3: Use metadata index for O(1) lookup instead of O(n) full table scan
         // Delete existing entry if present
-        if let Some(old_id) = self.metadata_index.get_doc_metadata_id(source_path).await {
-            let _ = self.vectors_db.delete(old_id).await;
+        if let Some(old_id) = self.metadata_index.get_doc_metadata_id(source_path).await
+            && let Err(e) = self.vectors_db.delete(old_id).await
+        {
+            tracing::warn!(vector_id = old_id, error = %e, "Failed to delete old metadata vector");
         }
 
         // Insert new metadata entry with a dummy embedding vector
@@ -468,12 +449,11 @@ impl RagCore {
     }
 }
 
-/**
- * Generates a timestamp string representing the current time in seconds since the UNIX epoch.
- */
-fn chrono_free_timestamp() -> u64 {
+/// Returns the current time in seconds since the UNIX epoch.
+/// Returns an error if the system clock is before the UNIX epoch.
+fn current_timestamp() -> Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or_else(|_| 0)
+        .map_err(|e| anyhow::anyhow!("System clock before UNIX epoch: {}", e))
 }
