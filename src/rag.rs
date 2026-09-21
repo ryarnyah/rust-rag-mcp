@@ -292,12 +292,7 @@ impl RagCore {
      * Performs a semantic search for the given query string, returning the top_k most relevant results.
      * Optionally filters results by the specified source.
      */
-    pub async fn search(
-        &self,
-        query: &str,
-        top_k: usize,
-        source_filter: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let query_chunk = vec![DocumentChunk {
             id: "query".to_string(),
             text: query.to_string(),
@@ -319,15 +314,10 @@ impl RagCore {
         let ef = (top_k as u32 * 4).clamp(40, 200);
 
         // Search vectors with optional source filter
-        let search_results = if let Some(filter) = source_filter {
-            self.vectors_db
-                .search_with_source_filter(query_embedding, top_k, ef as usize, filter)
-                .await?
-        } else {
-            self.vectors_db
-                .search(query_embedding, top_k, ef as usize)
-                .await?
-        };
+        let search_results = self
+            .vectors_db
+            .search(query_embedding, top_k, ef as usize)
+            .await?;
 
         let mut results = Vec::new();
         for hit in search_results {

@@ -71,9 +71,6 @@ enum Commands {
 
         #[arg(long, default_value_t = 5)]
         top_k: usize,
-
-        #[arg(long)]
-        source: Option<String>,
     },
 
     /// List indexed sources
@@ -202,12 +199,10 @@ async fn main() -> anyhow::Result<()> {
             cache_path,
             model,
             top_k,
-            source,
         } => {
             let core = rag::RagCore::new(&db_path, &cache_path, &model, 512, 64).await?;
             let query_str = query.join(" ");
-            let results: Vec<rust_rag_mcp::SearchResult> =
-                core.search(&query_str, top_k, source.as_deref()).await?;
+            let results: Vec<rust_rag_mcp::SearchResult> = core.search(&query_str, top_k).await?;
 
             if results.is_empty() {
                 println!("No results found.");

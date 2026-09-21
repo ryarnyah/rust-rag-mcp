@@ -62,10 +62,6 @@ pub struct SearchRequest {
         description = "Maximum results to return (default: 5). Higher values return more candidates but take longer."
     )]
     pub top_k: schemar_ext::Nullable<usize>,
-    #[schemars(
-        description = "Optional exact source path filter to restrict search to a single document."
-    )]
-    pub source_filter: schemar_ext::Nullable<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -209,8 +205,7 @@ impl RagServer {
         let top_k = req.top_k.unwrap_or(5);
         let result = {
             let core = self.core.read().await;
-            core.search(&req.query, top_k, req.source_filter.as_deref())
-                .await
+            core.search(&req.query, top_k).await
         };
         match result {
             Ok(results) => {

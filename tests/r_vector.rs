@@ -925,39 +925,6 @@ async fn test_search_k_greater_than_size() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_search_with_source_filter() -> Result<()> {
-    cleanup("test_source_filter.db");
-    {
-        let cfg = Config::new(2);
-        let db = AsyncVectorDb::open("test_source_filter.db", cfg).await?;
-
-        let meta1 = br#"{"source":"file1.txt","text":"hello"}"#;
-        let meta2 = br#"{"source":"file2.txt","text":"world"}"#;
-        let meta3 = br#"{"source":"file1.txt","text":"foo"}"#;
-
-        db.insert(&[1.0, 0.0], Some(meta1)).await?;
-        db.insert(&[0.0, 1.0], Some(meta2)).await?;
-        db.insert(&[1.0, 0.0], Some(meta3)).await?;
-
-        let results = db
-            .search_with_source_filter(&[1.0, 0.0], 10, 32, "file1.txt")
-            .await?;
-
-        for hit in &results {
-            if let Ok(meta_obj) = serde_json::from_slice::<serde_json::Value>(&hit.metadata) {
-                if let Some(source) = meta_obj.get("source").and_then(|s| s.as_str()) {
-                    assert_eq!(source, "file1.txt", "filtered result has wrong source");
-                }
-            }
-        }
-
-        db.flush().await?;
-    }
-    cleanup("test_source_filter.db");
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_wal_recovery_preserves_metadata() -> Result<()> {
     cleanup("test_wal_meta_preserve.db");
 

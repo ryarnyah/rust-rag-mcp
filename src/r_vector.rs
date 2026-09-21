@@ -2086,26 +2086,6 @@ impl AsyncVectorDb {
             .collect())
     }
 
-    /// Search with source filtering (async read)
-    pub async fn search_with_source_filter(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: usize,
-        source_filter: &str,
-    ) -> Result<Vec<SearchHitOwned>> {
-        let db = self.db.read().await;
-        let hits = db.search_with_source_filter(query, k, ef, source_filter)?;
-        Ok(hits
-            .into_iter()
-            .map(|h| SearchHitOwned {
-                id: h.id,
-                score: h.score,
-                metadata: h.metadata.to_vec(),
-            })
-            .collect())
-    }
-
     /// Compact database (async write, exclusive lock)
     pub async fn compact(&self) -> Result<()> {
         self.db.write().await.compact().await
