@@ -2,9 +2,159 @@ mod fixtures;
 
 use rust_rag_mcp::chunker::Chunker;
 use rust_rag_mcp::docs;
+use rust_rag_mcp::mcp::RagServer;
+use rust_rag_mcp::rag::RagCore;
 use tempfile::tempdir;
 
 const TEST_FIXTURES_DIR: &str = "../../test-fixtures";
+
+/// Helper to create a RagCore for testing (uses small model, fast settings)
+async fn test_rag_core(dir: &std::path::Path) -> RagCore {
+    RagCore::new(
+        &dir.to_string_lossy(),
+        &dir.join("cache").to_string_lossy(),
+        "Xenova/bge-small-en-v1.5",
+        512,
+        64,
+        150,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_rag_server_instantiation() {
+    let dir = tempdir().unwrap();
+    let server = RagServer::new(
+        &dir.path().to_string_lossy(),
+        &dir.path().join("cache").to_string_lossy(),
+        "Xenova/bge-small-en-v1.5",
+        512,
+        64,
+        150,
+    )
+    .await;
+    assert!(server.is_ok(), "RagServer should instantiate: {:?}", server.err());
+}
+
+#[tokio::test]
+async fn test_rag_index_text_and_search() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    // Index some text
+    let result = core
+        .index_text(
+            "Rust is a systems programming language focused on safety and performance.",
+            "test.rs",
+        )
+        .await
+        .unwrap();
+    match result {
+        rust_rag_mcp::IndexResult::Indexed(count) => assert!(count > 0),
+        rust_rag_mcp::IndexResult::Skipped => panic!("Should not skip first index"),
+    }
+
+    // Search for it
+    let results = core.search("programming language", 5).await.unwrap();
+    assert!(!results.is_empty(), "Should find at least one result");
+    assert!(
+        results[0].score > 0.0,
+        "Score should be positive, got {}",
+        results[0].score
+    );
+    assert!(
+        results[0].chunk.text.contains("Rust"),
+        "Result should contain 'Rust'"
+    );
+
+    core.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rag_index_text_dedup() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    let text = "This is a duplicate content test.";
+
+    // First index
+    let r1 = core.index_text(text, "dedup.txt").await.unwrap();
+    assert!(matches!(r1, rust_rag_mcp::IndexResult::Indexed(_)));
+
+    // Same content again — should skip
+    let r2 = core.index_text(text, "dedup.txt").await.unwrap();
+    assert!(matches!(r2, rust_rag_mcp::IndexResult::Skipped));
+
+    // Different content, same source — should re-index
+    let r3 = core
+        .index_text("This is completely different content.", "dedup.txt")
+        .await
+        .unwrap();
+    assert!(matches!(r3, rust_rag_mcp::IndexResult::Indexed(_)));
+
+    core.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rag_delete_source() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    core.index_text("Some content to delete.", "delete_me.txt")
+        .await
+        .unwrap();
+
+    let sources = core.list_sources().await.unwrap();
+    assert!(sources.contains(&"delete_me.txt".to_string()));
+
+    core.delete_source("delete_me.txt").await.unwrap();
+
+    let sources = core.list_sources().await.unwrap();
+    assert!(!sources.contains(&"delete_me.txt".to_string()));
+
+    core.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rag_document_status() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    // Before indexing — should be None
+    let status = core.document_status("status_test.txt").await.unwrap();
+    assert!(status.is_none());
+
+    // After indexing — should have status
+    core.index_text("Status check content.", "status_test.txt")
+        .await
+        .unwrap();
+    let status = core.document_status("status_test.txt").await.unwrap();
+    assert!(status.is_some());
+    let s = status.unwrap();
+    assert_eq!(s.source_path, "status_test.txt");
+    assert!(!s.content_hash.is_empty());
+    assert!(s.chunk_count > 0);
+
+    core.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_rag_chunk_count() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    let before = core.chunk_count().await.unwrap();
+    assert_eq!(before, 0);
+
+    core.index_text("First document.", "a.txt").await.unwrap();
+    core.index_text("Second document.", "b.txt").await.unwrap();
+
+    let after = core.chunk_count().await.unwrap();
+    assert!(after >= 2, "Should have at least 2 chunks, got {after}");
+
+    core.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn test_extract_sample_pdf() {

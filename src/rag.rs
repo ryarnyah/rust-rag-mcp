@@ -169,7 +169,7 @@ impl RagCore {
     pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
         let source_path = path
             .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
+            .map_err(|e| anyhow::anyhow!("Failed to canonicalize path {:?}: {}", path, e))?
             .to_string_lossy()
             .to_string();
 
@@ -246,6 +246,14 @@ impl RagCore {
 
         for batch in chunks.chunks(BATCH_SIZE) {
             let embeddings_result = self.embedding.embed_chunks(batch).await?;
+
+            if embeddings_result.len() != batch.len() {
+                tracing::warn!(
+                    expected = batch.len(),
+                    got = embeddings_result.len(),
+                    "Embedding count mismatch — some chunks will be skipped"
+                );
+            }
 
             for (chunk, embedding) in batch.iter().zip(embeddings_result.iter()) {
                 let chunk_meta = ChunkMetadata {

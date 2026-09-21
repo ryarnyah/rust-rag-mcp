@@ -713,10 +713,7 @@ impl WalWriter {
         self.file.sync_all()?;
 
         // Drop old handle, rename to segment, create new WAL
-        drop(std::mem::replace(&mut self.file, {
-            // Temporary dummy — immediately replaced below
-            OpenOptions::new().read(true).open("/dev/null")?
-        }));
+        drop(std::mem::replace(&mut self.file, open_null_file()?));
 
         let seg_path =
             WriteAheadLog::segment_path(Path::new(&self.db_path_prefix), self.next_segment_id);
@@ -784,6 +781,22 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Open a platform-appropriate null file handle (used as a dummy for mem::replace)
+fn open_null_file() -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        OpenOptions::new().read(true).open("/dev/null")
+    }
+    #[cfg(windows)]
+    {
+        OpenOptions::new().read(true).open("NUL")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::File::open(std::env::temp_dir().join(".null_dummy"))
+    }
 }
 
 // ---------------------------------------------------------------------------

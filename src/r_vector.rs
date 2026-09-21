@@ -1886,6 +1886,15 @@ impl VectorDb {
         self.mmap = None;
         self.index.mmap = None;
 
+        // Shut down old WAL writer before re-opening
+        self.wal.shutdown().await.map_err(VectorDbError::Io)?;
+
+        // Release the advisory lock before re-opening the same path.
+        // Replace with a harmless dummy file handle so the old lock is dropped.
+        let dummy_lock = open_null_file().map_err(VectorDbError::Io)?;
+        let _old_lock = std::mem::replace(&mut self._lock_file, dummy_lock);
+        drop(_old_lock);
+
         tokio::fs::rename(&tmp_vec, &self.path)
             .await
             .map_err(VectorDbError::Io)?;
@@ -1963,6 +1972,23 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
+}
+
+/// Open a platform-appropriate null file handle (used as a dummy for mem::replace)
+fn open_null_file() -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new().read(true).open("/dev/null")
+    }
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new().read(true).open("NUL")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Fallback: create a temporary file and immediately return it
+        std::fs::File::open(std::env::temp_dir().join(".null_dummy"))
+    }
 }
 
 // ============================================================================
