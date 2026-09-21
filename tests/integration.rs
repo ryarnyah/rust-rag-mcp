@@ -11,8 +11,8 @@ const TEST_FIXTURES_DIR: &str = "../../test-fixtures";
 /// Helper to create a RagCore for testing (uses small model, fast settings)
 async fn test_rag_core(dir: &std::path::Path) -> RagCore {
     RagCore::new(
-        &dir.to_string_lossy(),
-        &dir.join("cache").to_string_lossy(),
+        dir,
+        &dir.join("cache"),
         "Xenova/bge-small-en-v1.5",
         512,
         64,
@@ -26,8 +26,8 @@ async fn test_rag_core(dir: &std::path::Path) -> RagCore {
 async fn test_rag_server_instantiation() {
     let dir = tempdir().unwrap();
     let server = RagServer::new(
-        &dir.path().to_string_lossy(),
-        &dir.path().join("cache").to_string_lossy(),
+        dir.path(),
+        &dir.path().join("cache"),
         "Xenova/bge-small-en-v1.5",
         512,
         64,

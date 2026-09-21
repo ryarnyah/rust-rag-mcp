@@ -4,7 +4,7 @@ use crate::embeddings::EmbeddingService;
 use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig};
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
 use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -97,20 +97,19 @@ impl RagCore {
     /// model name, chunk size, overlap, and ef_construction. Initializes the embedding service, chunker,
     /// syntax chunker, and sets up the necessary vector database.
     pub async fn new(
-        db_path: &str,
-        cache_dir: &str,
+        db_path: &Path,
+        cache_dir: &Path,
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
         ef_construction: usize,
     ) -> Result<Self> {
-        let embedding = EmbeddingService::new(model_name, cache_dir)?;
+        let embedding = EmbeddingService::new(model_name, &cache_dir.to_string_lossy())?;
         let ndims = embedding.dimensions();
 
         // Ensure db_path points to a directory and create db files inside it
-        let db_dir = Path::new(db_path);
-        tokio::fs::create_dir_all(db_dir).await?;
-        let db_file_path = db_dir.join("db");
+        tokio::fs::create_dir_all(db_path).await?;
+        let db_file_path = db_path.join("db");
 
         // Create vector database for chunks and metadata
         let vectors_cfg = VectorDbConfig::new(ndims)
@@ -150,19 +149,46 @@ impl RagCore {
         })
     }
 
-    /// Computes the SHA-256 hash of the contents of the specified file asynchronously.
-    async fn compute_file_hash(path: &Path) -> Result<String> {
-        let bytes = tokio::fs::read(path).await?;
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        Ok(hex::encode(hasher.finalize()))
-    }
-
     /// Computes the SHA-256 hash of the given text synchronously.
     fn compute_text_hash(text: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    /// Reads a file once and returns both its content hash and text extraction.
+    /// This avoids TOCTOU races between hashing and extraction.
+    async fn read_file_for_indexing(path: &Path) -> Result<(String, String)> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+
+        let content_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hex::encode(hasher.finalize())
+        };
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let text = match ext.as_str() {
+            "pdf" => docs::extract_text(path).await?,
+            "docx" | "xlsx" | "pptx" => docs::extract_text(path).await?,
+            _ => {
+                // For text files, use the already-read bytes
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    text.to_string()
+                } else {
+                    docs::extract_text(path).await?
+                }
+            }
+        };
+
+        Ok((content_hash, text))
     }
 
     /// Indexes the specified file by extracting its text, chunking it, and storing the chunks and metadata in the database.
@@ -173,7 +199,8 @@ impl RagCore {
             .to_string_lossy()
             .to_string();
 
-        let content_hash = Self::compute_file_hash(path).await?;
+        // Read file once to avoid TOCTOU between hash check and text extraction
+        let (content_hash, text) = Self::read_file_for_indexing(path).await?;
 
         if let Some(status) = self.document_status(&source_path).await? {
             if status.content_hash == content_hash {
@@ -181,8 +208,6 @@ impl RagCore {
             }
             self.delete_source(&source_path).await?;
         }
-
-        let text = docs::extract_text(path).await?;
 
         let ext = path
             .extension()

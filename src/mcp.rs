@@ -64,8 +64,8 @@ pub struct RagServer {
 
 impl RagServer {
     pub async fn new(
-        db_path: &str,
-        cache_path: &str,
+        db_path: &std::path::Path,
+        cache_path: &std::path::Path,
         model_name: &str,
         chunk_size: usize,
         overlap: usize,
