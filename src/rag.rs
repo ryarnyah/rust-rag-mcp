@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing;
 
 /// P3: Metadata index for O(1) source lookups
 /// Maps source path to vector IDs, avoiding full table scans

@@ -45,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing;
 
 use crate::wal::{WalOpType, WalRecord, WriteAheadLog};
 
@@ -234,11 +233,18 @@ impl Config {
 ///
 /// Automatically uses SIMD instructions (AVX2/AVX-512) when available.
 /// Falls back to scalar on unsupported platforms.
+///
+/// # Panics
+/// Panics if `a.len() != b.len()`.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "vector dimension mismatch in dot product: {} vs {}",
+        a.len(),
+        b.len()
+    );
 
     // Use ndarray for automatic SIMD vectorization
     let a_arr = ArrayView1::from(a);
@@ -2151,13 +2157,11 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "vector dimension mismatch")]
     fn test_cosine_distance_mismatched_lengths() {
         let a = vec![1.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        // dot returns 0.0 for mismatched lengths, so distance = 1.0 - 0/(norm_a * norm_b)
-        // but norms use the full slice, so result may vary. Just check it's finite.
-        let dist = cosine_distance(&a, &b);
-        assert!(dist.is_ok());
+        cosine_distance(&a, &b).unwrap();
     }
 
     #[test]

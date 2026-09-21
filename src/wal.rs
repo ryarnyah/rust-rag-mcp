@@ -132,8 +132,18 @@ impl WalRecord {
         let metadata_len = u32::from_le_bytes(data[26..30].try_into().unwrap()) as usize;
         let expected_crc = u32::from_le_bytes(data[30..34].try_into().unwrap());
 
-        let vector_bytes = vector_len * 4;
-        let payload_len = vector_bytes + metadata_len;
+        let vector_bytes = vector_len.checked_mul(4).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Vector length overflow in WAL record",
+            )
+        })?;
+        let payload_len = vector_bytes.checked_add(metadata_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Payload length overflow in WAL record",
+            )
+        })?;
         let total = RECORD_HEADER_LEN + payload_len + FOOTER_LEN;
 
         if data.len() < total {
@@ -425,9 +435,13 @@ impl WriteAheadLog {
 
     pub async fn shutdown(&self) -> io::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        let _ = self.tx.send(WalMessage::Shutdown { ack: ack_tx }).await;
-        let _ = ack_rx.await;
-        Ok(())
+        self.tx
+            .send(WalMessage::Shutdown { ack: ack_tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
+        ack_rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
     }
 
     // -- Recovery ------------------------------------------------------------

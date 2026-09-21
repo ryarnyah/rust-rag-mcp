@@ -283,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", source);
                 }
             }
+            core.close().await?;
         }
 
         Commands::Stats {

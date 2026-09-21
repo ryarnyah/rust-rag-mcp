@@ -17,6 +17,10 @@ impl Default for Chunker {
 
 impl Chunker {
     pub fn new(max_chunk_size: usize, overlap: usize) -> Self {
+        assert!(
+            overlap < max_chunk_size,
+            "overlap ({overlap}) must be less than chunk_size ({max_chunk_size})"
+        );
         Self {
             max_chunk_size,
             overlap,

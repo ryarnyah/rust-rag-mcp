@@ -1,10 +1,11 @@
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::DocumentChunk;
 
 pub struct EmbeddingService {
-    model: Mutex<TextEmbedding>,
+    model: Arc<Mutex<TextEmbedding>>,
     model_name: String,
     dimensions: usize,
 }
@@ -100,7 +101,7 @@ impl EmbeddingService {
         };
 
         Ok(Self {
-            model: Mutex::new(model),
+            model: Arc::new(Mutex::new(model)),
             model_name: model_name.to_string(),
             dimensions,
         })
@@ -112,10 +113,6 @@ impl EmbeddingService {
 
     pub fn model_name(&self) -> &str {
         &self.model_name
-    }
-
-    pub fn get_model(&self) -> &Mutex<TextEmbedding> {
-        &self.model
     }
 
     pub fn list_models() -> Vec<String> {
@@ -173,9 +170,15 @@ impl EmbeddingService {
     }
 
     pub async fn embed_chunks(&self, chunks: &[DocumentChunk]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        let model = self.model.clone();
 
-        let embeddings_data = self.model.lock().await.embed(texts, None)?;
+        let embeddings_data = tokio::task::spawn_blocking(move || {
+            let mut guard = model.blocking_lock();
+            guard.embed(texts, None)
+        })
+        .await??;
+
         Ok(embeddings_data)
     }
 }

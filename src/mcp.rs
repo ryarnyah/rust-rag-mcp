@@ -252,8 +252,7 @@ impl RagServer {
     #[tool(description = "\
         Search the RAG knowledge base using semantic similarity. \
         Query is embedded and compared against stored chunks via cosine similarity. \
-        Results ranked by score (0.0-1.0) with matching text, source, chunk index, and score. \
-        Use source_filter to restrict to a specific document.")]
+        Results ranked by score (0.0-1.0) with matching text, source, chunk index, and score.")]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
