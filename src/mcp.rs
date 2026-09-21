@@ -4,12 +4,58 @@ use crate::rag::RagCore;
 use crate::schemar_ext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, NumberOrString, ProgressNotificationParam, ProgressToken,
+    CallToolResult, ContentBlock, ErrorData, NumberOrString, ProgressNotificationParam,
+    ProgressToken,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[derive(Debug, serde::Serialize)]
+struct IndexPathResponse {
+    status: &'static str,
+    indexed: usize,
+    skipped: usize,
+    details: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IndexTextResponse {
+    status: &'static str,
+    source: String,
+    chunks: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SearchResponse {
+    count: usize,
+    results: Vec<SearchResultItem>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SearchResultItem {
+    rank: usize,
+    score: f64,
+    source: String,
+    chunk_index: u32,
+    text: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DeleteSourceResponse {
+    status: &'static str,
+    source: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DocumentStatusResponse {
+    found: bool,
+    source: String,
+    content_hash: Option<String>,
+    indexed_at: Option<u64>,
+    chunk_count: Option<u32>,
+}
 
 #[derive(Clone)]
 pub struct RagServer {
@@ -94,10 +140,10 @@ impl RagServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let path = std::path::Path::new(&req.path);
         if !path.exists() {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Path not found: {}",
-                req.path
-            ))]));
+            return Err(ErrorData::invalid_params(
+                format!("Path not found: {}", req.path),
+                None,
+            ));
         }
 
         let progress_token = ctx
@@ -149,15 +195,13 @@ impl RagServer {
             }
         }
 
-        let mut output = format!(
-            "Done. Indexed: {}, Skipped (unchanged): {}",
-            indexed, skipped
-        );
-        if !errors.is_empty() {
-            output.push('\n');
-            output.push_str(&errors.join("\n"));
-        }
-        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+        let resp = IndexPathResponse {
+            status: "ok",
+            indexed,
+            skipped,
+            details: errors,
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
     }
 
     #[tool(description = "\
@@ -175,21 +219,25 @@ impl RagServer {
         };
         match result {
             Ok(IndexResult::Indexed(count)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Indexed '{}' — {} chunks created",
-                    req.source, count
-                ))]))
+                let resp = IndexTextResponse {
+                    status: "indexed",
+                    source: req.source,
+                    chunks: Some(count),
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
             }
             Ok(IndexResult::Skipped) => {
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Skipped '{}' — content unchanged since last index",
-                    req.source
-                ))]))
+                let resp = IndexTextResponse {
+                    status: "skipped",
+                    source: req.source,
+                    chunks: None,
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error indexing text '{}': {}",
-                req.source, e
-            ))])),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("Error indexing text '{}': {}", req.source, e),
+                None,
+            )),
         }
     }
 
@@ -209,78 +257,27 @@ impl RagServer {
         };
         match result {
             Ok(results) => {
-                if results.is_empty() {
-                    Ok(CallToolResult::success(vec![ContentBlock::text(
-                        "No results found.".to_string(),
-                    )]))
-                } else {
-                    let mut output = String::new();
-                    for (i, result) in results.iter().enumerate() {
-                        output.push_str(&format!(
-                            "[{}] (score: {:.4}) [{}:{}] {}\n\n",
-                            i + 1,
-                            result.score,
-                            result.chunk.source,
-                            result.chunk.chunk_index,
-                            result.chunk.text,
-                        ));
-                    }
-                    Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
-                }
+                let items: Vec<SearchResultItem> = results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| SearchResultItem {
+                        rank: i + 1,
+                        score: r.score,
+                        source: r.chunk.source.clone(),
+                        chunk_index: r.chunk.chunk_index,
+                        text: r.chunk.text.clone(),
+                    })
+                    .collect();
+                let resp = SearchResponse {
+                    count: items.len(),
+                    results: items,
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error searching: {}",
-                e
-            ))])),
-        }
-    }
-
-    #[tool(description = "\
-        List all indexed source documents. \
-        Returns one full source path per line (file paths or logical names). \
-        Use to see available documents for search or get source paths for document_status/delete_source.")]
-    async fn list_sources(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = {
-            let core = self.core.read().await;
-            core.list_sources().await
-        };
-        match result {
-            Ok(sources) => {
-                if sources.is_empty() {
-                    Ok(CallToolResult::success(vec![ContentBlock::text(
-                        "No sources indexed.".to_string(),
-                    )]))
-                } else {
-                    Ok(CallToolResult::success(vec![ContentBlock::text(
-                        sources.join("\n"),
-                    )]))
-                }
-            }
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error listing sources: {}",
-                e
-            ))])),
-        }
-    }
-
-    #[tool(description = "\
-        Get total number of indexed chunks across all documents. \
-        Each document is split into multiple chunks during indexing. \
-        This count reflects total searchable units in the knowledge base.")]
-    async fn chunk_count(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = {
-            let core = self.core.read().await;
-            core.chunk_count().await
-        };
-        match result {
-            Ok(count) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "{}",
-                count
-            ))])),
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error getting chunk count: {}",
-                e
-            ))])),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("Error searching: {}", e),
+                None,
+            )),
         }
     }
 
@@ -297,14 +294,17 @@ impl RagServer {
             core.delete_source(&req.source_path).await
         };
         match result {
-            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Deleted all chunks and metadata for '{}'",
-                req.source_path
-            ))])),
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error deleting source '{}': {}",
-                req.source_path, e
-            ))])),
+            Ok(()) => {
+                let resp = DeleteSourceResponse {
+                    status: "deleted",
+                    source: req.source_path,
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+            }
+            Err(e) => Err(ErrorData::internal_error(
+                format!("Error deleting source '{}': {}", req.source_path, e),
+                None,
+            )),
         }
     }
 
@@ -322,18 +322,30 @@ impl RagServer {
             core.document_status(&req.source_path).await
         };
         match result {
-            Ok(Some(status)) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Source: {}\nContent hash: {}\nIndexed at: {}\nChunks: {}",
-                status.source_path, status.content_hash, status.indexed_at, status.chunk_count
-            ))])),
-            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "'{}' has not been indexed",
-                req.source_path
-            ))])),
-            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Error checking status for '{}': {}",
-                req.source_path, e
-            ))])),
+            Ok(Some(status)) => {
+                let resp = DocumentStatusResponse {
+                    found: true,
+                    source: status.source_path,
+                    content_hash: Some(status.content_hash),
+                    indexed_at: Some(status.indexed_at),
+                    chunk_count: Some(status.chunk_count),
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+            }
+            Ok(None) => {
+                let resp = DocumentStatusResponse {
+                    found: false,
+                    source: req.source_path,
+                    content_hash: None,
+                    indexed_at: None,
+                    chunk_count: None,
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+            }
+            Err(e) => Err(ErrorData::internal_error(
+                format!("Error checking status for '{}': {}", req.source_path, e),
+                None,
+            )),
         }
     }
 }
