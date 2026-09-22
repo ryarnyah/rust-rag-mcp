@@ -157,10 +157,10 @@ fn parse_and_chunk(
                         // AST decomposition would produce meaningless leaf tokens.
                         // Instead, split the child's text range by word count,
                         // prefixed with the parent's header as context.
-                        let child_text = &text[child.start_byte()..child.end_byte()];
                         let sub_chunks = split_by_words(
-                            child_text,
+                            text,
                             child.start_byte(),
+                            child.end_byte(),
                             source,
                             max_chunk_size,
                             overlap,
@@ -319,16 +319,19 @@ fn merge_small_chunks(chunks: &mut Vec<DocumentChunk>, text: &str, max_chunk_siz
 
 /// Split a text range into word-count-based chunks, with optional context prefix.
 /// Used when AST decomposition would produce meaningless leaf tokens.
+#[allow(clippy::too_many_arguments)]
 fn split_by_words(
     text: &str,
     base_offset: usize,
+    end_offset: usize,
     source: &str,
     max_chunk_size: usize,
     overlap: usize,
     ctx: Option<(usize, usize)>,
     prev_end: usize,
 ) -> Vec<DocumentChunk> {
-    let words: Vec<&str> = text.split_whitespace().collect();
+    let slice = &text[base_offset..end_offset];
+    let words: Vec<&str> = slice.split_whitespace().collect();
     if words.is_empty() {
         return Vec::new();
     }
@@ -339,25 +342,26 @@ fn split_by_words(
     while start_word < words.len() {
         let end_word = (start_word + max_chunk_size).min(words.len());
 
-        // Find byte offsets within the original source text for this word range
+        // Find byte offsets within the slice for this word range
         let mut byte_pos = 0;
         for w in &words[..start_word] {
             byte_pos += w.len();
-            while byte_pos < text.len() && text.as_bytes()[byte_pos].is_ascii_whitespace() {
+            while byte_pos < slice.len() && slice.as_bytes()[byte_pos].is_ascii_whitespace() {
                 byte_pos += 1;
             }
         }
-        let chunk_text_start = base_offset + byte_pos;
 
         let mut word_end_pos = byte_pos;
         for w in &words[start_word..end_word] {
             word_end_pos += w.len();
-            while word_end_pos < text.len()
-                && text.as_bytes()[word_end_pos].is_ascii_whitespace()
+            while word_end_pos < slice.len()
+                && slice.as_bytes()[word_end_pos].is_ascii_whitespace()
             {
                 word_end_pos += 1;
             }
         }
+
+        let chunk_text_start = base_offset + byte_pos;
         let chunk_text_end = base_offset + word_end_pos;
 
         let chunk_start = ctx
@@ -1360,5 +1364,86 @@ fn second() {
             overlap_words,
             prefix_word_count
         );
+    }
+
+    #[test]
+    fn test_rust_file_with_many_imports_no_crash() {
+        // Reproduces a crash where split_by_words overshot past the child
+        // node's end boundary when processing non-top-level oversized nodes.
+        // The source_file is oversized, its children (use statements) are
+        // also oversized with max_chunk_size=3, triggering the word-split path.
+        let code = r#"
+use crate::IndexResult;
+use crate::docs;
+use crate::rag::RagCore;
+use crate::schemar_ext;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorData, NumberOrString, ProgressNotificationParam,
+};
+
+pub struct RagServer;
+"#;
+        let chunker = SyntaxChunker::new(3, 1);
+        let chunks = chunker.chunk_text(code, "mcp.rs");
+        assert!(!chunks.is_empty(), "Should produce chunks");
+        for chunk in &chunks {
+            assert!(
+                chunk.start_offset <= chunk.end_offset,
+                "Invalid range: start={} end={}",
+                chunk.start_offset,
+                chunk.end_offset
+            );
+            assert!(
+                chunk.end_offset <= code.len(),
+                "end_offset {} exceeds text length {}",
+                chunk.end_offset,
+                code.len()
+            );
+            assert_eq!(
+                &code[chunk.start_offset..chunk.end_offset],
+                chunk.text,
+                "Chunk text doesn't match source"
+            );
+        }
+    }
+
+    #[test]
+    fn test_large_java_file_no_crash() {
+        // A realistic Java file with many imports and a large class body
+        // that forces the non-top-level oversized split path.
+        let imports: String = (0..50)
+            .map(|i| format!("import com.example.package{i}.Class{i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let methods: String = (0..30)
+            .map(|i| {
+                format!(
+                    "    public void method_{i}(int a, int b) {{\n        int result = a + b + {i};\n        System.out.println(result);\n    }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let code = format!("package com.example;\n\n{imports}\n\npublic class LargeClass {{\n{methods}\n}}");
+
+        let chunker = SyntaxChunker::new(10, 2);
+        let chunks = chunker.chunk_text(&code, "LargeClass.java");
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                chunk.start_offset <= chunk.end_offset,
+                "Invalid range: start={} end={}",
+                chunk.start_offset,
+                chunk.end_offset
+            );
+            assert!(
+                chunk.end_offset <= code.len(),
+                "end_offset {} exceeds text length {}",
+                chunk.end_offset,
+                code.len()
+            );
+        }
+        // Should have multiple chunks for 30 methods
+        assert!(chunks.len() > 5, "Should produce many chunks, got {}", chunks.len());
     }
 }
