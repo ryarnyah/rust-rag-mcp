@@ -1127,3 +1127,57 @@ async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata(
     cleanup("test_wal_meta_missing.db");
     Ok(())
 }
+
+// Regression: compact() used to leave VectorDb pointing at the shut-down WAL
+// writer and a dummy lock handle, so inserts failed and no advisory lock was
+// held after compaction. It must also discard stale pre-compaction WAL records
+// so they are not replayed into the renumbered data on re-open.
+#[tokio::test]
+async fn test_insert_works_after_compact() -> Result<()> {
+    cleanup("test_compact_wal.db");
+
+    {
+        let cfg = Config::new(4).with_capacity(64);
+        let mut db = VectorDb::open("test_compact_wal.db", cfg).await?;
+
+        for i in 0..10 {
+            db.insert(&[i as f32, 1.0, 0.0, 0.5], None)?; // distinct non-zero vectors
+        }
+        // Delete 4 of 10 => 40% > 30% compaction threshold.
+        for id in 0..4 {
+            db.delete(id)?;
+        }
+        assert!(db.should_compact(), "should trigger compaction");
+        db.flush().await?;
+
+        db.compact().await?;
+
+        // The WAL must still be functional after compaction.
+        let before = db.len();
+        assert_eq!(before, 6, "compaction should leave 6 live vectors");
+        assert_eq!(db.deleted_count(), 0, "compaction resets deleted_count");
+        let new_id = db.insert(&[100.0; 4], Some(b"post-compact"))?;
+        assert_eq!(new_id as usize, before, "insert should append after compaction");
+        assert_eq!(db.live_len(), before + 1, "6 live + 1 new = 7");
+        db.flush().await?;
+        db.close().await?;
+    }
+
+    // Reopen: the post-compact insert must have been logged and flushed.
+    {
+        let cfg = Config::new(4).with_capacity(64);
+        let db = VectorDb::open("test_compact_wal.db", cfg).await?;
+        assert_eq!(db.live_len(), 7, "expected 6 surviving + 1 post-compact insert");
+        let found = (0..db.len() as u32).any(|id| {
+            db.get_meta(id)
+                .ok()
+                .flatten()
+                .map(|m| m == b"post-compact")
+                .unwrap_or(false)
+        });
+        assert!(found, "post-compact insert metadata should be present after reopen");
+    }
+
+    cleanup("test_compact_wal.db");
+    Ok(())
+}

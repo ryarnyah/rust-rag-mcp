@@ -1534,9 +1534,13 @@ impl VectorDb {
 
         tracing::info!("WAL recovery: recovered {} records", recovered_count);
 
-        if recovered_count > 0 {
-            self.flush().await?;
-        }
+        // Always checkpoint + clear once a non-empty WAL has been replayed (we
+        // only reach here when the WAL contained records, thanks to the early
+        // return above). Even if every record was idempotently skipped, leaving
+        // them in the file would let their stale LSNs collide with future writes:
+        // `header.current_lsn` is only refreshed at checkpoint/truncate time and
+        // can lag the records actually present in the file.
+        self.flush().await?;
 
         Ok(())
     }
@@ -2058,9 +2062,11 @@ impl VectorDb {
         let tmp_hnsw = hnsw_path(&tmp_vec);
         let tmp_meta = meta_path(&tmp_vec);
 
+        let tmp_wal = with_suffix(&tmp_vec, ".wal");
         let _ = tokio::fs::remove_file(&tmp_vec).await;
         let _ = tokio::fs::remove_file(&tmp_hnsw).await;
         let _ = tokio::fs::remove_file(&tmp_meta).await;
+        let _ = tokio::fs::remove_file(&tmp_wal).await;
 
         let live = self.live_len().max(1);
         let tmp_cfg = Config {
@@ -2082,18 +2088,14 @@ impl VectorDb {
             fresh.flush().await?;
         }
 
+        // The temp DB's WAL only ever held its checkpoint header (insert_raw
+        // bypasses WAL logging), and its data has been flushed. Remove it so
+        // compaction doesn't leave a stray temp WAL file behind.
+        let _ = tokio::fs::remove_file(&tmp_wal).await;
+
         // Unmap before renaming
         self.mmap = None;
         self.index.mmap = None;
-
-        // Shut down old WAL writer before re-opening
-        self.wal.shutdown().await.map_err(VectorDbError::Io)?;
-
-        // Release the advisory lock before re-opening the same path.
-        // Replace with a harmless dummy file handle so the old lock is dropped.
-        let dummy_lock = open_null_file().map_err(VectorDbError::Io)?;
-        let _old_lock = std::mem::replace(&mut self._lock_file, dummy_lock);
-        drop(_old_lock);
 
         tokio::fs::rename(&tmp_vec, &self.path)
             .await
@@ -2105,11 +2107,32 @@ impl VectorDb {
             .await
             .map_err(VectorDbError::Io)?;
 
+        // The compacted data files are complete and flushed, so every pending WAL
+        // record is now both redundant and stale (their vector IDs predate the
+        // compaction renumbering). Truncate the WAL *after* the rename succeeds so
+        // a mid-compact failure still leaves the original WAL intact, and so
+        // re-opening cannot replay pre-compaction records into the new files.
+        self.wal.clear().await.map_err(VectorDbError::Io)?;
+
+        // Shut down old WAL writer before re-opening (releases the .wal lock).
+        self.wal.shutdown().await.map_err(VectorDbError::Io)?;
+
+        // Release the advisory lock before re-opening the same path.
+        // Replace with a harmless dummy file handle so the old lock is dropped.
+        let dummy_lock = open_null_file().map_err(VectorDbError::Io)?;
+        let _old_lock = std::mem::replace(&mut self._lock_file, dummy_lock);
+        drop(_old_lock);
+
         let reopened = VectorDb::open(&self.path, self.cfg).await?;
         self.file = reopened.file;
         self.mmap = reopened.mmap;
         self.index = reopened.index;
         self.meta = reopened.meta;
+        // Adopt the re-opened DB's live WAL writer and held lock. Keeping the old
+        // (shut-down) writer or the dummy handle here would leave the database
+        // without a working WAL or an advisory lock after compaction.
+        self.wal = reopened.wal;
+        self._lock_file = reopened._lock_file;
         self.deleted_count = 0;
         Ok(())
     }

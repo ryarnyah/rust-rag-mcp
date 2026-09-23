@@ -7,10 +7,12 @@ use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 // ---------------------------------------------------------------------------
 // LSN
@@ -186,8 +188,32 @@ impl WalRecord {
 // Messages to writer
 // ---------------------------------------------------------------------------
 
+/// Acknowledgement channel for a single record write.
+///
+/// The synchronous log API blocks on a std channel; the async API awaits a
+/// tokio oneshot. Both are signalled by the writer thread once the record has
+/// actually been written to the WAL file, which is what upholds the
+/// LOG-BEFORE-APPLY guarantee.
+enum RecordAck {
+    Blocking(std_mpsc::Sender<io::Result<Lsn>>),
+    Async(oneshot::Sender<io::Result<Lsn>>),
+}
+
+impl RecordAck {
+    fn send(self, result: io::Result<Lsn>) {
+        match self {
+            RecordAck::Blocking(s) => {
+                let _ = s.send(result);
+            }
+            RecordAck::Async(s) => {
+                let _ = s.send(result);
+            }
+        }
+    }
+}
+
 enum WalMessage {
-    Record(WalRecord),
+    Record(WalRecord, RecordAck),
     Checkpoint {
         generation: u64,
         ack: oneshot::Sender<io::Result<()>>,
@@ -253,8 +279,9 @@ impl WalHeader {
 pub struct WriteAheadLog {
     next_lsn: Arc<AtomicU64>,
     last_written_lsn: Arc<AtomicU64>,
-    tx: mpsc::Sender<WalMessage>,
+    tx: std_mpsc::Sender<WalMessage>,
     checkpoint_generation: Arc<AtomicU64>,
+    writer_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl WriteAheadLog {
@@ -297,13 +324,14 @@ impl WriteAheadLog {
         let next_segment_id = Self::find_max_segment_id(db_path);
         let db_path_prefix = db_path.to_string_lossy().to_string();
 
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = std_mpsc::channel();
 
         let writer = WalWriter {
             file,
             wal_path,
             db_path_prefix,
             last_written_lsn: last_written_lsn.clone(),
+            next_lsn: next_lsn.clone(),
             last_checkpoint_lsn: Arc::new(AtomicU64::new(header.last_checkpoint_lsn)),
             last_checkpoint_generation: Arc::new(AtomicU64::new(header.last_checkpoint_generation)),
             current_generation: header.last_checkpoint_generation,
@@ -316,17 +344,17 @@ impl WriteAheadLog {
             write_buf: Vec::with_capacity(4096),
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = writer.run().await {
-                tracing::error!("WAL writer: {}", e);
-            }
-        });
+        // Run the writer on a dedicated OS thread. This lets synchronous log
+        // calls block on an acknowledgement without stalling (or dead-locking)
+        // the tokio runtime, and lets Drop join the thread to guarantee a flush.
+        let writer_thread = thread::spawn(move || writer.run());
 
         Ok(WriteAheadLog {
             next_lsn,
             last_written_lsn,
             tx,
             checkpoint_generation: Arc::new(AtomicU64::new(header.last_checkpoint_generation)),
+            writer_thread: Mutex::new(Some(writer_thread)),
         })
     }
 
@@ -348,39 +376,50 @@ impl WriteAheadLog {
         }
     }
 
-    fn try_log(&self, record: WalRecord) -> io::Result<Lsn> {
-        let lsn = record.lsn;
+    fn send_record(&self, record: WalRecord, ack: RecordAck) -> io::Result<()> {
         self.tx
-            .try_send(WalMessage::Record(record))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "WAL channel full")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down")
-                }
-            })?;
-        Ok(lsn)
+            .send(WalMessage::Record(record, ack))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))
     }
 
-    async fn async_log(&self, record: WalRecord) -> io::Result<Lsn> {
-        let lsn = record.lsn;
-        self.tx
-            .send(WalMessage::Record(record))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
-        Ok(lsn)
+    /// Queue a record and block until the writer thread has written it to the
+    /// WAL file. This upholds LOG-BEFORE-APPLY: the caller only mutates the data
+    /// files once the log entry is on disk (in the OS page cache), so a process
+    /// crash cannot lose the log entry while keeping the applied change.
+    fn log_blocking(&self, record: WalRecord) -> io::Result<Lsn> {
+        let (ack_tx, ack_rx) = std_mpsc::channel();
+        self.send_record(record, RecordAck::Blocking(ack_tx))?;
+        match ack_rx.recv() {
+            Ok(inner) => inner,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WAL writer shut down",
+            )),
+        }
+    }
+
+    /// Queue a record and await the writer thread's acknowledgement.
+    async fn log_async(&self, record: WalRecord) -> io::Result<Lsn> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.send_record(record, RecordAck::Async(ack_tx))?;
+        match ack_rx.await {
+            Ok(inner) => inner,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WAL writer shut down",
+            )),
+        }
     }
 
     // Sync variants (used by VectorDb which is not async)
     pub fn log_insert(&self, id: u32, vector: &[f32], metadata: &[u8]) -> io::Result<Lsn> {
-        self.try_log(self.make_record(WalOpType::Insert, id, vector, metadata))
+        self.log_blocking(self.make_record(WalOpType::Insert, id, vector, metadata))
     }
     pub fn log_delete(&self, id: u32, metadata: &[u8]) -> io::Result<Lsn> {
-        self.try_log(self.make_record(WalOpType::Delete, id, &[], metadata))
+        self.log_blocking(self.make_record(WalOpType::Delete, id, &[], metadata))
     }
     pub fn log_update(&self, id: u32, vector: &[f32], metadata: &[u8]) -> io::Result<Lsn> {
-        self.try_log(self.make_record(WalOpType::Update, id, vector, metadata))
+        self.log_blocking(self.make_record(WalOpType::Update, id, vector, metadata))
     }
 
     // Async variants
@@ -390,11 +429,11 @@ impl WriteAheadLog {
         vector: &[f32],
         metadata: &[u8],
     ) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Insert, id, vector, metadata))
+        self.log_async(self.make_record(WalOpType::Insert, id, vector, metadata))
             .await
     }
     pub async fn log_delete_async(&self, id: u32, metadata: &[u8]) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Delete, id, &[], metadata))
+        self.log_async(self.make_record(WalOpType::Delete, id, &[], metadata))
             .await
     }
     pub async fn log_update_async(
@@ -403,7 +442,7 @@ impl WriteAheadLog {
         vector: &[f32],
         metadata: &[u8],
     ) -> io::Result<Lsn> {
-        self.async_log(self.make_record(WalOpType::Update, id, vector, metadata))
+        self.log_async(self.make_record(WalOpType::Update, id, vector, metadata))
             .await
     }
 
@@ -415,7 +454,6 @@ impl WriteAheadLog {
                 generation: r#gen,
                 ack: ack_tx,
             })
-            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
         ack_rx
             .await
@@ -426,7 +464,6 @@ impl WriteAheadLog {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(WalMessage::Truncate { ack: ack_tx })
-            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
         ack_rx
             .await
@@ -437,11 +474,21 @@ impl WriteAheadLog {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(WalMessage::Shutdown { ack: ack_tx })
-            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer shut down"))?;
-        ack_rx
+        let result = ack_rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ack dropped"))?;
+        // Wait for the writer thread to exit so the WAL is fully flushed and the
+        // file lock released before returning.
+        self.join_writer();
+        result
+    }
+
+    /// Block until the writer thread has exited (no-op if it already has).
+    fn join_writer(&self) {
+        if let Some(handle) = self.writer_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 
     // -- Recovery ------------------------------------------------------------
@@ -560,9 +607,11 @@ impl WriteAheadLog {
 
 impl Drop for WriteAheadLog {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(WalMessage::Shutdown {
-            ack: oneshot::channel().0,
-        });
+        // Signal the writer to flush and exit, then join it so the WAL is durable
+        // even if the caller never invoked shutdown().
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let _ = self.tx.send(WalMessage::Shutdown { ack: ack_tx });
+        self.join_writer();
     }
 }
 
@@ -575,10 +624,11 @@ struct WalWriter {
     wal_path: PathBuf,
     db_path_prefix: String,
     last_written_lsn: Arc<AtomicU64>,
+    next_lsn: Arc<AtomicU64>,
     last_checkpoint_lsn: Arc<AtomicU64>,
     last_checkpoint_generation: Arc<AtomicU64>,
     current_generation: u64,
-    rx: mpsc::Receiver<WalMessage>,
+    rx: std_mpsc::Receiver<WalMessage>,
     max_wal_segment_size: u64,
     max_total_wal_size: u64,
     max_wal_segments: u32,
@@ -588,10 +638,22 @@ struct WalWriter {
 }
 
 impl WalWriter {
-    async fn run(mut self) -> io::Result<()> {
-        while let Some(msg) = self.rx.recv().await {
+    fn run(mut self) {
+        while let Ok(msg) = self.rx.recv() {
             match msg {
-                WalMessage::Record(rec) => self.write_record(&rec)?,
+                WalMessage::Record(rec, ack) => {
+                    let lsn = rec.lsn;
+                    match self.write_record(&rec) {
+                        Ok(()) => ack.send(Ok(lsn)),
+                        Err(e) => {
+                            // Report the failure to this caller and keep the writer
+                            // alive: exiting here would silently drop every record
+                            // already queued behind this one.
+                            tracing::error!("WAL write failed: {}", e);
+                            ack.send(Err(e));
+                        }
+                    }
+                }
                 WalMessage::Checkpoint { generation, ack } => {
                     let _ = ack.send(self.do_checkpoint(generation));
                 }
@@ -603,7 +665,7 @@ impl WalWriter {
                     let _ = self.file.flush();
                     let _ = self.file.sync_all();
                     let _ = ack.send(Ok(()));
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -611,15 +673,19 @@ impl WalWriter {
         self.drain();
         let _ = self.file.flush();
         let _ = self.file.sync_all();
-        Ok(())
     }
 
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WalMessage::Record(rec) => {
-                    if let Err(e) = self.write_record(&rec) {
-                        tracing::error!("WAL drain write failed: {}", e);
+                WalMessage::Record(rec, ack) => {
+                    let lsn = rec.lsn;
+                    match self.write_record(&rec) {
+                        Ok(()) => ack.send(Ok(lsn)),
+                        Err(e) => {
+                            tracing::error!("WAL drain write failed: {}", e);
+                            ack.send(Err(e));
+                        }
                     }
                 }
                 WalMessage::Checkpoint { generation, ack } => {
@@ -682,6 +748,11 @@ impl WalWriter {
         self.last_checkpoint_generation
             .store(generation, Ordering::Relaxed);
 
+        // The checkpoint record occupies LSN `lsn`; advance the counter so the
+        // next data record cannot reuse it (e.g. if clear() fails and the
+        // checkpoint record remains in the file).
+        self.next_lsn.fetch_max(lsn.0 + 1, Ordering::Relaxed);
+
         if self.max_total_wal_size > 0 {
             self.cleanup();
         }
@@ -727,6 +798,12 @@ impl WalWriter {
             .write(true)
             .open(&self.wal_path)?;
         self.file = new_file;
+        // The exclusive lock lives on the old file descriptor, which was just
+        // dropped. Re-acquire it on the new active WAL so the lock survives
+        // rotation.
+        if let Err(e) = self.file.try_lock_exclusive() {
+            tracing::warn!("WAL re-lock after rotation failed: {}", e);
+        }
 
         // Write header to new WAL with current checkpoint state
         let hdr = WalHeader {
@@ -754,10 +831,14 @@ impl WalWriter {
             })
             .collect();
 
+        // Track how many segments remain so the count limit is re-evaluated as we
+        // delete. Using the initial `segs.len()` throughout would keep `over_count`
+        // stuck true and delete far more segments than configured.
+        let mut remaining = segs.len() as u32;
+
         for (size, path) in &sizes {
             let over_size = self.max_total_wal_size > 0 && total > self.max_total_wal_size;
-            let over_count =
-                self.max_wal_segments > 0 && (segs.len() as u32) > self.max_wal_segments;
+            let over_count = self.max_wal_segments > 0 && remaining > self.max_wal_segments;
             if !over_size && !over_count {
                 break;
             }
@@ -770,6 +851,7 @@ impl WalWriter {
                 {
                     let _ = fs::remove_file(path);
                     total -= size;
+                    remaining -= 1;
                 }
             }
         }
@@ -964,5 +1046,74 @@ mod tests {
         assert_eq!(WalOpType::from_u8(4).unwrap(), WalOpType::Checkpoint);
         assert!(WalOpType::from_u8(0).is_err());
         assert!(WalOpType::from_u8(5).is_err());
+    }
+
+    fn temp_db_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wal_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("test.db")
+    }
+
+    /// Parse every record in an active WAL file (skipping the 40-byte header).
+    fn read_records(path: &Path) -> Vec<WalRecord> {
+        let data = fs::read(path).unwrap();
+        let mut out = Vec::new();
+        let mut offset = WAL_HEADER_SIZE;
+        while offset < data.len() {
+            match WalRecord::from_bytes(&data[offset..]) {
+                Ok((rec, n)) => {
+                    offset += n;
+                    out.push(rec);
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Regression for "ack at enqueue": the record must already be on disk when
+    /// log_insert returns, not merely queued for a background writer.
+    #[tokio::test]
+    async fn test_record_on_disk_before_log_returns() {
+        let db_path = temp_db_path("durability");
+        let wal = WriteAheadLog::new(&db_path, 0, 0, 0).await.unwrap();
+
+        wal.log_insert(7, &[1.0, 2.0], b"hello").unwrap();
+
+        // Read the WAL back through an independent handle: the record that was
+        // just logged must already be present (LOG-BEFORE-APPLY).
+        let recs = read_records(&WriteAheadLog::wal_path(&db_path));
+        assert_eq!(recs.len(), 1, "record must be written before log_insert returns");
+        assert_eq!(recs[0].vector_id, 7);
+        assert_eq!(recs[0].metadata, b"hello");
+
+        wal.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    /// Regression for the checkpoint LSN collision: a checkpoint record must not
+    /// reuse the LSN of the next data record, even if clear() is never called.
+    #[tokio::test]
+    async fn test_checkpoint_does_not_cause_lsn_reuse() {
+        let db_path = temp_db_path("ckpt_lsn");
+        let wal = WriteAheadLog::new(&db_path, 0, 0, 0).await.unwrap();
+
+        wal.log_insert(1, &[1.0], b"a").unwrap(); // lsn 0
+        wal.checkpoint().await.unwrap(); // checkpoint record, no clear()
+        wal.log_insert(2, &[2.0], b"b").unwrap(); // must NOT reuse the checkpoint LSN
+
+        let lsns: Vec<u64> = read_records(&WriteAheadLog::wal_path(&db_path))
+            .iter()
+            .map(|r| r.lsn.0)
+            .collect();
+        assert!(
+            lsns.windows(2).all(|w| w[1] > w[0]),
+            "LSNs must be strictly increasing (no reuse), got {:?}",
+            lsns
+        );
+
+        wal.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 }
