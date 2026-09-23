@@ -214,7 +214,11 @@ fn parse_and_chunk(
 
     for (i, chunk) in chunks.iter_mut().enumerate() {
         chunk.chunk_index = i as u32;
-        chunk.text = text[chunk.start_offset..chunk.end_offset].to_string();
+        chunk.text = if chunk.start_offset < chunk.end_offset && chunk.end_offset <= text.len() {
+            text[chunk.start_offset..chunk.end_offset].to_string()
+        } else {
+            String::new()
+        };
     }
 
     Ok(chunks)
@@ -295,6 +299,9 @@ fn merge_small_chunks(chunks: &mut Vec<DocumentChunk>, text: &str, max_chunk_siz
     let mut merged: Vec<DocumentChunk> = Vec::new();
 
     for chunk in chunks.drain(..) {
+        if chunk.start_offset >= chunk.end_offset {
+            continue;
+        }
         let word_count = count_words(text, chunk.start_offset, chunk.end_offset);
 
         if let Some(last) = merged.last_mut() {
@@ -330,6 +337,9 @@ fn split_by_words(
     ctx: Option<(usize, usize)>,
     prev_end: usize,
 ) -> Vec<DocumentChunk> {
+    if base_offset >= end_offset || end_offset > text.len() {
+        return Vec::new();
+    }
     let slice = &text[base_offset..end_offset];
     let words: Vec<&str> = slice.split_whitespace().collect();
     if words.is_empty() {
@@ -391,6 +401,9 @@ fn split_by_words(
 /// For a Java class: `public class Foo {` or a method: `public int add(int a, int b) {`
 /// Returns the byte offset just after the first `{` on the header line.
 fn find_header_end(text: &str, start: usize, end: usize) -> usize {
+    if start >= end || start >= text.len() {
+        return end;
+    }
     let slice = &text[start..end.min(text.len())];
     // Find the first '{' which ends the declaration header
     if let Some(pos) = slice.find('{') {
@@ -405,6 +418,9 @@ fn find_header_end(text: &str, start: usize, end: usize) -> usize {
 }
 
 fn count_words(text: &str, start: usize, end: usize) -> usize {
+    if start >= end || start >= text.len() {
+        return 0;
+    }
     let slice = &text[start..end.min(text.len())];
     let mut count = 0;
     let mut in_word = false;
