@@ -260,13 +260,15 @@ fn compute_overlap_range(text: &str, before_byte: usize, overlap: usize) -> Opti
         return None;
     }
 
-    let slice = &text[..before_byte];
     let mut words_found = 0;
     let mut in_word = false;
     let mut last_word_end = before_byte;
+    let mut i = before_byte;
 
-    for (i, ch) in slice.char_indices().rev() {
-        if ch.is_whitespace() {
+    while i > 0 {
+        i -= 1;
+        let ch = text.as_bytes()[i];
+        if ch == b' ' || ch == b'\t' || ch == b'\n' || ch == b'\r' {
             if in_word {
                 words_found += 1;
                 if words_found > overlap {
@@ -276,7 +278,7 @@ fn compute_overlap_range(text: &str, before_byte: usize, overlap: usize) -> Opti
             in_word = false;
         } else {
             if !in_word {
-                last_word_end = i + ch.len_utf8();
+                last_word_end = i + 1;
             }
             in_word = true;
         }
@@ -346,22 +348,25 @@ fn split_by_words(
         return Vec::new();
     }
 
+    // Precompute byte start offset for each word
+    let mut word_starts: Vec<usize> = Vec::with_capacity(words.len());
+    let mut pos = 0;
+    for w in &words {
+        word_starts.push(pos);
+        pos += w.len();
+        while pos < slice.len() && slice.as_bytes()[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+    }
+
     let mut chunks = Vec::new();
     let mut start_word = 0;
 
     while start_word < words.len() {
         let end_word = (start_word + max_chunk_size).min(words.len());
 
-        // Find byte offsets within the slice for this word range
-        let mut byte_pos = 0;
-        for w in &words[..start_word] {
-            byte_pos += w.len();
-            while byte_pos < slice.len() && slice.as_bytes()[byte_pos].is_ascii_whitespace() {
-                byte_pos += 1;
-            }
-        }
-
-        let mut word_end_pos = byte_pos;
+        let byte_pos = word_starts[start_word];
+        let mut word_end_pos = word_starts[start_word];
         for w in &words[start_word..end_word] {
             word_end_pos += w.len();
             while word_end_pos < slice.len()
@@ -421,11 +426,12 @@ fn count_words(text: &str, start: usize, end: usize) -> usize {
     if start >= end || start >= text.len() {
         return 0;
     }
-    let slice = &text[start..end.min(text.len())];
+    let end = end.min(text.len());
+    let slice = &text.as_bytes()[start..end];
     let mut count = 0;
     let mut in_word = false;
-    for ch in slice.chars() {
-        if ch.is_whitespace() {
+    for &b in slice {
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
             in_word = false;
         } else if !in_word {
             in_word = true;
