@@ -270,40 +270,40 @@ impl RagCore {
         const BATCH_SIZE: usize = 64;
 
         for batch in chunks.chunks(BATCH_SIZE) {
-            let embeddings_result = self.embedding.embed_chunks(batch).await?;
-
-            if embeddings_result.len() != batch.len() {
-                tracing::warn!(
-                    expected = batch.len(),
-                    got = embeddings_result.len(),
-                    "Embedding count mismatch — some chunks will be skipped"
-                );
-            }
-
-            for (chunk, embedding) in batch.iter().zip(embeddings_result.iter()) {
-                let chunk_meta = ChunkMetadata {
-                    id: chunk.id.clone(),
-                    text: chunk.text.clone(),
-                    source: chunk.source.clone(),
-                    chunk_index: chunk.chunk_index,
-                    start_offset: chunk.start_offset as u64,
-                    end_offset: chunk.end_offset as u64,
-                };
-                let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
-
-                let vec_id = self
-                    .vectors_db
-                    .insert(embedding, Some(&metadata_bytes))
-                    .await?;
-
-                self.metadata_index
-                    .add_chunk(chunk.source.clone(), vec_id)
-                    .await;
-            }
+            let embeddings = self.embedding.embed_chunks(batch).await?;
+            self.insert_batch(batch, &embeddings).await?;
         }
 
         self.vectors_db.flush().await?;
 
+        Ok(())
+    }
+
+    async fn insert_batch(
+        &self,
+        batch: &[DocumentChunk],
+        embeddings: &[Vec<f32>],
+    ) -> Result<()> {
+        for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
+            let chunk_meta = ChunkMetadata {
+                id: chunk.id.clone(),
+                text: chunk.text.clone(),
+                source: chunk.source.clone(),
+                chunk_index: chunk.chunk_index,
+                start_offset: chunk.start_offset as u64,
+                end_offset: chunk.end_offset as u64,
+            };
+            let metadata_bytes = serde_json::to_vec(&chunk_meta)?;
+
+            let vec_id = self
+                .vectors_db
+                .insert(embedding, Some(&metadata_bytes))
+                .await?;
+
+            self.metadata_index
+                .add_chunk(chunk.source.clone(), vec_id)
+                .await;
+        }
         Ok(())
     }
 
