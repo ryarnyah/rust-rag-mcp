@@ -141,12 +141,23 @@ fn main() {
         let n = 2_000_000;
         let start = Instant::now();
         let mut sink = 0.0f32;
+        let mut errors = 0usize;
         for _ in 0..n {
-            sink += cosine_distance(&a, &b).unwrap_or(0.0);
+            // On error count it — never substitute a fake 0.0 distance.
+            match cosine_distance(&a, &b) {
+                Ok(d) => sink += d,
+                Err(e) => {
+                    errors += 1;
+                    if errors == 1 {
+                        eprintln!("cosine_distance failed: {e}");
+                    }
+                }
+            }
         }
         let elapsed = start.elapsed();
         let (alloc, peak) = snapshot();
         let _ = sink;
+        assert_eq!(errors, 0, "cosine_distance errored {errors} times");
         print_row("cosine_distance (128d)", n, elapsed, alloc, peak);
     }
 

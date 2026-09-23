@@ -244,8 +244,15 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core =
-                rag::RagCore::new(std::path::Path::new(&db_path), std::path::Path::new(&cache_path), &model, chunk_size, overlap, 150).await?;
+            let core = rag::RagCore::new(
+                std::path::Path::new(&db_path),
+                std::path::Path::new(&cache_path),
+                &model,
+                chunk_size,
+                overlap,
+                150,
+            )
+            .await?;
             let query_str = query.join(" ");
             let results: Vec<rust_rag_mcp::SearchResult> = core.search(&query_str, top_k).await?;
 
@@ -273,8 +280,15 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core =
-                rag::RagCore::new(std::path::Path::new(&db_path), std::path::Path::new(&cache_path), &model, chunk_size, overlap, 150).await?;
+            let core = rag::RagCore::new(
+                std::path::Path::new(&db_path),
+                std::path::Path::new(&cache_path),
+                &model,
+                chunk_size,
+                overlap,
+                150,
+            )
+            .await?;
             let sources = core.list_sources().await?;
             if sources.is_empty() {
                 println!("No indexed sources.");
@@ -293,8 +307,15 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core =
-                rag::RagCore::new(std::path::Path::new(&db_path), std::path::Path::new(&cache_path), &model, chunk_size, overlap, 150).await?;
+            let core = rag::RagCore::new(
+                std::path::Path::new(&db_path),
+                std::path::Path::new(&cache_path),
+                &model,
+                chunk_size,
+                overlap,
+                150,
+            )
+            .await?;
             let count = core.chunk_count().await?;
             let sources = core.list_sources().await?;
             println!("Indexed chunks: {}", count);
@@ -313,8 +334,15 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core =
-                rag::RagCore::new(std::path::Path::new(&db_path), std::path::Path::new(&cache_path), &model, chunk_size, overlap, 150).await?;
+            let core = rag::RagCore::new(
+                std::path::Path::new(&db_path),
+                std::path::Path::new(&cache_path),
+                &model,
+                chunk_size,
+                overlap,
+                150,
+            )
+            .await?;
             match core.delete_source(&source_path).await {
                 Ok(()) => println!("Deleted: {}", source_path),
                 Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),

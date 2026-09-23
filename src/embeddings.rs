@@ -208,24 +208,21 @@ mod tests {
     #[serial]
     fn test_new_invalid_model() {
         // fastembed uses default model regardless of input
-        let svc =
-            EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR.into()).unwrap();
+        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR).unwrap();
         assert!(svc.dimensions() > 0);
     }
 
     #[test]
     #[serial]
     fn test_new_valid_model() {
-        let svc =
-            EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR.into()).unwrap();
+        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR).unwrap();
         assert!(svc.dimensions() > 0);
     }
 
     #[tokio::test]
     #[serial]
     async fn test_embed_chunks() {
-        let svc =
-            EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR.into()).unwrap();
+        let svc = EmbeddingService::new("Xenova/bge-small-en-v1.5", DEFAULT_CACHE_DIR).unwrap();
         let chunks = vec![DocumentChunk {
             id: "1".to_string(),
             text: "hello world".to_string(),

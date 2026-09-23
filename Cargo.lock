@@ -2918,7 +2918,6 @@ dependencies = [
  "futures",
  "hex",
  "memmap2",
- "ndarray",
  "ordered-float",
  "rmcp",
  "serde",

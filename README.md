@@ -13,6 +13,7 @@
   <a href="#features">Features</a> •
   <a href="#cli-reference">CLI</a> •
   <a href="#mcp-integration">MCP Integration</a> •
+  <a href="#formal-verification">Formal Verification</a> •
   <a href="#architecture">Architecture</a>
 </p>
 

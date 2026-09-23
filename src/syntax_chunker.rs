@@ -153,7 +153,8 @@ fn parse_and_chunk(
 
             if wc > 0 && (wc as usize) <= max_chunk_size {
                 let olap = word_index.overlap_range(node.start_byte(), overlap);
-                let (cs, ce) = merge_ranges(ctx, olap, node.start_byte(), node.end_byte(), prev_end);
+                let (cs, ce) =
+                    merge_ranges(ctx, olap, node.start_byte(), node.end_byte(), prev_end);
 
                 chunks.push(DocumentChunk {
                     id: String::new(),
@@ -384,8 +385,7 @@ fn split_by_words(
         let mut word_end_pos = word_starts[start_word];
         for w in &words[start_word..end_word] {
             word_end_pos += w.len();
-            while word_end_pos < slice.len()
-                && slice.as_bytes()[word_end_pos].is_ascii_whitespace()
+            while word_end_pos < slice.len() && slice.as_bytes()[word_end_pos].is_ascii_whitespace()
             {
                 word_end_pos += 1;
             }
@@ -430,10 +430,7 @@ fn find_header_end(text: &str, start: usize, end: usize) -> usize {
         start + pos + 1
     } else {
         // No brace found (e.g. pure declaration); return end of first line
-        slice
-            .find('\n')
-            .map(|pos| start + pos + 1)
-            .unwrap_or(end)
+        slice.find('\n').map(|pos| start + pos + 1).unwrap_or(end)
     }
 }
 
@@ -800,13 +797,19 @@ public class UserRepository implements Repository<User> {
 
         let chunks_if = chunker.chunk_text(code, "Repository.java");
         let texts_if: Vec<&str> = chunks_if.iter().map(|c| c.text.as_str()).collect();
-        assert!(texts_if.iter().any(|t| t.contains("interface Repository")),
-            "Should have interface declaration");
+        assert!(
+            texts_if.iter().any(|t| t.contains("interface Repository")),
+            "Should have interface declaration"
+        );
 
         let chunks_impl = chunker.chunk_text(code_impl, "UserRepository.java");
         let texts_impl: Vec<&str> = chunks_impl.iter().map(|c| c.text.as_str()).collect();
-        assert!(texts_impl.iter().any(|t| t.contains("class UserRepository")),
-            "Should have class declaration");
+        assert!(
+            texts_impl
+                .iter()
+                .any(|t| t.contains("class UserRepository")),
+            "Should have class declaration"
+        );
     }
 
     #[test]
@@ -845,12 +848,18 @@ public class LinkedList {
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "LinkedList.java");
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        assert!(chunk_texts.iter().any(|t| t.contains("class Node")),
-            "Should have inner class Node chunk");
-        assert!(chunk_texts.iter().any(|t| t.contains("addFirst")),
-            "Should have addFirst chunk");
-        assert!(chunk_texts.iter().any(|t| t.contains("removeFirst")),
-            "Should have removeFirst chunk");
+        assert!(
+            chunk_texts.iter().any(|t| t.contains("class Node")),
+            "Should have inner class Node chunk"
+        );
+        assert!(
+            chunk_texts.iter().any(|t| t.contains("addFirst")),
+            "Should have addFirst chunk"
+        );
+        assert!(
+            chunk_texts.iter().any(|t| t.contains("removeFirst")),
+            "Should have removeFirst chunk"
+        );
     }
 
     #[test]
@@ -877,8 +886,10 @@ public enum Status {
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "Status.java");
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        assert!(chunk_texts.iter().any(|t| t.contains("enum Status")),
-            "Should have enum declaration chunk");
+        assert!(
+            chunk_texts.iter().any(|t| t.contains("enum Status")),
+            "Should have enum declaration chunk"
+        );
     }
 
     #[test]
@@ -897,11 +908,18 @@ public enum Status {
         // Each method is ~17 words; max=20 so each fits, but class (~340 words) is split
         let chunker = SyntaxChunker::new(20, 4);
         let chunks = chunker.chunk_text(&code, "ManyMethods.java");
-        assert!(chunks.len() > 1, "Should produce multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Should produce multiple chunks, got {}",
+            chunks.len()
+        );
         // Verify that child chunks of the split class include the class header
         // as context prefix (oversized node split)
         let has_class_header = chunks.iter().any(|c| c.text.contains("class ManyMethods"));
-        assert!(has_class_header, "At least one chunk should contain class header context");
+        assert!(
+            has_class_header,
+            "At least one chunk should contain class header context"
+        );
     }
 
     #[test]
@@ -927,7 +945,9 @@ public int multiply(int a, int b) {
         let chunks = chunker.chunk_text(code, "MathUtils.java");
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
         let has_javadoc = chunk_texts.iter().any(|t| t.contains("@param"));
-        let has_line_comment = chunk_texts.iter().any(|t| t.contains("single-line comment"));
+        let has_line_comment = chunk_texts
+            .iter()
+            .any(|t| t.contains("single-line comment"));
         assert!(has_javadoc, "Javadoc comment should be indexed");
         assert!(has_line_comment, "Line comment should be indexed");
     }
@@ -957,8 +977,12 @@ public class Config {
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "Config.java");
         let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        assert!(chunk_texts.iter().any(|t| t.contains("static {") || t.contains("static{")),
-            "Static initializer should be indexed");
+        assert!(
+            chunk_texts
+                .iter()
+                .any(|t| t.contains("static {") || t.contains("static{")),
+            "Static initializer should be indexed"
+        );
     }
 
     #[test]
@@ -1002,12 +1026,17 @@ public class MyClass {
         for text in &chunk_texts {
             let words: Vec<&str> = text.split_whitespace().collect();
             if words.len() == 1 && words[0] == "ryarnyah" {
-                panic!("'ryarnyah' must not be a standalone chunk: {:?}", chunk_texts);
+                panic!(
+                    "'ryarnyah' must not be a standalone chunk: {:?}",
+                    chunk_texts
+                );
             }
         }
         // The full package line should be present as one chunk
         assert!(
-            chunk_texts.iter().any(|t| t.contains("package com.github.ryarnyah.rag")),
+            chunk_texts
+                .iter()
+                .any(|t| t.contains("package com.github.ryarnyah.rag")),
             "Full package declaration should be a single chunk"
         );
     }
@@ -1034,18 +1063,19 @@ public class Controller {
             let words: Vec<&str> = text.split_whitespace().collect();
             // No single-word chunks like "GetMapping" or "annotation"
             if words.len() == 1 {
-                panic!(
-                    "Single-word chunk found '{}': {:?}",
-                    words[0], chunk_texts
-                );
+                panic!("Single-word chunk found '{}': {:?}", words[0], chunk_texts);
             }
         }
         assert!(
-            chunk_texts.iter().any(|t| t.contains("import java.util.List")),
+            chunk_texts
+                .iter()
+                .any(|t| t.contains("import java.util.List")),
             "Import java.util.List should be intact"
         );
         assert!(
-            chunk_texts.iter().any(|t| t.contains("import org.springframework")),
+            chunk_texts
+                .iter()
+                .any(|t| t.contains("import org.springframework")),
             "Import org.springframework should be intact"
         );
     }
@@ -1072,7 +1102,12 @@ fn second() {
         // Each function is ~14 words; use max=20 so each fits as one chunk
         let chunker = SyntaxChunker::new(20, 4);
         let chunks = chunker.chunk_text(code, "test.rs");
-        assert_eq!(chunks.len(), 2, "Should produce 2 chunks, got {}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Should produce 2 chunks, got {}",
+            chunks.len()
+        );
         // The second chunk should start before the 'fn second()' node
         // because overlap words should pull in some preceding text
         let second_fn_start = code.find("fn second()").unwrap();
@@ -1172,7 +1207,8 @@ public class Parser {
             let open = chunk.text.matches('{').count();
             let close = chunk.text.matches('}').count();
             assert_eq!(
-                open, close,
+                open,
+                close,
                 "Unbalanced braces in chunk: '{}' (open={}, close={})",
                 &chunk.text[..chunk.text.len().min(80)],
                 open,
@@ -1293,10 +1329,16 @@ public class UserRepository {
         // Method is ~600+ words; max=10 forces split into many small chunks
         let chunker = SyntaxChunker::new(10, 2);
         let chunks = chunker.chunk_text(&code, "BatchProcessor.java");
-        assert!(chunks.len() > 1, "Should split large method into multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Should split large method into multiple chunks, got {}",
+            chunks.len()
+        );
         // At least one chunk should contain the class header
         assert!(
-            chunks.iter().any(|c| c.text.contains("class BatchProcessor")),
+            chunks
+                .iter()
+                .any(|c| c.text.contains("class BatchProcessor")),
             "Split chunks should include class header context"
         );
     }
@@ -1388,10 +1430,23 @@ public class UserController {
 "#;
         let chunker = SyntaxChunker::new(512, 64);
         let chunks = chunker.chunk_text(code, "UserController.java");
-        let all_text = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(all_text.contains("@RestController"), "Annotations should be in chunks");
-        assert!(all_text.contains("@GetMapping"), "Method annotations should be in chunks");
-        assert!(all_text.contains("UserController"), "Class name should be in chunks");
+        let all_text = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("@RestController"),
+            "Annotations should be in chunks"
+        );
+        assert!(
+            all_text.contains("@GetMapping"),
+            "Method annotations should be in chunks"
+        );
+        assert!(
+            all_text.contains("UserController"),
+            "Class name should be in chunks"
+        );
     }
 
     #[test]
@@ -1413,7 +1468,12 @@ fn second() {
         let overlap_words = 4;
         let chunker = SyntaxChunker::new(50, overlap_words);
         let chunks = chunker.chunk_text(code, "test.rs");
-        assert_eq!(chunks.len(), 2, "Should produce 2 chunks, got {}", chunks.len());
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Should produce 2 chunks, got {}",
+            chunks.len()
+        );
         // The overlap prefix should have approximately `overlap_words` words
         let second_fn_byte = code.find("fn second()").unwrap();
         let prefix = &code[chunks[1].start_offset..second_fn_byte];
@@ -1484,7 +1544,9 @@ pub struct RagServer;
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        let code = format!("package com.example;\n\n{imports}\n\npublic class LargeClass {{\n{methods}\n}}");
+        let code = format!(
+            "package com.example;\n\n{imports}\n\npublic class LargeClass {{\n{methods}\n}}"
+        );
 
         let chunker = SyntaxChunker::new(10, 2);
         let chunks = chunker.chunk_text(&code, "LargeClass.java");
@@ -1504,6 +1566,10 @@ pub struct RagServer;
             );
         }
         // Should have multiple chunks for 30 methods
-        assert!(chunks.len() > 5, "Should produce many chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 5,
+            "Should produce many chunks, got {}",
+            chunks.len()
+        );
     }
 }

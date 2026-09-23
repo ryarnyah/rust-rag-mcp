@@ -65,6 +65,91 @@ fn test_cosine_distance_nan() {
     assert!(cosine_distance(&a, &b).is_err());
 }
 
+#[test]
+fn test_cosine_distance_zero_vector_is_error() {
+    // Undefined input → error, never a fabricated number.
+    let a = vec![0.0, 0.0];
+    let b = vec![1.0, 0.0];
+    let err = cosine_distance(&a, &b).unwrap_err();
+    assert!(matches!(err, VectorDbError::ZeroVector));
+}
+
+#[tokio::test]
+async fn test_zero_query_returns_error_not_scores() -> Result<()> {
+    cleanup("test_zero_query.db");
+    {
+        let cfg = Config::new(2);
+        let mut db = VectorDb::open("test_zero_query.db", cfg).await?;
+        db.insert(&[1.0, 0.0], None)?;
+
+        let err = db.search(&[0.0, 0.0], 5, 32).unwrap_err();
+        assert!(matches!(err, VectorDbError::ZeroVector));
+    }
+    cleanup("test_zero_query.db");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_placeholder_rows_stored_but_never_searchable() -> Result<()> {
+    cleanup("test_placeholder.db");
+    {
+        let cfg = Config::new(2).with_capacity(16);
+        let mut db = VectorDb::open("test_placeholder.db", cfg).await?;
+
+        // Placeholder (all-zero) row, like rag.rs stores document metadata,
+        // inserted *between* real vectors so it lands in the middle of id space.
+        db.insert(&[1.0, 0.0], None)?;
+        let ph = db.insert(&[0.0, 0.0], Some(b"doc-metadata"))?;
+        db.insert(&[0.0, 1.0], None)?;
+        db.insert(&[1.0, 0.0], None)?;
+
+        // Stored and readable like any other row.
+        assert_eq!(db.get(ph)?, Some(vec![0.0, 0.0]));
+        assert_eq!(db.get_meta(ph)?, Some(b"doc-metadata".as_slice()));
+
+        // Searching must neither fail nor ever surface the placeholder row.
+        let results = db.search(&[1.0, 0.0], 10, 64)?;
+        assert!(!results.is_empty());
+        for hit in &results {
+            assert_ne!(hit.id, ph, "placeholder row must not be searchable");
+            assert!(hit.score.is_finite() && (0.0..=1.0).contains(&hit.score));
+        }
+
+        // Deletion still works on placeholder rows.
+        assert!(db.delete(ph)?);
+        assert!(db.is_deleted(ph));
+    }
+    cleanup("test_placeholder.db");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_entry_node_keeps_graph_connected() -> Result<()> {
+    cleanup("test_update_entry.db");
+    {
+        let cfg = Config::new(2).with_capacity(16);
+        let mut db = VectorDb::open("test_update_entry.db", cfg).await?;
+
+        db.insert(&[1.0, 0.0], None)?;
+        db.insert(&[0.0, 1.0], None)?;
+        db.insert(&[1.0, 1.0], None)?;
+
+        // Update the entry point (id 0): its edges are rebuilt from scratch
+        // and the graph must stay reachable afterwards.
+        db.update(0, &[0.7, 0.7], None)?;
+
+        let results = db.search(&[1.0, 0.0], 3, 64)?;
+        let seen: Vec<u32> = results.iter().map(|h| h.id).collect();
+        assert_eq!(
+            results.len(),
+            3,
+            "graph must stay connected, got ids {seen:?}"
+        );
+    }
+    cleanup("test_update_entry.db");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_metadata_simple() -> Result<()> {
     cleanup("test_meta_simple.db");
@@ -281,9 +366,9 @@ async fn test_wal_crash_delete_before_flush() -> Result<()> {
 
         assert_eq!(db.len(), 3, "All vectors still tracked");
         assert_eq!(db.live_len(), 2, "One vector deleted");
-        assert_eq!(db.is_deleted(0), false);
-        assert_eq!(db.is_deleted(1), true, "Deletion should be recovered");
-        assert_eq!(db.is_deleted(2), false);
+        assert!(!db.is_deleted(0));
+        assert!(db.is_deleted(1), "Deletion should be recovered");
+        assert!(!db.is_deleted(2));
     }
 
     cleanup("test_wal_delete_crash.db");
@@ -370,12 +455,12 @@ async fn test_wal_mixed_operations_crash() -> Result<()> {
             db.get_meta(1)?.map(|m| m.to_vec()),
             Some(b"updated1".to_vec())
         );
-        assert_eq!(db.is_deleted(3), true);
+        assert!(db.is_deleted(3));
         assert_eq!(db.get(3)?, None);
 
-        assert_eq!(db.is_deleted(0), false);
-        assert_eq!(db.is_deleted(2), false);
-        assert_eq!(db.is_deleted(4), false);
+        assert!(!db.is_deleted(0));
+        assert!(!db.is_deleted(2));
+        assert!(!db.is_deleted(4));
     }
 
     cleanup("test_wal_mixed.db");
@@ -757,7 +842,7 @@ async fn test_search_ordering_correctness() -> Result<()> {
         let query = vec![1.0, 0.0, 0.0];
         let results = db.search(&query, 4, 32)?;
 
-        assert!(results.len() > 0);
+        assert!(!results.is_empty());
         for i in 0..results.len() - 1 {
             assert!(
                 results[i].score >= results[i + 1].score,

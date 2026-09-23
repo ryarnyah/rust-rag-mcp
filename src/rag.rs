@@ -279,11 +279,7 @@ impl RagCore {
         Ok(())
     }
 
-    async fn insert_batch(
-        &self,
-        batch: &[DocumentChunk],
-        embeddings: &[Vec<f32>],
-    ) -> Result<()> {
+    async fn insert_batch(&self, batch: &[DocumentChunk], embeddings: &[Vec<f32>]) -> Result<()> {
         for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
             let chunk_meta = ChunkMetadata {
                 id: chunk.id.clone(),

@@ -34,7 +34,11 @@ async fn test_rag_server_instantiation() {
         150,
     )
     .await;
-    assert!(server.is_ok(), "RagServer should instantiate: {:?}", server.err());
+    assert!(
+        server.is_ok(),
+        "RagServer should instantiate: {:?}",
+        server.err()
+    );
 }
 
 #[tokio::test]

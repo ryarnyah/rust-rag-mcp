@@ -34,7 +34,6 @@
 
 use fs2::FileExt;
 use memmap2::{MmapMut, MmapOptions};
-use ndarray::ArrayView1;
 use ordered_float::OrderedFloat;
 use std::cell::UnsafeCell;
 use std::cmp::Reverse;
@@ -78,6 +77,9 @@ pub enum VectorDbError {
     /// Configuration mismatch with existing file
     #[error("Configuration mismatch: {0}")]
     ConfigMismatch(String),
+
+    #[error("cosine distance is undefined for a zero vector")]
+    ZeroVector,
 
     /// Distance computation produced NaN
     #[error("Distance computation produced NaN for vectors")]
@@ -229,15 +231,16 @@ impl Config {
 // ============================================================================
 
 /// Dot product of two vectors
-/// Dot product using SIMD when available (ndarray)
 ///
-/// Automatically uses SIMD instructions (AVX2/AVX-512) when available.
-/// Falls back to scalar on unsupported platforms.
+/// Accumulates in `f64` for numerical stability, without allocating: the
+/// inputs are widened element-wise and the reduction is auto-vectorized by
+/// LLVM (AVX2/AVX-512 when available). Widening to `f64` first means no
+/// intermediate rounding and no underflow for squared `f32` magnitudes.
 ///
 /// # Panics
 /// Panics if `a.len() != b.len()`.
 #[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+fn dot(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(
         a.len(),
         b.len(),
@@ -246,37 +249,80 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
         b.len()
     );
 
-    // Use ndarray for automatic SIMD vectorization
-    let a_arr = ArrayView1::from(a);
-    let b_arr = ArrayView1::from(b);
-    a_arr.dot(&b_arr)
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x as f64) * (y as f64))
+        .sum()
 }
 
-/// Euclidean norm (L2) of a vector using SIMD
+/// Euclidean norm (L2) of a vector
 #[inline]
-fn norm(a: &[f32]) -> f32 {
+fn norm(a: &[f32]) -> f64 {
     dot(a, a).sqrt()
 }
 
-/// Cosine distance with proper NaN handling (SIMD-optimized)
+/// True for an all-zero (or all-±0.0) row: cosine distance to it is
+/// undefined, so such rows are treated as **placeholder rows** — stored with
+/// their metadata (used by `rag.rs` for document metadata) but never entered
+/// into the HNSW graph, and therefore never returned by a search.
+///
+/// Equivalent to `norm(v) == 0.0`: the sum of squares is computed in `f64`,
+/// which cannot underflow squared `f32` values, so it is zero only if every
+/// element is zero.
+#[inline]
+fn is_placeholder_vector(v: &[f32]) -> bool {
+    v.iter().all(|&x| x == 0.0)
+}
+
+/// Cosine distance with proper NaN handling
 ///
 /// Returns distance in [0, 2]: 0 = identical, 2 = opposite
 ///
-/// Uses SIMD instructions for dot product and norm calculations when available.
+/// Dot product and norms are accumulated in `f64` and the result is clamped
+/// to `[-1, 1]` before conversion, so floating-point rounding can never push
+/// the distance outside its documented range.
+///
+/// Every degenerate case is reported as an error — no numeric value is ever
+/// returned for an input the formula cannot answer for.
 ///
 /// # Errors
-/// Returns `VectorDbError::NaNDistance` if either vector has NaN or distance is NaN
+/// - `VectorDbError::DimensionMismatch` if `a.len() != b.len()`
+/// - `VectorDbError::ZeroVector` if either vector has zero magnitude
+///   (cosine similarity is undefined there — callers must not receive a
+///   fabricated distance such as 0.0 or 1.0)
+/// - `VectorDbError::NaNDistance` if either vector contains a non-finite
+///   value (NaN/±infinity) or the computed distance is not finite
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        return Err(VectorDbError::DimensionMismatch {
+            expected: a.len(),
+            got: b.len(),
+        });
+    }
+    if !a.iter().chain(b.iter()).all(|x| x.is_finite()) {
+        return Err(VectorDbError::NaNDistance);
+    }
+
     let dot_prod = dot(a, b);
-    let norm_a = norm(a).max(1e-20);
-    let norm_b = norm(b).max(1e-20);
-    let dist = 1.0 - dot_prod / (norm_a * norm_b);
+    let norm_a = norm(a);
+    let norm_b = norm(b);
+
+    // Exact comparison is sound here: inputs are finite `f32`, squared in
+    // `f64`, so the only way the norm is 0.0 is an all-zero (or all-±0.0)
+    // vector — `f64` cannot underflow a squared `f32`.
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return Err(VectorDbError::ZeroVector);
+    }
+
+    // Divide sequentially to avoid overflow in norm_a * norm_b.
+    let similarity = (dot_prod / norm_a / norm_b).clamp(-1.0, 1.0);
+    let dist = 1.0 - similarity;
 
     if !dist.is_finite() {
         return Err(VectorDbError::NaNDistance);
     }
-    Ok(dist)
+    Ok(dist as f32)
 }
 
 /// Compare two distances, handling NaN safely
@@ -951,7 +997,13 @@ impl HnswIndex {
 
         let mut dists: Vec<(u32, f32)> = neighbors
             .iter()
-            .map(|&n| dist(id, n).map(|d| (n, d)))
+            .filter_map(|&n| match dist(id, n) {
+                Ok(d) => Some(Ok((n, d))),
+                // Placeholder row in a legacy neighbor list: drop the link
+                // instead of scoring it. Other errors propagate.
+                Err(VectorDbError::ZeroVector) => None,
+                Err(e) => Some(Err(e)),
+            })
             .collect::<Result<Vec<_>>>()?;
         dists.sort_by(|a, b| distance_cmp(a.1, b.1));
 
@@ -967,7 +1019,20 @@ impl HnswIndex {
     /// Search layer for candidates similar to entry node.
     /// Results are written into scratch.search_output (sorted by distance).
     /// Caller must read from scratch before the next search_layer call.
-    fn search_layer<F, D>(&self, entry: u32, layer: usize, ef: usize, dist: &F, is_deleted: &D)
+    ///
+    /// Error management: `ZeroVector` means the row is a placeholder (or the
+    /// entry point is one) — the node is traversable but never reported as a
+    /// result, and never contributes a fabricated distance. Any other error
+    /// (out-of-bounds id, non-finite vector, ...) is propagated: a search
+    /// never invents numbers to cover a failure.
+    fn search_layer<F, D>(
+        &self,
+        entry: u32,
+        layer: usize,
+        ef: usize,
+        dist: &F,
+        is_deleted: &D,
+    ) -> Result<()>
     where
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
@@ -976,13 +1041,19 @@ impl HnswIndex {
         scratch.visited.clear();
         scratch.visited.insert(entry);
 
-        let d0 = dist(entry).unwrap_or(f32::INFINITY);
+        // A placeholder entry point cannot be ranked, but its links (legacy
+        // databases) let the walk hop off it onto real vectors.
+        let (d0, rankable) = match dist(entry) {
+            Ok(d) => (d, true),
+            Err(VectorDbError::ZeroVector) => (f32::INFINITY, false),
+            Err(e) => return Err(e),
+        };
 
         scratch.candidates.clear();
         scratch.candidates.push(Reverse((OrderedFloat(d0), entry)));
 
         scratch.results.clear();
-        if !is_deleted(entry) {
+        if rankable && !is_deleted(entry) {
             scratch.results.push((OrderedFloat(d0), entry));
         }
 
@@ -1003,7 +1074,9 @@ impl HnswIndex {
                 }
                 let d = match dist(n) {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    // Placeholder row: skip it entirely instead of scoring it.
+                    Err(VectorDbError::ZeroVector) => continue,
+                    Err(e) => return Err(e),
                 };
                 let worst = scratch
                     .results
@@ -1028,6 +1101,26 @@ impl HnswIndex {
             .search_output
             .extend(scratch.results.drain().map(|(d, id)| (d.into_inner(), id)));
         scratch.search_output.sort_by(|a, b| distance_cmp(a.0, b.0));
+        Ok(())
+    }
+
+    /// Register a node's slot without linking it into the graph.
+    ///
+    /// Used for placeholder rows (all-zero vectors): they need level/count
+    /// bookkeeping so later ids address valid slots and deletions are safe,
+    /// but they are never distance-compared, never become the entry point,
+    /// and never receive or hold graph edges.
+    fn register_unlinked(&mut self, new_id: u32) -> Result<()> {
+        while (new_id as usize) >= self.capacity() {
+            self.grow()?;
+        }
+        let level = self.sample_level();
+        self.set_level(new_id, level as u8);
+        for l in 0..=level {
+            self.set_layer_count(new_id, l, 0);
+        }
+        self.set_count((new_id as usize + 1).max(self.count()));
+        Ok(())
     }
 
     /// Insert new node into index (must be called with proper distance function)
@@ -1055,7 +1148,14 @@ impl HnswIndex {
         }
 
         let mut ep = entry;
-        let mut ep_dist = dist(new_id, ep)?;
+        // The entry point may be a legacy placeholder row: use it only to
+        // traverse (the greedy walk hops off it onto a real vector on the
+        // first finite distance), never as a ranked distance.
+        let mut ep_dist = match dist(new_id, ep) {
+            Ok(d) => d,
+            Err(VectorDbError::ZeroVector) => f32::INFINITY,
+            Err(e) => return Err(e),
+        };
         let cur_max = self.max_level() as usize;
 
         // 1. Greedy descent from top layer down to `level + 1`
@@ -1069,7 +1169,11 @@ impl HnswIndex {
                     if is_deleted(n) {
                         continue;
                     }
-                    let d = dist(new_id, n)?;
+                    let d = match dist(new_id, n) {
+                        Ok(d) => d,
+                        Err(VectorDbError::ZeroVector) => continue, // placeholder neighbor
+                        Err(e) => return Err(e),
+                    };
                     if d < ep_dist {
                         ep_dist = d;
                         ep = n;
@@ -1084,7 +1188,7 @@ impl HnswIndex {
         let start_layer = level.min(cur_max);
         for layer in (0..=start_layer).rev() {
             let to_new = |n: u32| dist(new_id, n);
-            self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted);
+            self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
 
             let cap = Self::layer_capacity(&self.cfg, layer);
             let selected = {
@@ -1144,7 +1248,14 @@ impl HnswIndex {
         }
 
         let mut ep = entry;
-        let mut ep_dist = dist(ep)?;
+        // `dist(ep)` may be `ZeroVector` if the entry point is a legacy
+        // placeholder row — traverse through it, never rank it. Other errors
+        // (bad query, corruption) must surface, not be swallowed.
+        let mut ep_dist = match dist(ep) {
+            Ok(d) => d,
+            Err(VectorDbError::ZeroVector) => f32::INFINITY,
+            Err(e) => return Err(e),
+        };
         let cur_max = self.max_level() as usize;
 
         for layer in (1..=cur_max).rev() {
@@ -1153,7 +1264,11 @@ impl HnswIndex {
                 changed = false;
                 // P6: Use iterator to avoid Vec allocation
                 for n in self.layer_neighbors_iter(ep, layer) {
-                    let d = dist(n)?;
+                    let d = match dist(n) {
+                        Ok(d) => d,
+                        Err(VectorDbError::ZeroVector) => continue, // placeholder neighbor
+                        Err(e) => return Err(e),
+                    };
                     if d < ep_dist && !is_deleted(n) {
                         ep_dist = d;
                         ep = n;
@@ -1163,7 +1278,7 @@ impl HnswIndex {
             }
         }
 
-        self.search_layer(ep, 0, ef.max(k), &dist, is_deleted);
+        self.search_layer(ep, 0, ef.max(k), &dist, is_deleted)?;
         let scratch = unsafe { &*self.scratch.get() };
         scratch
             .search_output
@@ -1439,14 +1554,57 @@ impl VectorDb {
             self.index.set_layer_count(id, layer, 0);
         }
 
-        // Find nearest entry point for re-linking
         let entry = self.index.entry_point();
-        if entry == NONE || entry == id {
+        let placeholder = is_placeholder_vector(self.row(id as usize));
+
+        if placeholder {
+            // The row is (now) a placeholder: keep it out of the graph, and
+            // make sure it does not stay the entry point.
+            if entry == id {
+                match self.find_indexable_row(id) {
+                    Some(other) => {
+                        self.index.set_entry_point(other);
+                        let level = self.index.node_level(other);
+                        self.index.set_max_level(level);
+                    }
+                    None => {
+                        self.index.set_entry_point(NONE);
+                        self.index.set_max_level(0);
+                    }
+                }
+            }
             return Ok(());
         }
 
-        let mut ep = entry;
-        let mut ep_dist = dist(id, ep)?;
+        if entry == NONE {
+            // Empty graph: registering as entry point needs no distances.
+            return self.index.insert(id, dist, &is_deleted);
+        }
+
+        // Find a seed entry point for re-linking
+        let mut ep;
+        let mut ep_dist;
+        if entry == id {
+            // This node is the entry point and its links were just cleared:
+            // re-link against another indexable row instead of itself.
+            match self.find_indexable_row(id) {
+                Some(other) => {
+                    ep = other;
+                    ep_dist = dist(id, other)?;
+                }
+                // This is the only row in the graph: nothing to link to.
+                None => return Ok(()),
+            }
+        } else {
+            ep = entry;
+            // The entry point may be a legacy placeholder row: it is used
+            // only to traverse, never ranked.
+            ep_dist = match dist(id, ep) {
+                Ok(d) => d,
+                Err(VectorDbError::ZeroVector) => f32::INFINITY,
+                Err(e) => return Err(e),
+            };
+        }
 
         // Greedy descent to find closest entry point
         let cur_max = self.index.max_level() as usize;
@@ -1458,7 +1616,11 @@ impl VectorDb {
                     if is_deleted(n) || n == id {
                         continue;
                     }
-                    let d = dist(id, n)?;
+                    let d = match dist(id, n) {
+                        Ok(d) => d,
+                        Err(VectorDbError::ZeroVector) => continue, // placeholder neighbor
+                        Err(e) => return Err(e),
+                    };
                     if d < ep_dist {
                         ep_dist = d;
                         ep = n;
@@ -1472,7 +1634,7 @@ impl VectorDb {
         for layer in (0..=node_level as usize).rev() {
             let to_new = |n: u32| dist(id, n);
             self.index
-                .search_layer(ep, layer, self.cfg.ef_construction, &to_new, &is_deleted);
+                .search_layer(ep, layer, self.cfg.ef_construction, &to_new, &is_deleted)?;
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
             {
                 let scratch = unsafe { &mut *self.index.scratch.get() };
@@ -1511,6 +1673,16 @@ impl VectorDb {
         self.insert_raw(&record.vector_data, &record.metadata)
     }
 
+    /// Find a row that can be distance-compared (non-deleted, non-placeholder),
+    /// excluding `exclude`. Used to (re)pick a graph entry point.
+    fn find_indexable_row(&self, exclude: u32) -> Option<u32> {
+        (0..self.len() as u32).find(|&id| {
+            id != exclude
+                && !self.meta.is_deleted(id)
+                && !is_placeholder_vector(self.row(id as usize))
+        })
+    }
+
     /// Insert vector without WAL logging (used for compaction and recovery)
     fn insert_raw(&mut self, v: &[f32], metadata: &[u8]) -> Result<u32> {
         let n = self.len();
@@ -1526,7 +1698,12 @@ impl VectorDb {
         let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |_id: u32| false;
-        self.index.insert(id, dist, &is_deleted)?;
+        if is_placeholder_vector(v) {
+            // Placeholder row: stored, never indexed — no distance to it exists.
+            self.index.register_unlinked(id)?;
+        } else {
+            self.index.insert(id, dist, &is_deleted)?;
+        }
         Ok(id)
     }
 
@@ -1652,6 +1829,11 @@ impl VectorDb {
     }
 
     /// Insert new vector, returns its ID
+    ///
+    /// An all-zero vector is accepted as a **placeholder row**: it is stored
+    /// with its metadata (readable, deletable, compactable) but never enters
+    /// the HNSW graph, because cosine distance to a zero vector is undefined.
+    /// Searches never return it.
     pub fn insert(&mut self, v: &[f32], metadata: Option<&[u8]>) -> Result<u32> {
         if v.len() != self.cfg.dim {
             return Err(VectorDbError::DimensionMismatch {
@@ -1680,7 +1862,12 @@ impl VectorDb {
         let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |_id: u32| false;
-        self.index.insert(id, dist, &is_deleted)?;
+        if is_placeholder_vector(v) {
+            // Placeholder row: stored, never indexed — no distance to it exists.
+            self.index.register_unlinked(id)?;
+        } else {
+            self.index.insert(id, dist, &is_deleted)?;
+        }
         Ok(id)
     }
 
@@ -1737,12 +1924,21 @@ impl VectorDb {
     }
 
     /// Search for k nearest neighbors
+    ///
+    /// # Errors
+    /// - `DimensionMismatch` if the query dimension differs from the db's
+    /// - `ZeroVector` if the query is all-zero (undefined for cosine distance)
+    /// - any distance/storage error while traversing the graph
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
         if query.len() != self.cfg.dim {
             return Err(VectorDbError::DimensionMismatch {
                 expected: self.cfg.dim,
                 got: query.len(),
             });
+        }
+        if is_placeholder_vector(query) {
+            // No direction to compare: report it, never return made-up scores.
+            return Err(VectorDbError::ZeroVector);
         }
 
         let view = self.vector_view();
@@ -1802,6 +1998,10 @@ impl VectorDb {
                 expected: self.cfg.dim,
                 got: query.len(),
             });
+        }
+        if is_placeholder_vector(query) {
+            // No direction to compare: report it, never return made-up scores.
+            return Err(VectorDbError::ZeroVector);
         }
 
         let view = self.vector_view();
@@ -1951,6 +2151,7 @@ impl VectorDb {
 }
 
 /// Search result with vector ID, similarity score, and metadata
+#[derive(Debug)]
 pub struct SearchHit<'a> {
     /// Vector ID
     pub id: u32,
@@ -2137,6 +2338,7 @@ impl AsyncVectorDb {
 }
 
 /// Owned version of SearchHit for async API
+#[derive(Debug)]
 pub struct SearchHitOwned {
     /// Vector ID
     pub id: u32,
@@ -2176,18 +2378,41 @@ mod tests {
 
     #[test]
     fn test_cosine_distance_zero_vector() {
+        // Undefined input → error, never a fabricated number.
         let a = vec![0.0, 0.0];
         let b = vec![1.0, 0.0];
-        let dist = cosine_distance(&a, &b).unwrap();
-        assert!(dist.is_finite());
+        let err = cosine_distance(&a, &b).unwrap_err();
+        assert!(matches!(err, VectorDbError::ZeroVector));
     }
 
     #[test]
-    #[should_panic(expected = "vector dimension mismatch")]
+    fn test_cosine_distance_zero_vector_self_is_error() {
+        // Regression: the old 1e-20 epsilon norm floor made
+        // cosine_distance(zero, zero) return 1.0 — a number for an
+        // undefined input, violating both the "0 = identical" contract
+        // and error propagation. It must error instead.
+        let a = vec![0.0, -0.0, 0.0];
+        let err = cosine_distance(&a, &a).unwrap_err();
+        assert!(matches!(err, VectorDbError::ZeroVector));
+    }
+
+    #[test]
     fn test_cosine_distance_mismatched_lengths() {
+        // The fallible API returns an error instead of panicking (the old
+        // `#[should_panic]` assertion predates the length check).
         let a = vec![1.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        cosine_distance(&a, &b).unwrap();
+        let err = cosine_distance(&a, &b).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VectorDbError::DimensionMismatch {
+                    expected: 2,
+                    got: 3
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
