@@ -7,6 +7,57 @@ thread_local! {
     static PARSER_CACHE: RefCell<Option<(Language, Parser)>> = const { RefCell::new(None) };
 }
 
+/// Precomputed word-count index for O(1) word counting and O(log N) overlap lookup.
+struct WordIndex {
+    /// word_prefix[i] = number of words that start in text[0..i]
+    word_prefix: Vec<u32>,
+}
+
+impl WordIndex {
+    fn new(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut word_prefix = Vec::with_capacity(bytes.len() + 1);
+        word_prefix.push(0);
+        let mut count: u32 = 0;
+        let mut in_word = false;
+        for &b in bytes {
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                count += 1;
+            }
+            word_prefix.push(count);
+        }
+        Self { word_prefix }
+    }
+
+    #[inline]
+    fn count_words(&self, start: usize, end: usize) -> u32 {
+        if start >= end || end >= self.word_prefix.len() {
+            return 0;
+        }
+        self.word_prefix[end] - self.word_prefix[start]
+    }
+
+    /// Find the byte offset where `overlap` words end before `before_byte`.
+    /// Returns (overlap_start, before_byte) or None.
+    fn overlap_range(&self, before_byte: usize, overlap: usize) -> Option<(usize, usize)> {
+        if overlap == 0 || before_byte == 0 || before_byte >= self.word_prefix.len() {
+            return None;
+        }
+        let words_here = self.word_prefix[before_byte] as usize;
+        if words_here <= overlap {
+            return Some((0, before_byte));
+        }
+        let target = words_here - overlap;
+        // Binary search for the smallest byte position where word_prefix[pos] >= target
+        let pos = self.word_prefix[..=before_byte].binary_search_by(|w| (*w as usize).cmp(&target));
+        let byte_pos = pos.unwrap_or_else(|i| i);
+        Some((byte_pos, before_byte))
+    }
+}
+
 #[derive(Default)]
 pub struct SyntaxChunker {
     word_chunker: Chunker,
@@ -62,6 +113,7 @@ fn parse_and_chunk(
     })?;
 
     let mut chunks: Vec<DocumentChunk> = Vec::new();
+    let word_index = WordIndex::new(text);
     // Stack: (node, context_prefix) — context is only set for direct children
     // of an oversized node, never leaked to unrelated siblings.
     let mut stack: Vec<(Node, Option<(usize, usize)>)> = vec![(tree.root_node(), None)];
@@ -74,8 +126,8 @@ fn parse_and_chunk(
         // Comments are marked as "extra" by tree-sitter but are valuable for RAG
         if node.is_extra() {
             if is_comment_node(node.kind()) {
-                let word_count = count_words(text, node.start_byte(), node.end_byte());
-                if word_count >= 2 {
+                let wc = word_index.count_words(node.start_byte(), node.end_byte());
+                if wc >= 2 {
                     chunks.push(DocumentChunk {
                         id: String::new(),
                         text: String::new(),
@@ -97,10 +149,10 @@ fn parse_and_chunk(
         let prev_end = chunks.last().map(|c| c.end_offset).unwrap_or(0);
 
         if is_top_level_node(kind) {
-            let word_count = count_words(text, node.start_byte(), node.end_byte());
+            let wc = word_index.count_words(node.start_byte(), node.end_byte());
 
-            if word_count > 0 && word_count <= max_chunk_size {
-                let olap = compute_overlap_range(text, node.start_byte(), overlap);
+            if wc > 0 && (wc as usize) <= max_chunk_size {
+                let olap = word_index.overlap_range(node.start_byte(), overlap);
                 let (cs, ce) = merge_ranges(ctx, olap, node.start_byte(), node.end_byte(), prev_end);
 
                 chunks.push(DocumentChunk {
@@ -125,14 +177,14 @@ fn parse_and_chunk(
                     if child.is_error() || child.is_missing() || !child.is_named() {
                         continue;
                     }
-                    let cw = count_words(text, child.start_byte(), child.end_byte());
+                    let cw = word_index.count_words(child.start_byte(), child.end_byte());
                     if cw == 0 {
                         continue;
                     }
 
                     let child_prev = chunks.last().map(|c| c.end_offset).unwrap_or(0);
-                    if cw <= max_chunk_size {
-                        let olap = compute_overlap_range(text, child.start_byte(), overlap);
+                    if (cw as usize) <= max_chunk_size {
+                        let olap = word_index.overlap_range(child.start_byte(), overlap);
                         let (cs, ce) = merge_ranges(
                             Some(this_ctx),
                             olap,
@@ -187,9 +239,9 @@ fn parse_and_chunk(
         // Leaf node
         let start = node.start_byte();
         let end = node.end_byte();
-        let word_count = count_words(text, start, end);
+        let wc = word_index.count_words(start, end);
 
-        if word_count < 2 {
+        if wc < 2 {
             continue;
         }
 
@@ -197,7 +249,7 @@ fn parse_and_chunk(
             continue;
         }
 
-        let olap = compute_overlap_range(text, start, overlap);
+        let olap = word_index.overlap_range(start, overlap);
         let (cs, ce) = merge_ranges(ctx, olap, start, end, prev_end);
 
         chunks.push(DocumentChunk {
@@ -252,43 +304,6 @@ fn merge_ranges(
     }
 
     (start, node_end)
-}
-
-/// Compute the overlap byte range: the N words before `before_byte`.
-fn compute_overlap_range(text: &str, before_byte: usize, overlap: usize) -> Option<(usize, usize)> {
-    if overlap == 0 || before_byte == 0 {
-        return None;
-    }
-
-    let mut words_found = 0;
-    let mut in_word = false;
-    let mut last_word_end = before_byte;
-    let mut i = before_byte;
-
-    while i > 0 {
-        i -= 1;
-        let ch = text.as_bytes()[i];
-        if ch == b' ' || ch == b'\t' || ch == b'\n' || ch == b'\r' {
-            if in_word {
-                words_found += 1;
-                if words_found > overlap {
-                    return Some((last_word_end, before_byte));
-                }
-            }
-            in_word = false;
-        } else {
-            if !in_word {
-                last_word_end = i + 1;
-            }
-            in_word = true;
-        }
-    }
-
-    if words_found > 0 {
-        Some((0, before_byte))
-    } else {
-        None
-    }
 }
 
 /// Merge adjacent chunks that are too small into a single meaningful chunk.
@@ -448,69 +463,92 @@ fn is_comment_node(kind: &str) -> bool {
     )
 }
 
+// Sorted for binary_search. Must stay sorted!
+static TOP_LEVEL_NODES: &[&str] = &[
+    "annotation_type_declaration",
+    "arrow_function",
+    "attribute",
+    "block",
+    "block_mapping",
+    "block_sequence",
+    "class",
+    "class_declaration",
+    "class_definition",
+    "compilation_unit",
+    "constructor_declaration",
+    "declaration",
+    "def_function",
+    "def_module",
+    "defp_function",
+    "document",
+    "element",
+    "enum_declaration",
+    "enum_definition",
+    "enum_item",
+    "enum_specifier",
+    "export_statement",
+    "field_declaration",
+    "function",
+    "function_clause",
+    "function_declaration",
+    "function_definition",
+    "function_def",
+    "function_item",
+    "function_signature_item",
+    "generator_function_declaration",
+    "impl_item",
+    "import_declaration",
+    "initializer",
+    "interface_declaration",
+    "interface_definition",
+    "keyframes_statement",
+    "local_function_declaration",
+    "local_variable_declaration",
+    "macro_definition",
+    "macro_def",
+    "media_statement",
+    "method",
+    "method_declaration",
+    "method_definition",
+    "module",
+    "module_definition",
+    "namespace_declaration",
+    "namespace_definition",
+    "object_definition",
+    "package_declaration",
+    "preproc_def",
+    "preproc_else",
+    "preproc_endif",
+    "preproc_function_def",
+    "preproc_if",
+    "preproc_ifdef",
+    "preproc_ifndef",
+    "preproc_include",
+    "program",
+    "record_declaration",
+    "rule",
+    "rule_set",
+    "script_element",
+    "service_definition",
+    "singleton_method",
+    "source_file",
+    "static_initializer",
+    "struct_declaration",
+    "struct_item",
+    "struct_specifier",
+    "style_element",
+    "trait_definition",
+    "trait_item",
+    "type_alias_declaration",
+    "type_definition",
+    "type_item",
+    "val_definition",
+    "variable_assignment",
+    "variable_declaration",
+];
+
 fn is_top_level_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        // Root
-        "source_file" | "program" | "compilation_unit" | "module_definition" | "document"
-        // Rust
-            | "function_item" | "function_signature_item" | "struct_item"
-            | "enum_item" | "impl_item" | "trait_item" | "type_item"
-            | "mod_item" | "macro_definition"
-        // Python
-            | "decorated_definition"
-        // JavaScript / TypeScript
-            | "method_definition" | "type_alias_declaration" | "export_statement"
-            | "generator_function_declaration" | "arrow_function"
-        // Go
-            | "function"
-        // C / C++
-            | "struct_specifier" | "enum_specifier"
-            | "preproc_include" | "preproc_def" | "preproc_ifdef"
-            | "preproc_ifndef" | "preproc_if" | "preproc_else"
-            | "preproc_endif" | "preproc_function_def"
-        // Java
-            | "record_declaration" | "annotation_type_declaration"
-            | "field_declaration" | "static_initializer" | "initializer"
-            | "import_declaration" | "package_declaration"
-        // C#
-            | "namespace_declaration" | "struct_declaration"
-        // Ruby
-            | "class" | "module" | "method" | "singleton_method"
-        // PHP
-            | "namespace_definition" | "interface_definition"
-        // Scala
-            | "object_definition" | "val_definition"
-        // HTML
-            | "element" | "script_element" | "style_element"
-        // CSS
-            | "rule_set" | "media_statement" | "keyframes_statement"
-        // YAML
-            | "block_mapping" | "block_sequence"
-        // Lua
-            | "local_function_declaration" | "local_variable_declaration"
-        // Zig
-            | "decl"
-        // Elixir
-            | "def_module" | "def_function" | "defp_function"
-        // Erlang
-            | "function_clause"
-        // HCL
-            | "block"
-        // Protobuf
-            | "message_definition" | "service_definition" | "enum_definition"
-        // CMake
-            | "function_def" | "macro_def"
-        // Make
-            | "rule" | "variable_assignment"
-        // Shared across multiple languages (deduplicated)
-            | "function_definition" | "function_declaration"
-            | "class_definition" | "class_declaration"
-            | "interface_declaration" | "enum_declaration"
-            | "method_declaration" | "constructor_declaration"
-            | "type_definition" | "trait_definition"
-            | "variable_declaration" | "attribute"
-    )
+    TOP_LEVEL_NODES.binary_search(&kind).is_ok()
 }
 
 pub fn language_for_extension(ext: &str) -> Option<Language> {
