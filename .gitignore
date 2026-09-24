@@ -9,4 +9,4 @@
 *.lock
 test_*.db
 
-*.db.wal*
+*.db.*

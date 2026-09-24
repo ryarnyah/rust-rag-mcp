@@ -1122,6 +1122,16 @@ async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata(
             Some(b"beta".to_vec()),
             "B's metadata should be restored from WAL"
         );
+        // B's row existed on disk without metadata, so open() counted it as
+        // deleted; after the WAL restores the metadata it must be counted
+        // live again (otherwise live_len/deletion ratio drift permanently).
+        assert_eq!(
+            db.deleted_count(),
+            0,
+            "restored row must not stay counted as deleted"
+        );
+        assert_eq!(db.live_len(), 2, "both rows are live after recovery");
+        db.integrity_check()?;
     }
 
     cleanup("test_wal_meta_missing.db");
@@ -1157,7 +1167,10 @@ async fn test_insert_works_after_compact() -> Result<()> {
         assert_eq!(before, 6, "compaction should leave 6 live vectors");
         assert_eq!(db.deleted_count(), 0, "compaction resets deleted_count");
         let new_id = db.insert(&[100.0; 4], Some(b"post-compact"))?;
-        assert_eq!(new_id as usize, before, "insert should append after compaction");
+        assert_eq!(
+            new_id as usize, before,
+            "insert should append after compaction"
+        );
         assert_eq!(db.live_len(), before + 1, "6 live + 1 new = 7");
         db.flush().await?;
         db.close().await?;
@@ -1167,7 +1180,11 @@ async fn test_insert_works_after_compact() -> Result<()> {
     {
         let cfg = Config::new(4).with_capacity(64);
         let db = VectorDb::open("test_compact_wal.db", cfg).await?;
-        assert_eq!(db.live_len(), 7, "expected 6 surviving + 1 post-compact insert");
+        assert_eq!(
+            db.live_len(),
+            7,
+            "expected 6 surviving + 1 post-compact insert"
+        );
         let found = (0..db.len() as u32).any(|id| {
             db.get_meta(id)
                 .ok()
@@ -1175,7 +1192,10 @@ async fn test_insert_works_after_compact() -> Result<()> {
                 .map(|m| m == b"post-compact")
                 .unwrap_or(false)
         });
-        assert!(found, "post-compact insert metadata should be present after reopen");
+        assert!(
+            found,
+            "post-compact insert metadata should be present after reopen"
+        );
     }
 
     cleanup("test_compact_wal.db");

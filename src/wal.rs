@@ -1084,7 +1084,11 @@ mod tests {
         // Read the WAL back through an independent handle: the record that was
         // just logged must already be present (LOG-BEFORE-APPLY).
         let recs = read_records(&WriteAheadLog::wal_path(&db_path));
-        assert_eq!(recs.len(), 1, "record must be written before log_insert returns");
+        assert_eq!(
+            recs.len(),
+            1,
+            "record must be written before log_insert returns"
+        );
         assert_eq!(recs[0].vector_id, 7);
         assert_eq!(recs[0].metadata, b"hello");
 

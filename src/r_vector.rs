@@ -596,15 +596,20 @@ struct HnswIndex {
     mmap: Option<MmapMut>,
     cfg: Config,
     rng: Rng,
-    /// Reusable scratch buffers for search_layer and insert to avoid per-call allocations.
-    /// Safety: only accessed within &self or &mut self methods, never across threads.
-    /// VectorDb is behind RwLock, so concurrent access is prevented externally.
-    scratch: UnsafeCell<SearchBuffers>,
 }
 
-// SAFETY: HnswIndex is only accessed through VectorDb which is behind RwLock,
-// preventing concurrent access to scratch buffers.
-unsafe impl Sync for HnswIndex {}
+thread_local! {
+    /// Per-thread traversal scratch, reused across HNSW operations to avoid
+    /// ~50 heap allocations per insert/search.
+    ///
+    /// Thread locality is a safety requirement, not just an allocation
+    /// optimisation: concurrent searches share `&HnswIndex` through the
+    /// database read lock, so candidate/visited/result heaps stored inside
+    /// the index would be mutated by several threads at once (data race).
+    /// Per-thread buffers make each traversal independent without taking a
+    /// lock around the whole search.
+    static SCRATCH: UnsafeCell<SearchBuffers> = UnsafeCell::new(SearchBuffers::new());
+}
 
 /// Pre-allocated scratch buffers reused across HNSW operations.
 /// Eliminates ~50 heap allocations per insert/search by clearing
@@ -621,17 +626,18 @@ struct SearchBuffers {
 }
 
 impl SearchBuffers {
-    fn new(cfg: &Config) -> Self {
-        let ef = cfg.ef_construction;
+    /// Default capacity hints (matching the default `ef_construction` /
+    /// `m0`). The buffers grow on demand if a configuration needs more.
+    fn new() -> Self {
         Self {
-            visited: HashSet::with_capacity(ef * 2),
-            candidates: BinaryHeap::with_capacity(ef),
-            results: BinaryHeap::with_capacity(ef + 1),
-            search_output: Vec::with_capacity(ef),
-            select_result: Vec::with_capacity(cfg.m0),
-            select_seen: HashSet::with_capacity(cfg.m0 * 2),
+            visited: HashSet::with_capacity(300),
+            candidates: BinaryHeap::with_capacity(150),
+            results: BinaryHeap::with_capacity(151),
+            search_output: Vec::with_capacity(150),
+            select_result: Vec::with_capacity(64),
+            select_seen: HashSet::with_capacity(128),
             cross_cache: HashMap::new(),
-            dists: Vec::with_capacity(ef),
+            dists: Vec::with_capacity(150),
         }
     }
 }
@@ -699,7 +705,6 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: *cfg,
                 rng: Rng::new(cfg.seed),
-                scratch: UnsafeCell::new(SearchBuffers::new(cfg)),
             })
         } else {
             // Load existing index
@@ -763,7 +768,6 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: on_disk,
                 rng: Rng::new(seed),
-                scratch: UnsafeCell::new(SearchBuffers::new(&on_disk)),
             })
         }
     }
@@ -774,6 +778,20 @@ impl HnswIndex {
 
     fn mmap_mut(&mut self) -> &mut MmapMut {
         self.mmap.as_mut().expect("hnsw mmap present")
+    }
+
+    /// Raw pointer to *this thread's* traversal scratch buffers.
+    ///
+    /// Returning a raw pointer keeps the existing call structure (borrow the
+    /// buffers for a scoped block, then release) without fighting the
+    /// borrow checker over a thread-local. Safety: the buffer lives in
+    /// thread-local storage, so no other thread can observe it; callers must
+    /// still scope their borrows so a nested operation that also touches the
+    /// scratch (e.g. `search_layer` called from `insert`) never runs while a
+    /// previous borrow is live.
+    #[inline]
+    fn scratch(&self) -> *mut SearchBuffers {
+        SCRATCH.with(|c| c.get())
     }
 
     fn count(&self) -> usize {
@@ -806,6 +824,84 @@ impl HnswIndex {
 
     fn node_offset(&self, id: u32) -> usize {
         HNSW_HEADER + id as usize * Self::node_bytes(&self.cfg)
+    }
+
+    /// Validate every structural invariant the graph layout relies on.
+    ///
+    /// Checks, for each node: the sampled level is within bounds, each used
+    /// layer's neighbor count is within that layer's capacity, and every
+    /// neighbor is an in-range id that is neither a self-link nor a duplicate.
+    /// Also validates the header (count vs capacity, entry point range,
+    /// max level).
+    ///
+    /// Layout-agnostic: it only asserts *semantics*, so it stays valid across
+    /// on-disk layout refactors. O(N) over the whole graph — intended for
+    /// tests, post-compaction verification, and manual diagnostics, not hot
+    /// paths. The first violation is returned as `VectorDbError::Corruption`.
+    fn integrity_check(&self) -> Result<()> {
+        let count = self.count();
+        let cap = self.capacity();
+        if count > cap {
+            return Err(VectorDbError::Corruption(format!(
+                "graph holds {count} nodes but capacity is {cap}"
+            )));
+        }
+
+        let ep = self.entry_point();
+        if ep != NONE && (ep as usize) >= count {
+            return Err(VectorDbError::Corruption(format!(
+                "entry point {ep} is outside node range 0..{count}"
+            )));
+        }
+
+        let max_level = self.max_level() as usize;
+        if max_level > self.cfg.max_level {
+            return Err(VectorDbError::Corruption(format!(
+                "header max_level {max_level} exceeds configured maximum {}",
+                self.cfg.max_level
+            )));
+        }
+
+        for id in 0..count as u32 {
+            let level = self.node_level(id) as usize;
+            if level > self.cfg.max_level {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} has level {level} > configured maximum {}",
+                    self.cfg.max_level
+                )));
+            }
+
+            for layer in 0..=level {
+                let n = self.layer_count(id, layer);
+                let layer_cap = Self::layer_capacity(&self.cfg, layer);
+                if n > layer_cap {
+                    return Err(VectorDbError::Corruption(format!(
+                        "node {id} layer {layer} has {n} neighbors > capacity {layer_cap}"
+                    )));
+                }
+
+                let mut seen: HashSet<u32> = HashSet::with_capacity(n);
+                for i in 0..n {
+                    let neighbor = self.layer_neighbor(id, layer, i);
+                    if (neighbor as usize) >= count {
+                        return Err(VectorDbError::Corruption(format!(
+                            "node {id} layer {layer} links to {neighbor}, outside 0..{count}"
+                        )));
+                    }
+                    if neighbor == id {
+                        return Err(VectorDbError::Corruption(format!(
+                            "node {id} layer {layer} links to itself"
+                        )));
+                    }
+                    if !seen.insert(neighbor) {
+                        return Err(VectorDbError::Corruption(format!(
+                            "node {id} layer {layer} lists neighbor {neighbor} twice"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn node_level(&self, id: u32) -> u8 {
@@ -989,6 +1085,13 @@ impl HnswIndex {
         new: u32,
         dist: &F,
     ) -> Result<()> {
+        if new == id {
+            // A node can surface as its own candidate while its edges are
+            // being rebuilt (it is still reachable through other nodes'
+            // lists). A self-link would waste a neighbor slot and break the
+            // no-self-loops invariant of the graph.
+            return Ok(());
+        }
         let cap = Self::layer_capacity(&self.cfg, layer);
         let mut neighbors = self.layer_neighbors(id, layer);
         if !neighbors.contains(&new) {
@@ -1037,7 +1140,7 @@ impl HnswIndex {
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
     {
-        let scratch = unsafe { &mut *self.scratch.get() };
+        let scratch = unsafe { &mut *self.scratch() };
         scratch.visited.clear();
         scratch.visited.insert(entry);
 
@@ -1192,7 +1295,7 @@ impl HnswIndex {
 
             let cap = Self::layer_capacity(&self.cfg, layer);
             let selected = {
-                let scratch = unsafe { &mut *self.scratch.get() };
+                let scratch = unsafe { &mut *self.scratch() };
                 scratch.dists.clear();
                 scratch
                     .dists
@@ -1216,7 +1319,7 @@ impl HnswIndex {
                 self.add_link(n, layer, new_id, &dist)?;
             }
 
-            let scratch = unsafe { &*self.scratch.get() };
+            let scratch = unsafe { &*self.scratch() };
             if let Some(&(_, e)) = scratch.search_output.first() {
                 ep = e;
             }
@@ -1279,7 +1382,7 @@ impl HnswIndex {
         }
 
         self.search_layer(ep, 0, ef.max(k), &dist, is_deleted)?;
-        let scratch = unsafe { &*self.scratch.get() };
+        let scratch = unsafe { &*self.scratch() };
         scratch
             .search_output
             .iter()
@@ -1489,9 +1592,16 @@ impl VectorDb {
                         recovered_count += 1;
                     } else if self.meta.get(record.vector_id).is_none() {
                         // Vector data exists but metadata missing (data flushed
-                        // before crash, metadata/metadata not yet flushed).
+                        // before crash, metadata not yet flushed).
                         // Restore metadata from WAL record.
                         self.meta.put(record.vector_id, 0, &record.metadata)?;
+                        // The row was counted as *deleted* during open, because
+                        // missing metadata reads as deleted (see
+                        // `MetadataStore::is_deleted`). With its metadata back,
+                        // the row is live again — keep `deleted_count` in sync,
+                        // otherwise `live_len()`/compaction triggers drift.
+                        // (If a Delete record follows, it re-increments below.)
+                        self.deleted_count = self.deleted_count.saturating_sub(1);
                         recovered_count += 1;
                     }
                 }
@@ -1641,11 +1751,15 @@ impl VectorDb {
                 .search_layer(ep, layer, self.cfg.ef_construction, &to_new, &is_deleted)?;
             let cap = HnswIndex::layer_capacity(&self.cfg, layer);
             {
-                let scratch = unsafe { &mut *self.index.scratch.get() };
+                let scratch = unsafe { &mut *self.index.scratch() };
                 scratch.dists.clear();
                 scratch
                     .dists
                     .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
+                // The rebuilt node is still reachable through other nodes'
+                // links, so it can rank itself at distance 0 here. Drop it:
+                // it must not consume a neighbor slot of its own list.
+                scratch.dists.retain(|&(n, _)| n != id);
                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
                 let (dists_ptr, scratch_ptr) = {
                     let d = &scratch.dists as *const Vec<(u32, f32)>;
@@ -1663,7 +1777,7 @@ impl VectorDb {
                     self.index.add_link(n, layer, id, &dist)?;
                 }
             }
-            let scratch = unsafe { &*self.index.scratch.get() };
+            let scratch = unsafe { &*self.index.scratch() };
             if let Some(&(_, e)) = scratch.search_output.first() {
                 ep = e;
             }
@@ -1773,6 +1887,71 @@ impl VectorDb {
         total > 0 && ratio > 0.30
     }
 
+    /// Validate the structural integrity of all three on-disk structures.
+    ///
+    /// Verifies the vector file (row count vs capacity, row bytes fit in the
+    /// mapping), metadata coverage (every row has a record, `deleted_count`
+    /// matches the tombstoned rows), and the HNSW graph (per-node levels,
+    /// neighbor counts/bounds, entry point — see `HnswIndex::integrity_check`).
+    ///
+    /// All checks are layout-agnostic invariants, so they remain meaningful
+    /// across storage-layout refactors. O(N) — use after compaction, in
+    /// tests, or for diagnostics; not on hot paths.
+    pub fn integrity_check(&self) -> Result<()> {
+        let len = self.len();
+        let cap = self.capacity();
+        if len > cap {
+            return Err(VectorDbError::Corruption(format!(
+                "vector count {len} exceeds capacity {cap}"
+            )));
+        }
+
+        let row_bytes = self
+            .cfg
+            .dim
+            .checked_mul(4)
+            .ok_or_else(|| VectorDbError::Corruption("row size overflow".into()))?;
+        let needed = len
+            .checked_mul(row_bytes)
+            .and_then(|b| b.checked_add(VEC_HEADER))
+            .ok_or_else(|| VectorDbError::Corruption("file size overflow".into()))?;
+        if needed > self.mmap().len() {
+            return Err(VectorDbError::Corruption(format!(
+                "vector mapping holds {} bytes but {len} rows need {needed}",
+                self.mmap().len()
+            )));
+        }
+
+        if self.index.count() > len {
+            return Err(VectorDbError::Corruption(format!(
+                "graph has {} nodes but the vector file holds {len} rows",
+                self.index.count()
+            )));
+        }
+
+        // Every row (live or tombstoned) must carry a metadata record, and
+        // `deleted_count` must agree with what the metadata store reports.
+        let mut tombstoned = 0usize;
+        for id in 0..len as u32 {
+            if !self.meta.index.contains_key(&id) {
+                return Err(VectorDbError::Corruption(format!(
+                    "row {id} has no metadata record"
+                )));
+            }
+            if self.meta.is_deleted(id) {
+                tombstoned += 1;
+            }
+        }
+        if tombstoned != self.deleted_count {
+            return Err(VectorDbError::Corruption(format!(
+                "deleted_count is {} but metadata reports {tombstoned} tombstoned rows",
+                self.deleted_count
+            )));
+        }
+
+        self.index.integrity_check()
+    }
+
     fn capacity(&self) -> usize {
         u64::from_le_bytes(self.mmap()[24..32].try_into().unwrap()) as usize
     }
@@ -1781,16 +1960,22 @@ impl VectorDb {
         self.mmap_mut()[16..24].copy_from_slice(&(n as u64).to_le_bytes());
     }
 
+    /// Byte offset of row `i` within the vector file mapping.
+    #[inline]
+    fn row_offset(&self, i: usize) -> usize {
+        VEC_HEADER + i * self.cfg.dim * 4
+    }
+
     fn row(&self, i: usize) -> &[f32] {
         let dim = self.cfg.dim;
-        let start = VEC_HEADER + i * dim * 4;
+        let start = self.row_offset(i);
         let bytes = &self.mmap()[start..start + dim * 4];
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, dim) }
     }
 
     fn row_mut(&mut self, i: usize) -> &mut [f32] {
         let dim = self.cfg.dim;
-        let start = VEC_HEADER + i * dim * 4;
+        let start = self.row_offset(i);
         let bytes = &mut self.mmap_mut()[start..start + dim * 4];
         unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, dim) }
     }
@@ -2134,6 +2319,10 @@ impl VectorDb {
         self.wal = reopened.wal;
         self._lock_file = reopened._lock_file;
         self.deleted_count = 0;
+        // Compaction rewrote every row and renumbered ids; verify the
+        // rebuilt files satisfy all structural invariants before the
+        // database is handed back to callers.
+        self.integrity_check()?;
         Ok(())
     }
 
@@ -2290,6 +2479,15 @@ impl AsyncVectorDb {
     /// Returns (deleted_count, total_count, deletion_ratio)
     pub async fn deletion_stats(&self) -> (usize, usize, f32) {
         self.db.read().await.deletion_stats()
+    }
+
+    /// Validate structural integrity of the whole database (async read).
+    ///
+    /// See [`VectorDb::integrity_check`]: layout-agnostic invariants over
+    /// the vector file, metadata coverage, and the HNSW graph. O(N) — for
+    /// tests and diagnostics, not hot paths.
+    pub async fn integrity_check(&self) -> Result<()> {
+        self.db.read().await.integrity_check()
     }
 
     /// Check if compaction should be triggered (async read)
@@ -2480,5 +2678,142 @@ mod tests {
             assert!(f >= 0.0);
             assert!(f < 1.0);
         }
+    }
+
+    // -------------------------------------------------------------------
+    //  Structural integrity safety net
+    // -------------------------------------------------------------------
+
+    /// Deterministic non-zero vector (an all-zero vector would be stored as
+    /// an unlinked placeholder row instead of entering the graph).
+    fn random_nonzero(rng: &mut Rng, dim: usize) -> Vec<f32> {
+        loop {
+            let v: Vec<f32> = (0..dim)
+                .map(|_| (rng.next_f64() * 2.0 - 1.0) as f32)
+                .collect();
+            if !is_placeholder_vector(&v) {
+                return v;
+            }
+        }
+    }
+
+    /// Structured insert/delete/update sequence: every phase (including a
+    /// flush + reopen cycle) must leave all three files structurally sound.
+    #[tokio::test]
+    async fn integrity_check_after_random_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(16).with_capacity(32).with_seed(0xA11CE);
+
+        {
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            let mut rng = Rng::new(4242);
+            let mut ids = Vec::new();
+            for i in 0..200u32 {
+                let v = random_nonzero(&mut rng, 16);
+                let id = db.insert(&v, Some(format!("row-{i}").as_bytes())).unwrap();
+                ids.push(id);
+            }
+            // A placeholder row exercises the unlinked-node bookkeeping path.
+            db.insert(&[0.0; 16], Some(b"placeholder")).unwrap();
+            db.integrity_check().unwrap();
+
+            // Tombstone a third of the rows (deleted nodes keep their edges).
+            for &id in ids.iter().step_by(3) {
+                assert!(db.delete(id).unwrap());
+            }
+            db.integrity_check().unwrap();
+
+            // Update every third surviving row (rebuilds its edges in place).
+            for &id in ids.iter().skip(1).step_by(3) {
+                if !db.is_deleted(id) {
+                    let v = random_nonzero(&mut rng, 16);
+                    db.update(id, &v, None).unwrap();
+                }
+            }
+            db.integrity_check().unwrap();
+            db.flush().await.unwrap();
+        }
+
+        // Reopen: the on-disk structures must satisfy the same invariants.
+        {
+            let db = VectorDb::open(&path, cfg).await.unwrap();
+            db.integrity_check().unwrap();
+            assert_eq!(db.len(), 201, "200 real rows + 1 placeholder");
+        }
+    }
+
+    /// The checker must actually detect violations — a test-only checker that
+    /// silently passes corrupt data would give false confidence.
+    #[tokio::test]
+    async fn integrity_check_detects_corrupt_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(8).with_capacity(64).with_seed(7);
+
+        let mut db = VectorDb::open(&path, cfg).await.unwrap();
+        let mut rng = Rng::new(99);
+        for _ in 0..30 {
+            let v = random_nonzero(&mut rng, 8);
+            db.insert(&v, None).unwrap();
+        }
+        db.integrity_check().unwrap();
+
+        // Find a node that actually has layer-0 neighbors to corrupt.
+        let count = db.index.count() as u32;
+        let linked = (0..count).find(|&id| db.index.layer_count(id, 0) > 0);
+        let linked = linked.expect("graph with 30 nodes must have some edges");
+
+        // 1. Out-of-range neighbor.
+        let saved = db.index.layer_neighbor(linked, 0, 0);
+        db.index.set_layer_neighbor(linked, 0, 0, count + 1000);
+        assert!(
+            db.integrity_check().is_err(),
+            "out-of-range neighbor must be detected"
+        );
+        db.index.set_layer_neighbor(linked, 0, 0, saved);
+
+        // 2. Self-link.
+        db.index.set_layer_neighbor(linked, 0, 0, linked);
+        assert!(db.integrity_check().is_err(), "self-link must be detected");
+        db.index.set_layer_neighbor(linked, 0, 0, saved);
+
+        // Restored graph is clean again.
+        db.integrity_check().unwrap();
+    }
+
+    /// Row layout guard: rows must occupy a uniform stride inside the vector
+    /// mapping and round-trip exactly. (A layout change that makes rows
+    /// page-aligned keeps the stride uniform — only its value changes.)
+    #[tokio::test]
+    async fn vector_rows_use_uniform_stride() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        // dim=24 → 96-byte rows, deliberately not a power-of-two multiple.
+        let cfg = Config::new(24).with_capacity(8);
+
+        let mut db = VectorDb::open(&path, cfg).await.unwrap();
+        let mut rng = Rng::new(3);
+        let mut stored = Vec::new();
+        for _ in 0..50 {
+            let v = random_nonzero(&mut rng, 24);
+            db.insert(&v, None).unwrap();
+            stored.push(v);
+        }
+
+        let stride = db.row_offset(1) - db.row_offset(0);
+        for (i, v) in stored.iter().enumerate() {
+            assert_eq!(db.row_offset(i + 1) - db.row_offset(i), stride, "row {i}");
+            assert_eq!(
+                db.get(i as u32).unwrap(),
+                Some(v.clone()),
+                "row {i} must round-trip exactly"
+            );
+        }
+        assert!(
+            db.row_offset(50) <= db.mmap().len(),
+            "rows must fit inside the mapping"
+        );
+        db.integrity_check().unwrap();
     }
 }
