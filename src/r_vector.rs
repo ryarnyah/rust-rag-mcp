@@ -638,7 +638,10 @@ impl MetadataStore {
 //  HNSW Index
 // ============================================================================
 
-const HNSW_MAGIC: u64 = 0x484E_5357_0000_0002;
+/// Format v3: variable-length node blocks sized by their level (see
+/// [`HnswIndex::node_bytes`]) placed in an append-only arena, addressed
+/// through an in-memory offset directory instead of `id * fixed_size`.
+const HNSW_MAGIC: u64 = 0x484E_5357_0000_0003;
 const HNSW_HEADER: usize = 128;
 const HNSW_FLAG_DELETED: u8 = 1;
 const NONE: u32 = u32::MAX;
@@ -650,6 +653,14 @@ struct HnswIndex {
     mmap: Option<MmapMut>,
     cfg: Config,
     rng: Rng,
+    /// Offset directory: `dir[id]` is the byte offset of node `id`'s block.
+    ///
+    /// v3 stores each node in a variable-length block sized for *its* level
+    /// (levels are sampled once at insertion and never change), so blocks are
+    /// not at a fixed stride and need an index. The directory is rebuilt from
+    /// the file at open time (blocks are self-describing) and only ever grows
+    /// by appending, matching the append-only arena layout.
+    dir: Vec<u64>,
 }
 
 thread_local! {
@@ -697,12 +708,19 @@ impl SearchBuffers {
 }
 
 impl HnswIndex {
-    /// Calculate bytes per node (all layers combined)
-    fn node_bytes(cfg: &Config) -> usize {
-        // 8 bytes: level (u8) + flags (u8) + padding (6)
-        // Layer 0: 4 (count) + m0*4 (neighbors)
-        // Layers 1..max: (4 + m*4) each
-        8 + (4 + cfg.m0 * 4) + cfg.max_level * (4 + cfg.m * 4)
+    /// Bytes for one node block at a given level.
+    ///
+    /// A block is sized for exactly the levels the node has (the level is
+    /// sampled once at insertion and never changes), instead of reserving
+    /// space for `cfg.max_level` layers on every node. Since ~1 - 1/m of all
+    /// nodes live at layer 0, the average block shrinks from
+    /// `node_bytes(cfg, max_level)` (760 B at defaults) to ~176 B.
+    ///
+    /// Block layout (all little-endian):
+    /// `[level u8][flags u8][size u32][pad u16]` then, per layer 0..=level:
+    /// `[count u32][count × neighbor id u32]`.
+    fn node_bytes(cfg: &Config, level: usize) -> usize {
+        8 + Self::layer_bytes(cfg, 0) + level * Self::layer_bytes(cfg, 1)
     }
 
     /// Calculate bytes for a single layer within a node
@@ -738,16 +756,18 @@ impl HnswIndex {
             .map_err(VectorDbError::Io)?;
 
         if !exists {
-            // Initialize new index
-            let cap = cfg.initial_capacity.max(16);
-            let size = HNSW_HEADER + cap * Self::node_bytes(cfg);
+            // Initialize new index: fixed header plus an arena pre-sized for
+            // a handful of level-0 blocks; the arena doubles as nodes arrive.
+            let initial = cfg.initial_capacity.max(16);
+            let size = HNSW_HEADER + initial * Self::node_bytes(cfg, 0);
             file.set_len(size as u64).map_err(VectorDbError::Io)?;
             let mut m = map_file(&file)?;
             m[0..8].copy_from_slice(&HNSW_MAGIC.to_le_bytes());
             m[8..16].copy_from_slice(&0u64.to_le_bytes()); // count
             m[16..20].copy_from_slice(&NONE.to_le_bytes()); // entry point
             m[20] = 0; // max level so far
-            m[24..32].copy_from_slice(&(cap as u64).to_le_bytes());
+            // Arena end: first byte after the last node block.
+            m[24..32].copy_from_slice(&(HNSW_HEADER as u64).to_le_bytes());
             m[32..40].copy_from_slice(&(cfg.m as u64).to_le_bytes());
             m[40..48].copy_from_slice(&(cfg.m0 as u64).to_le_bytes());
             m[48..56].copy_from_slice(&(cfg.max_level as u64).to_le_bytes());
@@ -760,10 +780,11 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: *cfg,
                 rng: Rng::new(cfg.seed),
+                dir: Vec::with_capacity(initial),
             })
         } else {
             // Load existing index
-            let m = map_file(&file)?;
+            let mut m = map_file(&file)?;
 
             // Validate magic
             let magic = u64::from_le_bytes(m[0..8].try_into().map_err(|_| {
@@ -771,6 +792,11 @@ impl HnswIndex {
             })?);
             if magic != HNSW_MAGIC {
                 return Err(VectorDbError::Corruption("invalid HNSW magic".to_string()));
+            }
+            if m.len() < HNSW_HEADER {
+                return Err(VectorDbError::Corruption(
+                    "HNSW file smaller than its header".to_string(),
+                ));
             }
 
             // Validate config compatibility
@@ -818,11 +844,67 @@ impl HnswIndex {
                     .map_err(|_| VectorDbError::Corruption("invalid count".to_string()))?,
             );
             let seed = on_disk.seed ^ (count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+
+            // Rebuild the offset directory by walking the self-describing
+            // node blocks. Every block is validated (level bounds, size
+            // consistent with the level, fits in the file) as it is visited,
+            // so a corrupt directory fails at open instead of panicking on
+            // first graph access.
+            let mut dir = Vec::with_capacity(count as usize);
+            let mut off = HNSW_HEADER;
+            for i in 0..count {
+                if off + 8 > m.len() {
+                    return Err(VectorDbError::Corruption(format!(
+                        "node {i} block header truncated at offset {off}"
+                    )));
+                }
+                let level = m[off];
+                if level as usize > on_disk.max_level {
+                    return Err(VectorDbError::Corruption(format!(
+                        "node {i} has level {level} > configured maximum {}",
+                        on_disk.max_level
+                    )));
+                }
+                let size = u32::from_le_bytes(m[off + 2..off + 6].try_into().map_err(|_| {
+                    VectorDbError::Corruption("node block header truncated".to_string())
+                })?) as usize;
+                if size != Self::node_bytes(&on_disk, level as usize) {
+                    return Err(VectorDbError::Corruption(format!(
+                        "node {i} block size {size} inconsistent with level {level}"
+                    )));
+                }
+                if off + size > m.len() {
+                    return Err(VectorDbError::Corruption(format!(
+                        "node {i} block extends past end of file"
+                    )));
+                }
+                dir.push(off as u64);
+                off += size;
+            }
+
+            // A crash between a block write and the header update can leave
+            // arena_end lagging behind (or ahead of) the last complete block;
+            // the walk is the source of truth, so heal the header.
+            let stored_arena_end = u64::from_le_bytes(
+                m[24..32]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("invalid arena end".to_string()))?,
+            ) as usize;
+            if stored_arena_end != off {
+                tracing::debug!(
+                    stored_arena_end,
+                    walked_end = off,
+                    "HNSW arena_end healed from node walk"
+                );
+                m[24..32].copy_from_slice(&(off as u64).to_le_bytes());
+            }
+
             Ok(Self {
                 file,
                 mmap: Some(m),
                 cfg: on_disk,
                 rng: Rng::new(seed),
+                dir,
             })
         }
     }
@@ -853,8 +935,17 @@ impl HnswIndex {
         u64::from_le_bytes(self.mmap()[8..16].try_into().unwrap()) as usize
     }
 
-    fn capacity(&self) -> usize {
+    /// First byte after the last node block, persisted in the header.
+    ///
+    /// Blocks are only ever appended (a node's block size never changes
+    /// after creation), so this single value bounds every possibly-dirtied
+    /// byte and doubles as the flush range end.
+    fn arena_end(&self) -> usize {
         u64::from_le_bytes(self.mmap()[24..32].try_into().unwrap()) as usize
+    }
+
+    fn set_arena_end(&mut self, end: usize) {
+        self.mmap_mut()[24..32].copy_from_slice(&(end as u64).to_le_bytes());
     }
 
     fn entry_point(&self) -> u32 {
@@ -878,7 +969,11 @@ impl HnswIndex {
     }
 
     fn node_offset(&self, id: u32) -> usize {
-        HNSW_HEADER + id as usize * Self::node_bytes(&self.cfg)
+        // Panics on an unregistered id — the same failure mode the previous
+        // fixed-stride arithmetic had for out-of-range nodes. Callers that
+        // can observe a missing node (integrity checks, recovery) test the
+        // directory first.
+        self.dir[id as usize] as usize
     }
 
     /// Validate every structural invariant the graph layout relies on.
@@ -895,10 +990,52 @@ impl HnswIndex {
     /// paths. The first violation is returned as `VectorDbError::Corruption`.
     fn integrity_check(&self) -> Result<()> {
         let count = self.count();
-        let cap = self.capacity();
-        if count > cap {
+        if self.dir.len() < count {
             return Err(VectorDbError::Corruption(format!(
-                "graph holds {count} nodes but capacity is {cap}"
+                "directory holds {} node blocks but count is {count}",
+                self.dir.len()
+            )));
+        }
+
+        // Directory / arena consistency: every registered block sits inside
+        // the file, is ordered (no overlaps), and its stored size matches
+        // the level it declares.
+        let file_len = self.mmap().len();
+        let mut walked_end = HNSW_HEADER;
+        for id in 0..count {
+            let off = self.dir[id] as usize;
+            if off + 8 > file_len {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} block header lies past end of file"
+                )));
+            }
+            if off < walked_end {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} block overlaps its predecessor"
+                )));
+            }
+            let size = u32::from_le_bytes(
+                self.mmap()[off + 2..off + 6]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("block header truncated".into()))?,
+            ) as usize;
+            if off + size > file_len {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} block extends past end of file"
+                )));
+            }
+            let level = self.mmap()[off] as usize;
+            if size != Self::node_bytes(&self.cfg, level) {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} block size {size} inconsistent with level {level}"
+                )));
+            }
+            walked_end = off + size;
+        }
+        let arena_end = self.arena_end();
+        if arena_end < walked_end || arena_end > file_len {
+            return Err(VectorDbError::Corruption(format!(
+                "arena_end {arena_end} inconsistent with last block end {walked_end} (file {file_len})"
             )));
         }
 
@@ -963,10 +1100,8 @@ impl HnswIndex {
         self.mmap()[self.node_offset(id)]
     }
 
-    fn set_level(&mut self, id: u32, l: u8) {
-        let off = self.node_offset(id);
-        self.mmap_mut()[off] = l;
-    }
+    // Note: there is deliberately no `set_level` — a node's level (and with
+    // it its block size) is fixed at creation in `write_node_block`.
 
     fn set_node_deleted(&mut self, id: u32) {
         let off = self.node_offset(id);
@@ -1015,17 +1150,82 @@ impl HnswIndex {
         (0..c).map(move |i| self.layer_neighbor(id, layer, i))
     }
 
-    fn grow(&mut self) -> Result<()> {
-        let new_cap = (self.capacity() * 2).max(16);
-        let new_size = HNSW_HEADER + new_cap * Self::node_bytes(&self.cfg);
+    /// Extend the file (by doubling) until the arena covers `end` bytes.
+    fn ensure_arena(&mut self, end: usize) -> Result<()> {
+        if end <= self.mmap().len() {
+            return Ok(());
+        }
+        let mut new_len = self.mmap().len().max(HNSW_HEADER + 1024);
+        while new_len < end {
+            new_len = new_len
+                .checked_mul(2)
+                .ok_or_else(|| VectorDbError::Corruption("HNSW file size overflow".to_string()))?;
+        }
         self.mmap = None;
         self.file
-            .set_len(new_size as u64)
+            .set_len(new_len as u64)
             .map_err(VectorDbError::Io)?;
-        let mut m = map_file(&self.file)?;
-        m[24..32].copy_from_slice(&(new_cap as u64).to_le_bytes());
-        self.mmap = Some(m);
+        self.mmap = Some(map_file(&self.file)?);
         Ok(())
+    }
+
+    /// Append an empty block for a node at `level` and register it as the
+    /// next directory entry.
+    ///
+    /// The block header carries `level`, flags (zero: freshly created) and
+    /// the block size; per-layer counts are zeroed because the arena may
+    /// hold leftover bytes from a crashed (unregistered) insertion.
+    fn write_node_block(&mut self, level: u8) -> Result<()> {
+        let size = Self::node_bytes(&self.cfg, level as usize);
+        let off = self.arena_end();
+        self.ensure_arena(off + size)?;
+        {
+            let m = self.mmap_mut();
+            m[off] = level;
+            m[off + 1] = 0; // flags
+            m[off + 2..off + 6].copy_from_slice(&(size as u32).to_le_bytes());
+            m[off + 6..off + 8].copy_from_slice(&0u16.to_le_bytes());
+        }
+        self.dir.push(off as u64);
+        let id = (self.dir.len() - 1) as u32;
+        for l in 0..=level as usize {
+            self.set_layer_count(id, l, 0);
+        }
+        self.set_arena_end(off + size);
+        Ok(())
+    }
+
+    /// Register node `id`, allocating its block (and any missing blocks for
+    /// ids between the current count and `id`, which a crash can leave as
+    /// gaps). Returns the node's level: freshly sampled for new blocks, or
+    /// the previously sampled one when `id` is already registered.
+    ///
+    /// Does **not** bump `count` for `id` itself — insertion completes the
+    /// node by calling [`Self::set_count`] once it is fully linked, so a
+    /// crash mid-insert never leaves a counted but unlinkable node.
+    fn alloc_node(&mut self, id: u32) -> Result<u8> {
+        // A previous insertion may have aborted after allocating its block
+        // but before counting it. Drop such orphans (reclaiming their arena
+        // space) so directory and count stay in lockstep before this
+        // allocation appends anything.
+        while self.dir.len() > self.count() {
+            let orphan = self.dir.pop().expect("directory non-empty above count");
+            self.set_arena_end(orphan as usize);
+        }
+        // Crash gaps: rows exist for these ids but their node block was
+        // never written. Register them as complete (but unlinked) nodes.
+        while (self.count() as u32) < id {
+            let level = self.sample_level() as u8;
+            self.write_node_block(level)?;
+            self.set_count(self.count() + 1);
+        }
+        if (self.count() as u32) > id {
+            // Already registered: the block (and its level) exists.
+            return Ok(self.node_level(id));
+        }
+        let level = self.sample_level() as u8;
+        self.write_node_block(level)?;
+        Ok(level)
     }
 
     fn sample_level(&mut self) -> usize {
@@ -1269,14 +1469,12 @@ impl HnswIndex {
     /// but they are never distance-compared, never become the entry point,
     /// and never receive or hold graph edges.
     fn register_unlinked(&mut self, new_id: u32) -> Result<()> {
-        while (new_id as usize) >= self.capacity() {
-            self.grow()?;
+        if (new_id as usize) < self.count() {
+            // Already registered (e.g. recovery replaying into a database
+            // where the crash already completed this node).
+            return Ok(());
         }
-        let level = self.sample_level();
-        self.set_level(new_id, level as u8);
-        for l in 0..=level {
-            self.set_layer_count(new_id, l, 0);
-        }
+        self.alloc_node(new_id)?;
         self.set_count((new_id as usize + 1).max(self.count()));
         Ok(())
     }
@@ -1287,12 +1485,12 @@ impl HnswIndex {
         F: Fn(u32, u32) -> Result<f32> + Copy,
         D: Fn(u32) -> bool,
     {
-        while (new_id as usize) >= self.capacity() {
-            self.grow()?;
-        }
-
-        let level = self.sample_level();
-        self.set_level(new_id, level as u8);
+        // Allocate the block for a new node (or find the existing one for a
+        // re-insert — edge rebuilds keep the block, whose size was fixed at
+        // creation together with the node's level).
+        let level = self.alloc_node(new_id)? as usize;
+        // (Re-)zero the per-layer counts: a fresh block may overlap crash
+        // leftovers, and a rebuild starts from cleared edges.
         for l in 0..=level {
             self.set_layer_count(new_id, l, 0);
         }
@@ -1389,7 +1587,7 @@ impl HnswIndex {
     }
 
     fn mark_deleted(&mut self, id: u32) {
-        if (id as usize) < self.capacity() {
+        if (id as usize) < self.count() {
             self.set_node_deleted(id);
         }
     }
@@ -1446,22 +1644,14 @@ impl HnswIndex {
             .collect()
     }
 
-    /// Sync written graph bytes: the fixed header plus every live node block.
+    /// Sync written graph bytes: the fixed header plus the whole node arena.
     ///
-    /// Node blocks are only ever written for ids `< count`, so syncing
-    /// `[0, end)` covers every possibly-dirtied byte and skips the unused
-    /// capacity tail (which is zero-fill and never touched).
+    /// Blocks are appended-only and `arena_end` is bumped as they are
+    /// written, so `[0, arena_end)` covers every possibly-dirtied byte and
+    /// skips only file slack beyond the arena.
     fn flush(&self) -> Result<()> {
         let m = self.mmap();
-        let count = u64::from_le_bytes(
-            m[8..16]
-                .try_into()
-                .map_err(|_| VectorDbError::Corruption("hnsw file too small".into()))?,
-        ) as usize;
-        let end = count
-            .saturating_mul(Self::node_bytes(&self.cfg))
-            .saturating_add(HNSW_HEADER)
-            .min(m.len());
+        let end = self.arena_end().min(m.len());
         m.flush_range(0, end).map_err(VectorDbError::Io)
     }
 }
@@ -1773,6 +1963,12 @@ impl VectorDb {
         let view = self.vector_view();
         let dist = |a: u32, b: u32| view.distance(a, b);
         let is_deleted = |id: u32| self.meta.is_deleted(id);
+
+        // The row exists (id < len), but its node block may be missing if a
+        // crash landed between the row write and graph registration.
+        if (id as usize) >= self.index.count() {
+            self.index.register_unlinked(id)?;
+        }
 
         // Re-insert the node to rebuild its edges at all layers
         // First clear existing edges
@@ -2990,6 +3186,87 @@ mod tests {
         };
         assert!(
             matches!(&err, VectorDbError::Corruption(m) if m.contains("invalid vector magic")),
+            "expected magic rejection, got {err:?}"
+        );
+    }
+
+    /// v3 sizes each node block for its *own* level instead of reserving
+    /// `max_level` layers on every node. With defaults, ~95% of nodes live at
+    /// layer 0, so the arena must come out far smaller than the old fixed
+    /// `node_bytes(cfg, max_level)` layout — and blocks must never move
+    /// (updates rewrite in place, so `arena_end` is stable).
+    #[tokio::test]
+    async fn hnsw_nodes_use_compact_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(16).with_capacity(8);
+        let (count, arena_before) = {
+            let mut rng = Rng::new(11);
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            for _ in 0..500 {
+                let v = random_nonzero(&mut rng, 16);
+                db.insert(&v, None).unwrap();
+            }
+            let count = db.index.count();
+            assert_eq!(count, 500);
+            db.integrity_check().unwrap();
+
+            let arena = db.index.arena_end() - HNSW_HEADER;
+            let avg = arena / count;
+            let worst_fixed = HnswIndex::node_bytes(&db.cfg, db.cfg.max_level);
+            assert!(
+                avg < 300,
+                "average node block is {avg} B — not compact (old fixed layout was \
+                 {worst_fixed} B/node)"
+            );
+            assert!(avg < worst_fixed, "compact layout must beat fixed blocks");
+
+            // Updates rebuild edges but the level (hence block size) is fixed
+            // at creation: no block may be relocated, so the arena is stable.
+            let arena_before = db.index.arena_end();
+            for id in [0u32, 100, 250, 499] {
+                let v = random_nonzero(&mut rng, 16);
+                db.update(id, &v, None).unwrap();
+            }
+            assert_eq!(
+                db.index.arena_end(),
+                arena_before,
+                "updates must not move node blocks"
+            );
+            db.integrity_check().unwrap();
+            db.close().await.unwrap();
+            (count, arena_before)
+        };
+
+        // Reopen rebuilds the directory by walking the blocks: counts and
+        // arena_end must reconstruct exactly.
+        let db = VectorDb::open(&path, cfg).await.unwrap();
+        assert_eq!(db.index.count(), count);
+        assert_eq!(
+            db.index.arena_end(),
+            arena_before,
+            "walk must reproduce arena"
+        );
+        db.integrity_check().unwrap();
+    }
+
+    /// The v3 node layout changed with variable-length blocks; files written
+    /// by the previous fixed-stride format must be rejected, not misread.
+    #[tokio::test]
+    async fn open_rejects_previous_hnsw_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.hnsw");
+        let mut bytes = vec![0u8; HNSW_HEADER];
+        bytes[0..8].copy_from_slice(&0x484E_5357_0000_0002u64.to_le_bytes()); // v2 magic
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cfg = Config::new(4).with_capacity(8);
+        let err = match HnswIndex::open(&path, &cfg).await {
+            Err(e) => e,
+            Ok(_) => panic!("opening a v2-format HNSW file must fail"),
+        };
+        assert!(
+            matches!(&err, VectorDbError::Corruption(m) if m.contains("invalid HNSW magic")),
             "expected magic rejection, got {err:?}"
         );
     }
