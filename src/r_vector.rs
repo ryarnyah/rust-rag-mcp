@@ -2811,10 +2811,14 @@ impl AsyncVectorDb {
     /// Validate structural integrity of the whole database (async read).
     ///
     /// See [`VectorDb::integrity_check`]: layout-agnostic invariants over
-    /// the vector file, metadata coverage, and the HNSW graph. O(N) — for
-    /// tests and diagnostics, not hot paths.
+    /// the vector file, metadata coverage, and the HNSW graph. O(N) over
+    /// mmap'd pages — runs on the blocking pool so its page faults don't
+    /// stall async workers. For tests and diagnostics, not hot paths.
     pub async fn integrity_check(&self) -> Result<()> {
-        self.db.read().await.integrity_check()
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.blocking_read().integrity_check())
+            .await
+            .map_err(|e| VectorDbError::Io(io::Error::other(e)))?
     }
 
     /// Check if compaction should be triggered (async read)
@@ -2854,17 +2858,30 @@ impl AsyncVectorDb {
     }
 
     /// Search for k neighbors (async read)
+    ///
+    /// The traversal runs on the blocking pool: it synchronously page-faults
+    /// mmap'd vector and graph pages in, which on the async pool would stall
+    /// the worker — and with it every other task sharing it — for the whole
+    /// duration of the faults. The `Arc` handle is cloned (cheap) and the
+    /// read guard is acquired on the blocking thread itself.
     pub async fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHitOwned>> {
-        let db = self.db.read().await;
-        let hits = db.search(query, k, ef)?;
-        Ok(hits
-            .into_iter()
-            .map(|h| SearchHitOwned {
-                id: h.id,
-                score: h.score,
-                metadata: h.metadata.to_vec(),
-            })
-            .collect())
+        let db = self.db.clone();
+        let query = query.to_vec();
+        let hits = tokio::task::spawn_blocking(move || -> Result<Vec<SearchHitOwned>> {
+            let guard = db.blocking_read();
+            let hits = guard.search(&query, k, ef)?;
+            Ok(hits
+                .into_iter()
+                .map(|h| SearchHitOwned {
+                    id: h.id,
+                    score: h.score,
+                    metadata: h.metadata.to_vec(),
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| VectorDbError::Io(io::Error::other(e)))??;
+        Ok(hits)
     }
 
     /// Compact database (async write, exclusive lock)
