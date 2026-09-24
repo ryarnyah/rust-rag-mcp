@@ -367,6 +367,67 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> Result<f32> {
     Ok(dist as f32)
 }
 
+/// Cosine distance from many candidate rows to one fixed vector.
+///
+/// In a graph search the query is compared against every visited row, but
+/// the query itself never changes: this type computes the query's
+/// finiteness check and norm **once** at construction instead of once per
+/// candidate, while producing results bit-identical to
+/// [`cosine_distance`] (same `f64` operations in the same order — IEEE
+/// multiplication is commutative, so `dot(row, query)` equals
+/// `dot(query, row)` exactly).
+struct QueryCosine<'q> {
+    query: &'q [f32],
+    norm_query: f64,
+}
+
+impl<'q> QueryCosine<'q> {
+    /// Validate the query and precompute its norm.
+    ///
+    /// # Errors
+    /// - `VectorDbError::NaNDistance` if the query contains a non-finite value
+    /// - `VectorDbError::ZeroVector` if the query has zero magnitude
+    fn new(query: &'q [f32]) -> Result<Self> {
+        if !query.iter().all(|x| x.is_finite()) {
+            return Err(VectorDbError::NaNDistance);
+        }
+        let norm_query = norm(query);
+        if norm_query == 0.0 {
+            return Err(VectorDbError::ZeroVector);
+        }
+        Ok(Self { query, norm_query })
+    }
+
+    /// Distance from `other` to the fixed query vector, in [0, 2].
+    ///
+    /// Mirrors [`cosine_distance`]'s error contract exactly.
+    #[inline]
+    fn distance(&self, other: &[f32]) -> Result<f32> {
+        if other.len() != self.query.len() {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.query.len(),
+                got: other.len(),
+            });
+        }
+        if !other.iter().all(|x| x.is_finite()) {
+            return Err(VectorDbError::NaNDistance);
+        }
+
+        let norm_other = norm(other);
+        if norm_other == 0.0 {
+            return Err(VectorDbError::ZeroVector);
+        }
+
+        // Divide sequentially to avoid overflow (mirrors cosine_distance).
+        let similarity = (dot(other, self.query) / norm_other / self.norm_query).clamp(-1.0, 1.0);
+        let dist = 1.0 - similarity;
+        if !dist.is_finite() {
+            return Err(VectorDbError::NaNDistance);
+        }
+        Ok(dist as f32)
+    }
+}
+
 /// Compare two distances, handling NaN safely
 ///
 /// NaN is treated as equal to all distances (preserves sort stability)
@@ -2445,12 +2506,15 @@ impl VectorDb {
         }
 
         let view = self.vector_view();
+        // Query finiteness and norm are validated once here rather than
+        // re-checked for every visited candidate.
+        let metric = QueryCosine::new(query)?;
         let dist = |id: u32| -> Result<f32> {
             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds {
                 id,
                 capacity: view.file_size as u32,
             })?;
-            cosine_distance(v, query)
+            metric.distance(v)
         };
         let is_deleted = |id: u32| self.meta.is_deleted(id);
 
@@ -2508,12 +2572,15 @@ impl VectorDb {
         }
 
         let view = self.vector_view();
+        // Query finiteness and norm are validated once here rather than
+        // re-checked for every visited candidate.
+        let metric = QueryCosine::new(query)?;
         let dist = |id: u32| -> Result<f32> {
             let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds {
                 id,
                 capacity: view.file_size as u32,
             })?;
-            cosine_distance(v, query)
+            metric.distance(v)
         };
         let is_deleted = |id: u32| self.meta.is_deleted(id);
 
@@ -2978,6 +3045,58 @@ mod tests {
             ),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// The query-side hoisting in `QueryCosine` must be a pure optimization:
+    /// results are bit-identical to `cosine_distance` (same `f64` ops;
+    /// IEEE multiplication is commutative, so operand order cannot change
+    /// any bit), so search ranking cannot shift.
+    #[test]
+    fn query_cosine_matches_cosine_distance_bit_exactly() {
+        let mut rng = Rng::new(7);
+        let query = random_nonzero(&mut rng, 64);
+        let metric = QueryCosine::new(&query).unwrap();
+        for _ in 0..100 {
+            let row = random_nonzero(&mut rng, 64);
+            let expected = cosine_distance(&row, &query).unwrap();
+            let got = metric.distance(&row).unwrap();
+            assert_eq!(got, expected, "hoisted query norm changed the distance");
+            // Operand order must not matter either.
+            assert_eq!(got, cosine_distance(&query, &row).unwrap());
+        }
+    }
+
+    /// `QueryCosine` mirrors `cosine_distance`'s error contract exactly,
+    /// but reports query-side problems eagerly at construction (before any
+    /// graph traversal starts).
+    #[test]
+    fn query_cosine_error_contracts() {
+        assert!(matches!(
+            QueryCosine::new(&[f32::NAN, 1.0]),
+            Err(VectorDbError::NaNDistance)
+        ));
+        assert!(matches!(
+            QueryCosine::new(&[0.0, -0.0]),
+            Err(VectorDbError::ZeroVector)
+        ));
+
+        let query = [1.0, 0.0];
+        let metric = QueryCosine::new(&query).unwrap();
+        assert!(matches!(
+            metric.distance(&[f32::NAN, 1.0]),
+            Err(VectorDbError::NaNDistance)
+        ));
+        assert!(matches!(
+            metric.distance(&[0.0, 0.0]),
+            Err(VectorDbError::ZeroVector)
+        ));
+        assert!(matches!(
+            metric.distance(&[1.0, 0.0, 0.0]),
+            Err(VectorDbError::DimensionMismatch {
+                expected: 2,
+                got: 3
+            })
+        ));
     }
 
     #[test]
