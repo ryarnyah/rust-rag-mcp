@@ -1083,7 +1083,7 @@ async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata(
     //   - Leave WAL with B's record (simulates checkpoint not being written)
     {
         // Write B's vector into the data file and update count
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::{Read, Seek, SeekFrom, Write};
         let vec_bytes: Vec<u8> = [0.0f32, 1.0, 0.0, 0.0]
             .iter()
             .flat_map(|f| f.to_le_bytes())
@@ -1098,8 +1098,13 @@ async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata(
         data_file.seek(SeekFrom::Start(16))?;
         data_file.write_all(&2u64.to_le_bytes())?;
 
-        // Append B's vector at offset 32 + 1*4*4 = 48
-        data_file.seek(SeekFrom::Start(48))?;
+        // The row area starts at the page-aligned offset persisted in the
+        // header (offset 32..40). Append B's vector as row 1: data_start + 16.
+        data_file.seek(SeekFrom::Start(32))?;
+        let mut data_start = [0u8; 8];
+        data_file.read_exact(&mut data_start)?;
+        let data_start = u64::from_le_bytes(data_start);
+        data_file.seek(SeekFrom::Start(data_start + 16))?;
         data_file.write_all(&vec_bytes)?;
         data_file.flush()?;
 

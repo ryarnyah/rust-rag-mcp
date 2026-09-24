@@ -2812,6 +2812,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "memmap2",
  "ordered-float",
  "rmcp",

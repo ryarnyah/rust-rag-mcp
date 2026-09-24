@@ -48,6 +48,48 @@ use tokio::sync::RwLock;
 use crate::wal::{WalOpType, WalRecord, WriteAheadLog};
 
 // ============================================================================
+//  mmap helpers
+// ============================================================================
+
+/// System page size in bytes.
+///
+/// Used to page-align the vector row area so rows don't straddle page
+/// boundaries (which would turn every row access into two page faults).
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(sys_page_size)
+}
+
+#[cfg(unix)]
+fn sys_page_size() -> usize {
+    let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if sz > 0 { sz as usize } else { 4096 }
+}
+
+#[cfg(not(unix))]
+fn sys_page_size() -> usize {
+    4096
+}
+
+/// Round `x` up to a multiple of `align` (which must be a power of two).
+const fn align_up(x: usize, align: usize) -> usize {
+    (x + align - 1) & !(align - 1)
+}
+
+/// Map `file` read-write and apply access hints for the database workload:
+/// every consumer reads by id (row lookup, graph hop, metadata record), so
+/// access is effectively random and kernel read-ahead only wastes I/O.
+fn map_file(file: &File) -> Result<MmapMut> {
+    let m = unsafe { MmapOptions::new().map_mut(file)? };
+    #[cfg(unix)]
+    if let Err(e) = m.advise(memmap2::Advice::Random) {
+        // Advisory only: never fail a mapping because madvise was refused.
+        tracing::debug!(error = %e, "madvise(RANDOM) failed");
+    }
+    Ok(m)
+}
+
+// ============================================================================
 //  Error Types
 // ============================================================================
 
@@ -433,7 +475,7 @@ impl MetadataStore {
                 .file
                 .set_len(total as u64)
                 .map_err(VectorDbError::Io)?;
-            let mut m = unsafe { MmapOptions::new().map_mut(&store.file)? };
+            let mut m = map_file(&store.file)?;
             m[0..8].copy_from_slice(&META_MAGIC.to_le_bytes());
             m[8..12].copy_from_slice(&0u32.to_le_bytes()); // count = 0
             m.flush().map_err(VectorDbError::Io)?;
@@ -444,7 +486,7 @@ impl MetadataStore {
             if len < META_HEADER {
                 return Err(VectorDbError::Corruption("metadata file too small".into()));
             }
-            let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
+            let m = map_file(&store.file)?;
 
             let magic = u64::from_le_bytes(
                 m[0..8]
@@ -459,6 +501,9 @@ impl MetadataStore {
             store.record_count = count;
 
             let mut pos = META_HEADER;
+            // The record scan reads the file front-to-back exactly once.
+            #[cfg(unix)]
+            let _ = m.advise(memmap2::Advice::Sequential);
             for _ in 0..count as usize {
                 if pos + 16 > len {
                     return Err(VectorDbError::Corruption(format!(
@@ -488,13 +533,16 @@ impl MetadataStore {
                 );
                 pos = data_off + dlen;
             }
+            // Back to random access: after open, records are read by id.
+            #[cfg(unix)]
+            let _ = m.advise(memmap2::Advice::Random);
 
             // Truncate any bytes beyond the flushed records (leftover from grow()
             // that were never committed via flush())
             if pos < len {
                 drop(m);
                 store.file.set_len(pos as u64).map_err(VectorDbError::Io)?;
-                let m = unsafe { MmapOptions::new().map_mut(&store.file)? };
+                let m = map_file(&store.file)?;
                 store.mmap = Some(m);
             } else {
                 store.mmap = Some(m);
@@ -558,24 +606,30 @@ impl MetadataStore {
     fn grow(&mut self, need: usize) -> Result<()> {
         let new_size = (need * 2).max(1024);
         if let Some(m) = self.mmap.as_ref() {
-            m.flush().map_err(VectorDbError::Io)?;
+            // Persist records written so far before re-mapping the file.
+            m.flush_range(0, self.file_len).map_err(VectorDbError::Io)?;
         }
         self.mmap = None;
         self.file
             .set_len(new_size as u64)
             .map_err(VectorDbError::Io)?;
-        self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
+        self.mmap = Some(map_file(&self.file)?);
         Ok(())
     }
 
+    /// Persist the count header and sync written records to disk.
+    ///
+    /// Only `[0, file_len)` is synced: everything beyond is untouched
+    /// capacity from `grow()`. The file is intentionally **not** truncated
+    /// here (as earlier versions did): keeping mapping size and file size in
+    /// lockstep avoids a munmap/mmap round-trip per flush, and `open()` trims
+    /// any slack left behind by a crash.
     fn flush(&mut self) -> Result<()> {
         let count = self.record_count;
         self.mmap_mut()[8..12].copy_from_slice(&count.to_le_bytes());
-        self.mmap().flush().map_err(VectorDbError::Io)?;
-        self.file
-            .set_len(self.file_len as u64)
+        self.mmap()
+            .flush_range(0, self.file_len)
             .map_err(VectorDbError::Io)?;
-        self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
         Ok(())
     }
 }
@@ -688,7 +742,7 @@ impl HnswIndex {
             let cap = cfg.initial_capacity.max(16);
             let size = HNSW_HEADER + cap * Self::node_bytes(cfg);
             file.set_len(size as u64).map_err(VectorDbError::Io)?;
-            let mut m = unsafe { MmapOptions::new().map_mut(&file)? };
+            let mut m = map_file(&file)?;
             m[0..8].copy_from_slice(&HNSW_MAGIC.to_le_bytes());
             m[8..16].copy_from_slice(&0u64.to_le_bytes()); // count
             m[16..20].copy_from_slice(&NONE.to_le_bytes()); // entry point
@@ -699,7 +753,8 @@ impl HnswIndex {
             m[48..56].copy_from_slice(&(cfg.max_level as u64).to_le_bytes());
             m[56..64].copy_from_slice(&(cfg.ef_construction as u64).to_le_bytes());
             m[64..72].copy_from_slice(&cfg.seed.to_le_bytes());
-            m.flush().map_err(VectorDbError::Io)?;
+            // Only the header page has been written on a fresh file.
+            m.flush_range(0, HNSW_HEADER).map_err(VectorDbError::Io)?;
             Ok(Self {
                 file,
                 mmap: Some(m),
@@ -708,7 +763,7 @@ impl HnswIndex {
             })
         } else {
             // Load existing index
-            let m = unsafe { MmapOptions::new().map_mut(&file)? };
+            let m = map_file(&file)?;
 
             // Validate magic
             let magic = u64::from_le_bytes(m[0..8].try_into().map_err(|_| {
@@ -967,7 +1022,7 @@ impl HnswIndex {
         self.file
             .set_len(new_size as u64)
             .map_err(VectorDbError::Io)?;
-        let mut m = unsafe { MmapOptions::new().map_mut(&self.file)? };
+        let mut m = map_file(&self.file)?;
         m[24..32].copy_from_slice(&(new_cap as u64).to_le_bytes());
         self.mmap = Some(m);
         Ok(())
@@ -1391,8 +1446,23 @@ impl HnswIndex {
             .collect()
     }
 
+    /// Sync written graph bytes: the fixed header plus every live node block.
+    ///
+    /// Node blocks are only ever written for ids `< count`, so syncing
+    /// `[0, end)` covers every possibly-dirtied byte and skips the unused
+    /// capacity tail (which is zero-fill and never touched).
     fn flush(&self) -> Result<()> {
-        self.mmap().flush().map_err(VectorDbError::Io)
+        let m = self.mmap();
+        let count = u64::from_le_bytes(
+            m[8..16]
+                .try_into()
+                .map_err(|_| VectorDbError::Corruption("hnsw file too small".into()))?,
+        ) as usize;
+        let end = count
+            .saturating_mul(Self::node_bytes(&self.cfg))
+            .saturating_add(HNSW_HEADER)
+            .min(m.len());
+        m.flush_range(0, end).map_err(VectorDbError::Io)
     }
 }
 
@@ -1400,14 +1470,27 @@ impl HnswIndex {
 //  Vector Storage
 // ============================================================================
 
-const VEC_MAGIC: u64 = 0x5645_4354_4F52_0002;
-const VEC_HEADER: usize = 32;
+/// Format v3: the row area starts at a page-aligned offset (see
+/// [`stored_data_start`]) instead of directly after the fixed header.
+const VEC_MAGIC: u64 = 0x5645_4354_4F52_0003;
+/// Fixed header layout: magic(8) | dim(8) | len(8) | capacity(8) | data_start(8).
+const VEC_HEADER: usize = 40;
+/// Offset of the persisted row-area start within the fixed header.
+const VEC_DATA_START_OFF: usize = 32;
+
+/// Read the persisted row-area start from a vector-file header.
+#[inline]
+fn stored_data_start(header: &[u8]) -> usize {
+    u64::from_le_bytes(header[VEC_DATA_START_OFF..VEC_HEADER].try_into().unwrap()) as usize
+}
 
 /// View into vector data within mmap with bounds checking
 struct VectorView {
     ptr: *const u8,
     dim: usize,
     file_size: usize,
+    /// Row-area start (page-aligned), read from the file header.
+    base: usize,
 }
 
 impl VectorView {
@@ -1416,7 +1499,7 @@ impl VectorView {
     /// # Errors
     /// Returns None if ID is out of bounds
     fn get(&self, id: u32) -> Option<&[f32]> {
-        let start = VEC_HEADER + (id as usize).checked_mul(self.dim)?.checked_mul(4)?;
+        let start = self.base + (id as usize).checked_mul(self.dim)?.checked_mul(4)?;
         let end = start.checked_add(self.dim.checked_mul(4)?)?;
         if end > self.file_size {
             return None;
@@ -1478,17 +1561,22 @@ impl VectorDb {
             .map_err(VectorDbError::Io)?;
 
         let mmap = if !exists {
-            let total = VEC_HEADER + cfg.initial_capacity * cfg.dim * 4;
+            // Row area starts on the next page boundary after the fixed
+            // header, so rows that fit in a page never straddle one.
+            let data_start = align_up(VEC_HEADER, page_size());
+            let total = data_start + cfg.initial_capacity * cfg.dim * 4;
             file.set_len(total as u64).map_err(VectorDbError::Io)?;
-            let mut m = unsafe { MmapOptions::new().map_mut(&file)? };
+            let mut m = map_file(&file)?;
             m[0..8].copy_from_slice(&VEC_MAGIC.to_le_bytes());
             m[8..16].copy_from_slice(&(cfg.dim as u64).to_le_bytes());
             m[16..24].copy_from_slice(&0u64.to_le_bytes());
             m[24..32].copy_from_slice(&(cfg.initial_capacity as u64).to_le_bytes());
-            m.flush().map_err(VectorDbError::Io)?;
+            m[32..40].copy_from_slice(&(data_start as u64).to_le_bytes());
+            // Only the header has been written on a fresh file.
+            m.flush_range(0, VEC_HEADER).map_err(VectorDbError::Io)?;
             m
         } else {
-            let m = unsafe { MmapOptions::new().map_mut(&file)? };
+            let m = map_file(&file)?;
             let magic = u64::from_le_bytes(
                 m[0..8]
                     .try_into()
@@ -1509,6 +1597,31 @@ impl VectorDb {
                     expected: cfg.dim,
                     got: stored,
                 });
+            }
+            // Validate the persisted layout: the row area must be sane and
+            // all `len` rows must fit inside the file, otherwise a corrupted
+            // header would make row access panic instead of erroring.
+            let data_start = stored_data_start(&m);
+            if !(VEC_HEADER..=(1 << 20)).contains(&data_start) {
+                return Err(VectorDbError::Corruption(format!(
+                    "invalid row-area start {data_start}"
+                )));
+            }
+            let len = u64::from_le_bytes(
+                m[16..24]
+                    .try_into()
+                    .map_err(|_| VectorDbError::Corruption("invalid len".to_string()))?,
+            ) as usize;
+            let need = len
+                .checked_mul(stored)
+                .and_then(|b| b.checked_mul(4))
+                .and_then(|b| b.checked_add(data_start))
+                .ok_or_else(|| VectorDbError::Corruption("vector file size overflow".into()))?;
+            if need > m.len() {
+                return Err(VectorDbError::Corruption(format!(
+                    "vector mapping holds {} bytes but {len} rows need {need}",
+                    m.len()
+                )));
             }
             m
         };
@@ -1838,6 +1951,7 @@ impl VectorDb {
             ptr: self.mmap().as_ptr(),
             dim: self.cfg.dim,
             file_size: self.mmap().len(),
+            base: stored_data_start(self.mmap()),
         }
     }
 
@@ -1913,7 +2027,7 @@ impl VectorDb {
             .ok_or_else(|| VectorDbError::Corruption("row size overflow".into()))?;
         let needed = len
             .checked_mul(row_bytes)
-            .and_then(|b| b.checked_add(VEC_HEADER))
+            .and_then(|b| b.checked_add(stored_data_start(self.mmap())))
             .ok_or_else(|| VectorDbError::Corruption("file size overflow".into()))?;
         if needed > self.mmap().len() {
             return Err(VectorDbError::Corruption(format!(
@@ -1961,9 +2075,13 @@ impl VectorDb {
     }
 
     /// Byte offset of row `i` within the vector file mapping.
+    ///
+    /// The row area begins at the page-aligned `data_start` persisted in the
+    /// file header (v3 format), so rows never straddle page boundaries when
+    /// the row size divides the page size.
     #[inline]
     fn row_offset(&self, i: usize) -> usize {
-        VEC_HEADER + i * self.cfg.dim * 4
+        stored_data_start(self.mmap()) + i * self.cfg.dim * 4
     }
 
     fn row(&self, i: usize) -> &[f32] {
@@ -1982,12 +2100,12 @@ impl VectorDb {
 
     fn grow(&mut self) -> Result<()> {
         let new_cap = (self.capacity() * 2).max(16);
-        let new_len = VEC_HEADER + new_cap * self.cfg.dim * 4;
+        let new_len = stored_data_start(self.mmap()) + new_cap * self.cfg.dim * 4;
         self.mmap = None;
         self.file
             .set_len(new_len as u64)
             .map_err(VectorDbError::Io)?;
-        let mut m = unsafe { MmapOptions::new().map_mut(&self.file)? };
+        let mut m = map_file(&self.file)?;
         m[24..32].copy_from_slice(&(new_cap as u64).to_le_bytes());
         self.mmap = Some(m);
         Ok(())
@@ -2261,6 +2379,10 @@ impl VectorDb {
 
         {
             let mut fresh = VectorDb::open(&tmp_vec, tmp_cfg).await?;
+            // Compaction reads every source row front-to-back once; hint the
+            // kernel so it can read ahead aggressively for this pass.
+            #[cfg(unix)]
+            let _ = self.mmap().advise(memmap2::Advice::Sequential);
             for id in 0..self.len() as u32 {
                 if self.meta.is_deleted(id) {
                     continue;
@@ -2270,6 +2392,9 @@ impl VectorDb {
                 // Prod 4 fix: Use insert_raw to bypass WAL logging during compaction
                 fresh.insert_raw(&v, &meta)?;
             }
+            // The scan is over; normal access from here is random again.
+            #[cfg(unix)]
+            let _ = self.mmap().advise(memmap2::Advice::Random);
             fresh.flush().await?;
         }
 
@@ -2339,8 +2464,14 @@ impl VectorDb {
     /// - Deletes: skipped if already tombstoned
     /// - Updates: re-applied (idempotent, same data written again)
     pub async fn flush(&mut self) -> Result<()> {
-        // Step 1: Sync all data files to disk BEFORE checkpoint
-        self.mmap().flush().map_err(VectorDbError::Io)?;
+        // Step 1: Sync all data files to disk BEFORE checkpoint.
+        // Only written prefixes are msynced: rows beyond `len` and unused
+        // capacity have never been dirtied, so syncing them would walk page
+        // tables for nothing. The fixed header always falls inside the range
+        // (it starts at offset 0), so len/capacity updates are covered too.
+        self.mmap()
+            .flush_range(0, self.row_offset(self.len()))
+            .map_err(VectorDbError::Io)?;
         self.index.flush()?;
         self.meta.flush()?;
 
@@ -2785,35 +2916,81 @@ mod tests {
     /// Row layout guard: rows must occupy a uniform stride inside the vector
     /// mapping and round-trip exactly. (A layout change that makes rows
     /// page-aligned keeps the stride uniform — only its value changes.)
+    /// Runs for a row size that divides the page (must never straddle) and
+    /// one that doesn't (uniformity must still hold).
     #[tokio::test]
     async fn vector_rows_use_uniform_stride() {
+        let page = page_size();
+        for dim in [16usize, 24] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let cfg = Config::new(dim).with_capacity(8);
+
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            let mut rng = Rng::new(3);
+            let mut stored = Vec::new();
+            for _ in 0..50 {
+                let v = random_nonzero(&mut rng, dim);
+                db.insert(&v, None).unwrap();
+                stored.push(v);
+            }
+
+            let stride = db.row_offset(1) - db.row_offset(0);
+            assert_eq!(stride, dim * 4, "stride must equal the row size");
+            // v3 format: the row area starts on a page boundary, so rows that
+            // fit inside one page and divide it never straddle — one row
+            // access, one page fault.
+            assert_eq!(
+                db.row_offset(0) % page,
+                0,
+                "row area must start at a page boundary"
+            );
+            if stride <= page && page.is_multiple_of(stride) {
+                for i in 0..stored.len() {
+                    assert!(
+                        db.row_offset(i) % page + stride <= page,
+                        "row {i} straddles a page boundary"
+                    );
+                }
+            }
+            for (i, v) in stored.iter().enumerate() {
+                assert_eq!(db.row_offset(i + 1) - db.row_offset(i), stride, "row {i}");
+                assert_eq!(
+                    db.get(i as u32).unwrap(),
+                    Some(v.clone()),
+                    "row {i} must round-trip exactly"
+                );
+            }
+            assert!(
+                db.row_offset(50) <= db.mmap().len(),
+                "rows must fit inside the mapping"
+            );
+            db.integrity_check().unwrap();
+        }
+    }
+
+    /// The row-area alignment changed the on-disk format; files written by the
+    /// previous version must be rejected loudly instead of being misread
+    /// (the old data area at offset 32 would silently look like garbage rows).
+    #[tokio::test]
+    async fn open_rejects_previous_format_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
-        // dim=24 → 96-byte rows, deliberately not a power-of-two multiple.
-        let cfg = Config::new(24).with_capacity(8);
+        // Craft a v2 header: magic ...0002, dim 4, len 0, capacity 8.
+        let mut bytes = vec![0u8; 32 + 8 * 4 * 4];
+        bytes[0..8].copy_from_slice(&0x5645_4354_4F52_0002u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&4u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&8u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
 
-        let mut db = VectorDb::open(&path, cfg).await.unwrap();
-        let mut rng = Rng::new(3);
-        let mut stored = Vec::new();
-        for _ in 0..50 {
-            let v = random_nonzero(&mut rng, 24);
-            db.insert(&v, None).unwrap();
-            stored.push(v);
-        }
-
-        let stride = db.row_offset(1) - db.row_offset(0);
-        for (i, v) in stored.iter().enumerate() {
-            assert_eq!(db.row_offset(i + 1) - db.row_offset(i), stride, "row {i}");
-            assert_eq!(
-                db.get(i as u32).unwrap(),
-                Some(v.clone()),
-                "row {i} must round-trip exactly"
-            );
-        }
+        let cfg = Config::new(4).with_capacity(8);
+        let err = match VectorDb::open(&path, cfg).await {
+            Err(e) => e,
+            Ok(_) => panic!("opening a v2-format file must fail"),
+        };
         assert!(
-            db.row_offset(50) <= db.mmap().len(),
-            "rows must fit inside the mapping"
+            matches!(&err, VectorDbError::Corruption(m) if m.contains("invalid vector magic")),
+            "expected magic rejection, got {err:?}"
         );
-        db.integrity_check().unwrap();
     }
 }
