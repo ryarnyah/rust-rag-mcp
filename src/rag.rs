@@ -14,6 +14,31 @@ use tokio::sync::RwLock;
 
 /// P3: Metadata index for O(1) source lookups
 /// Maps source path to vector IDs, avoiding full table scans
+///
+/// # Not persisted (considered, deferred)
+///
+/// The last per-chunk heap structure in the stack: a `u32` per chunk in
+/// the source's `Vec` (plus growth slack), plus a string + map entry per
+/// unique source in each of the two maps — on the order of 8-16 bytes per
+/// chunk amortized.
+/// Like the HNSW offset directory and the metadata record index, it is
+/// fully derived state: `RagCore::new` rebuilds it by scanning every live
+/// row's metadata at startup. Options considered and deferred:
+///
+/// - *Persist it next to `.meta`*: needs a format bump **and** a
+///   consistency contract with compaction, which renumbers every vector
+///   id — the persisted map would have to be rewritten in lockstep with
+///   the compacted files, or it would silently point at the wrong rows.
+///   Derived state cannot be silently wrong if it is recomputed.
+/// - *Drop it and scan on demand*: `list_sources` and `delete_source`
+///   are the only consumers, both rare administrative operations — but
+///   each would re-read the entire metadata file (O(n) per call), which
+///   is exactly the cost the index was introduced to remove.
+///
+/// Kept in memory because it is cheap relative to the metadata payloads
+/// it indexes, rebuilt unconditionally at startup, and its lookups are
+/// what make `delete_source` O(k) instead of O(n). Revisit if per-chunk
+/// heap at very large scale becomes the binding constraint.
 #[derive(Clone)]
 struct MetadataIndex {
     source_to_ids: Arc<RwLock<HashMap<String, Vec<u32>>>>,

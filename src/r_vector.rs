@@ -478,11 +478,31 @@ const META_MAGIC: u64 = 0x4D45_5441_0000_0002;
 const META_HEADER: usize = 16; // magic(8) + count(4) + reserved(4)
 
 /// Single metadata record descriptor (in-memory index, data stays on disk via mmap)
+///
+/// Field order is load-bearing for memory: `offset` first keeps the struct
+/// at exactly 16 bytes (u64 + u32 + u32, no padding), so the dense index
+/// below costs a flat 16 bytes per row.
 #[derive(Debug, Clone)]
 struct MetaRecord {
-    flags: u32,
     offset: u64,
     len: u32,
+    flags: u32,
+}
+
+impl MetaRecord {
+    /// Sentinel slot for "this id has no record". Record data always starts
+    /// at least `META_HEADER + 16` = 32 bytes into the file, so `offset == 0`
+    /// can never occur in a genuine record.
+    const ABSENT: MetaRecord = MetaRecord {
+        offset: 0,
+        len: 0,
+        flags: 0,
+    };
+
+    #[inline]
+    fn is_absent(&self) -> bool {
+        self.offset == 0
+    }
 }
 
 /// Metadata storage: mmap-backed append-only file with record count in header.
@@ -495,14 +515,22 @@ struct MetaRecord {
 /// [16..)      records: [ id:u32 | flags:u32 | dlen:u32 | pad:u32 | data:dlen ] × count
 /// ```
 ///
-/// The in-memory HashMap only stores (id → offset, len, flags) — the actual
-/// metadata bytes live in the mmap and are read on demand via `get()`.
+/// The in-memory index is a dense `Vec<MetaRecord>` addressed directly by
+/// vector id: ids are assigned sequentially (`insert` appends at `len`), so
+/// a flat slot per row costs 16 bytes instead of the ~30-40 bytes a
+/// `HashMap` bucket entry needs (key + control byte + load-factor slack),
+/// and lookups skip hashing entirely — `is_deleted` runs once per visited
+/// node during search. Slots without a record (a crash between row and
+/// metadata writes, before WAL replay backfills them) hold
+/// [`MetaRecord::ABSENT`] and behave exactly like the old map's missing
+/// keys: deleted, no bytes, no record. The actual metadata bytes live in
+/// the mmap and are read on demand via `get()`.
 /// The header count is only updated on `flush()`, so on crash recovery
 /// `open()` reads exactly the flushed records and replays the WAL for the rest.
 struct MetadataStore {
     file: File,
     mmap: Option<MmapMut>,
-    index: HashMap<u32, MetaRecord>,
+    index: Vec<MetaRecord>,
     record_count: u32,
     file_len: usize,
 }
@@ -525,7 +553,7 @@ impl MetadataStore {
         let mut store = Self {
             file,
             mmap: None,
-            index: HashMap::new(),
+            index: Vec::new(),
             record_count: 0,
             file_len: 0,
         };
@@ -562,6 +590,14 @@ impl MetadataStore {
             store.record_count = count;
 
             let mut pos = META_HEADER;
+            // Each record is at least its 16-byte header, so this many slots
+            // can never be needed for a well-formed file; ids in one are a
+            // dense `0..m` set with `m < count <= max_slots` (inserts append
+            // ids in order, rewrites reuse existing ones). Checking against
+            // the file's physical capacity — not the header count, which a
+            // corrupt file could inflate — bounds the index allocation below
+            // by the file size itself.
+            let max_slots = (len - META_HEADER) / 16;
             // The record scan reads the file front-to-back exactly once.
             #[cfg(unix)]
             let _ = m.advise(memmap2::Advice::Sequential);
@@ -583,15 +619,20 @@ impl MetadataStore {
                         "metadata record data extends beyond file".into(),
                     ));
                 }
-
-                store.index.insert(
-                    id,
-                    MetaRecord {
-                        flags,
-                        offset: data_off as u64,
-                        len: dlen as u32,
-                    },
-                );
+                if id as usize >= max_slots {
+                    return Err(VectorDbError::Corruption(format!(
+                        "metadata record id {id} outside the {max_slots} ids this file can hold"
+                    )));
+                }
+                if id as usize >= store.index.len() {
+                    store.index.resize(id as usize + 1, MetaRecord::ABSENT);
+                }
+                // Last record for an id wins (later records rewrite it).
+                store.index[id as usize] = MetaRecord {
+                    offset: data_off as u64,
+                    len: dlen as u32,
+                    flags,
+                };
                 pos = data_off + dlen;
             }
             // Back to random access: after open, records are read by id.
@@ -622,19 +663,27 @@ impl MetadataStore {
     }
 
     fn is_deleted(&self, id: u32) -> bool {
-        self.index
-            .get(&id)
-            .map(|r| r.flags & META_FLAG_DELETED != 0)
-            .unwrap_or(true)
+        match self.index.get(id as usize) {
+            Some(r) if !r.is_absent() => r.flags & META_FLAG_DELETED != 0,
+            // No record for this id (past the index, or an unfilled slot):
+            // reads as deleted, matching the old missing-key default.
+            _ => true,
+        }
     }
 
     fn get(&self, id: u32) -> Option<&[u8]> {
-        let r = self.index.get(&id)?;
-        if r.flags & META_FLAG_DELETED != 0 {
+        let r = self.index.get(id as usize)?;
+        if r.is_absent() || r.flags & META_FLAG_DELETED != 0 {
             return None;
         }
         let off = r.offset as usize;
         Some(&self.mmap()[off..off + r.len as usize])
+    }
+
+    /// True when `id` has a metadata record at all (live or tombstoned).
+    #[inline]
+    fn has_record(&self, id: u32) -> bool {
+        self.index.get(id as usize).is_some_and(|r| !r.is_absent())
     }
 
     fn put(&mut self, id: u32, flags: u32, data: &[u8]) -> Result<()> {
@@ -651,14 +700,18 @@ impl MetadataStore {
             m[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
             m[off + 16..off + 16 + data.len()].copy_from_slice(data);
         }
-        self.index.insert(
-            id,
-            MetaRecord {
-                flags,
-                offset: (off + 16) as u64,
-                len: data.len() as u32,
-            },
-        );
+        let idx = id as usize;
+        if idx >= self.index.len() {
+            // Ids are assigned sequentially, so this appends a slot in
+            // normal operation; the ABSENT fill only matters when recovery
+            // backfills past a gap.
+            self.index.resize(idx + 1, MetaRecord::ABSENT);
+        }
+        self.index[idx] = MetaRecord {
+            offset: (off + 16) as u64,
+            len: data.len() as u32,
+            flags,
+        };
         self.record_count += 1;
         self.file_len = off + 16 + data.len();
         Ok(())
@@ -721,6 +774,34 @@ struct HnswIndex {
     /// not at a fixed stride and need an index. The directory is rebuilt from
     /// the file at open time (blocks are self-describing) and only ever grows
     /// by appending, matching the append-only arena layout.
+    ///
+    /// # Not persisted (considered, deferred)
+    ///
+    /// At 8 bytes per node this is the largest heap structure left after the
+    /// compact-layout work (~80 MB per 10M nodes). Persisting it as a
+    /// trailing section of the `.hnsw` file (magic bump) was considered and
+    /// deferred:
+    ///
+    /// - *What it would actually save.* The directory is touched on every
+    ///   graph hop, so those pages stay hot in page cache either way; the
+    ///   difference is only that file-backed pages become reclaimable under
+    ///   memory pressure (then re-faulted per hop) while a heap `Vec` never
+    ///   is. A modest win under pressure, not a step change.
+    /// - *It turns derived state into synchronized state.* Today the
+    ///   directory is recomputed from the arena, so a crash between a node
+    ///   append and anything else cannot desynchronize them; the open-time
+    ///   walk also validates every block and heals `arena_end`. A persisted
+    ///   directory would need its own crash-consistency contract (append
+    ///   arena + directory section, torn writes on either side) and could
+    ///   no longer skip the walk without giving up that validation.
+    /// - *The `u32` alternative* (4 bytes/node, no format change since the
+    ///   directory is memory-only) caps the arena at 4 GiB and doubles the
+    ///   element type surface at every lookup — a sharp edge for a saving
+    ///   that only matters at very large node counts.
+    ///
+    /// Revisit if the directory's heap footprint becomes measurable at
+    /// multi-hundred-million-node scale; until then a flat `Vec<u64>` of
+    /// derived state is both the simplest and the fastest option.
     dir: Vec<u64>,
 }
 
@@ -2304,7 +2385,7 @@ impl VectorDb {
         // `deleted_count` must agree with what the metadata store reports.
         let mut tombstoned = 0usize;
         for id in 0..len as u32 {
-            if !self.meta.index.contains_key(&id) {
+            if !self.meta.has_record(id) {
                 return Err(VectorDbError::Corruption(format!(
                     "row {id} has no metadata record"
                 )));
@@ -3404,6 +3485,98 @@ mod tests {
         assert!(
             matches!(&err, VectorDbError::Corruption(m) if m.contains("invalid HNSW magic")),
             "expected magic rejection, got {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    //  Dense metadata index
+    // -------------------------------------------------------------------
+
+    /// Memory layout guard: the metadata index must stay a dense 16 bytes
+    /// per row. Field reordering (or padding-inducing type changes) would
+    /// silently inflate per-row heap cost — the reason the index is a flat
+    /// `Vec` keyed by id instead of a `HashMap`.
+    #[test]
+    fn meta_record_layout_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<MetaRecord>(), 16);
+    }
+
+    /// Dense index semantics: records are addressed by id, an unfilled slot
+    /// reads exactly like the old `HashMap`'s missing key (deleted, no
+    /// bytes, no record), a rewrite keeps the slot instead of growing the
+    /// index, and a reopen replays physical records last-wins.
+    #[tokio::test]
+    async fn metadata_store_dense_index_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta");
+        {
+            let mut store = MetadataStore::open(&path).await.unwrap();
+            store.put(0, 0, b"zero").unwrap();
+            store.put(1, 0, b"one").unwrap();
+            store.put(2, 0, b"two").unwrap();
+            // Crash-gap slot: id 4 recorded while 3 never got a record.
+            // Production paths backfill in order, but the sentinel must
+            // back both the open-time scan and WAL recovery.
+            store.put(4, 0, b"four").unwrap();
+
+            assert_eq!(store.index.len(), 5, "index spans 0..=highest id");
+            assert_eq!(store.get(0), Some(b"zero".as_slice()));
+            assert!(store.get(3).is_none(), "absent slot yields no bytes");
+            assert!(store.is_deleted(3), "absent slot reads as deleted");
+            assert!(!store.has_record(3), "absent slot has no record");
+            assert!(store.has_record(2), "recorded slot has a record");
+            assert!(store.is_deleted(9), "id past the index reads as deleted");
+            assert!(!store.has_record(9), "id past the index has no record");
+
+            // Rewrite: later record wins and the slot is reused.
+            store.put(1, 0, b"one-v2").unwrap();
+            assert_eq!(store.get(1), Some(b"one-v2".as_slice()));
+            assert_eq!(store.index.len(), 5, "rewrite must not grow the index");
+
+            // Tombstone: still has a record, but the bytes are hidden.
+            store.put(0, META_FLAG_DELETED, b"zero").unwrap();
+            assert!(store.has_record(0));
+            assert!(store.is_deleted(0));
+            assert!(store.get(0).is_none());
+            store.flush().unwrap();
+        }
+
+        // Reopen: the scan replays the physical records into slots, last wins.
+        let store = MetadataStore::open(&path).await.unwrap();
+        assert_eq!(store.get(1), Some(b"one-v2".as_slice()));
+        assert!(store.is_deleted(0), "tombstone survives the scan");
+        assert!(store.has_record(0));
+        assert!(store.has_record(4));
+        assert!(!store.has_record(3), "hole stays unfilled");
+        assert_eq!(store.index.len(), 5);
+    }
+
+    /// A record id beyond the file's physical capacity is corruption and
+    /// must fail at open — before the dense index sizes itself from it
+    /// (a corrupt id must not be able to drive an allocation).
+    #[tokio::test]
+    async fn metadata_store_rejects_out_of_range_record_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta");
+        // Header + one record claiming id 1<<30: a well-formed file of this
+        // size can only hold (32-16)/16 = 1 id, dense from 0.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&META_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&(1u32 << 30).to_le_bytes()); // id
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // dlen
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // pad
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match MetadataStore::open(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("an out-of-range record id must be rejected"),
+        };
+        assert!(
+            matches!(&err, VectorDbError::Corruption(m) if m.contains("outside")),
+            "expected id-range rejection, got {err:?}"
         );
     }
 }
