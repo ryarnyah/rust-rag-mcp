@@ -1908,8 +1908,10 @@ impl HnswIndex {
         };
         let cur_max = self.max_level() as usize;
 
-        // 1. Greedy descent from top layer down to `level + 1`
-        let mut l = cur_max;
+        // 1. Greedy descent from top layer down to `level + 1`, never above
+        // the seed's own level (same read-safety rule as in `search`: layers
+        // the node does not have live past the end of its block).
+        let mut l = cur_max.min(self.node_level(ep) as usize);
         while l > level {
             let mut changed = true;
             while changed {
@@ -1934,8 +1936,9 @@ impl HnswIndex {
             l = l.saturating_sub(1);
         }
 
-        // 2. Link at every layer from min(level, cur_max) down to 0
-        let start_layer = level.min(cur_max);
+        // 2. Link at every layer from min(level, cur_max) down to 0, clamped
+        // to what the (possibly non-descended) seed actually carries
+        let start_layer = level.min(cur_max).min(self.node_level(ep) as usize);
         for layer in (0..=start_layer).rev() {
             let to_new = |n: u32| dist(new_id, n);
             self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
@@ -2006,7 +2009,11 @@ impl HnswIndex {
             Err(VectorDbError::ZeroVector) => f32::INFINITY,
             Err(e) => return Err(e),
         };
-        let cur_max = self.max_level() as usize;
+        // Never walk above the entry point's own level: a layer a node does
+        // not have would read past its block (garbage neighbor counts). The
+        // entry point normally carries the global max level, so this is
+        // defense in depth against a drifted or corrupt header.
+        let cur_max = (self.max_level() as usize).min(self.node_level(entry) as usize);
 
         for layer in (1..=cur_max).rev() {
             let mut changed = true;
@@ -2415,8 +2422,9 @@ impl VectorDb {
         let mut ep_dist;
         if entry == id {
             // This node is the entry point and its links were just cleared:
-            // re-link against another indexable row instead of itself.
-            match self.find_indexable_row(id) {
+            // re-link against a *high-level* indexable row instead of itself
+            // (see `find_relink_seed` for why the level matters).
+            match self.find_relink_seed(id) {
                 Some(other) => {
                     ep = other;
                     ep_dist = dist(id, other)?;
@@ -2435,8 +2443,11 @@ impl VectorDb {
             };
         }
 
-        // Greedy descent to find closest entry point
-        let cur_max = self.index.max_level() as usize;
+        // Greedy descent to find the closest entry point. Bounded by the
+        // seed's own level, not the global max: when this node *was* the
+        // entry point the seed was re-picked and need not share the max
+        // level — walking layers it does not have reads past its block.
+        let cur_max = self.index.node_level(ep) as usize;
         for layer in (1..=cur_max).rev() {
             let mut changed = true;
             while changed {
@@ -2461,6 +2472,13 @@ impl VectorDb {
 
         // Re-link at each layer of this node
         for layer in (0..=node_level as usize).rev() {
+            // A layer no remaining row carries must stay empty (links only
+            // ever join two nodes that both carry the layer, so it was empty
+            // before the rebuild too) — and searching it from a seed that
+            // lacks it would read past the seed's block.
+            if layer > self.index.node_level(ep) as usize {
+                continue;
+            }
             let to_new = |n: u32| dist(id, n);
             self.index
                 .search_layer(ep, layer, self.cfg.ef_construction, &to_new, &is_deleted)?;
@@ -2514,6 +2532,29 @@ impl VectorDb {
                 && !self.meta.is_deleted(id)
                 && !is_placeholder_vector(self.row(id as usize))
         })
+    }
+
+    /// Find the indexable row with the highest graph level, excluding
+    /// `exclude` — the seed for re-linking a node whose edges were just
+    /// cleared (the node itself cannot seed its own rebuild).
+    ///
+    /// The seed must be the *highest-level* candidate: the greedy descent and
+    /// the per-layer searches below start from it, and reading a layer the
+    /// seed does not have runs past its block into whatever follows (garbage
+    /// neighbor counts, out-of-bounds reads). Rows that never got a node
+    /// block (crash gap) are skipped — they cannot carry a layer either.
+    /// Layers above every remaining row's level had no links before the
+    /// rebuild either (a link only ever joins two nodes that both carry the
+    /// layer), so those lists staying empty is correct, not a recall loss.
+    fn find_relink_seed(&self, exclude: u32) -> Option<u32> {
+        (0..self.len() as u32)
+            .filter(|&id| {
+                (id as usize) < self.index.count()
+                    && id != exclude
+                    && !self.meta.is_deleted(id)
+                    && !is_placeholder_vector(self.row(id as usize))
+            })
+            .max_by_key(|&id| self.index.node_level(id))
     }
 
     /// Insert vector without WAL logging (used for compaction and recovery)
@@ -3916,6 +3957,43 @@ mod tests {
     // -------------------------------------------------------------------
     //  Dense metadata index
     // -------------------------------------------------------------------
+
+    /// Regression: `update` on the entry point clears its edges and re-links
+    /// from another row; the descent and per-layer searches then start from
+    /// that seed, which must carry every layer they walk. Levels come from
+    /// the config seed, so sweep seeds to reach the triggering layout —
+    /// the entry node holding a layer while the first re-link candidate does
+    /// not. Reading a layer the seed lacks used to run off its block into
+    /// the directory region (garbage neighbor counts) and panic past the end
+    /// of the mapping.
+    #[tokio::test]
+    async fn update_entry_relink_seed_carries_walked_layers() {
+        let mut exercised = 0;
+        for seed in 0..256u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let cfg = Config::new(2).with_capacity(16).with_seed(seed);
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            db.insert(&[1.0, 0.0], None).unwrap();
+            db.insert(&[0.0, 1.0], None).unwrap();
+            db.insert(&[1.0, 1.0], None).unwrap();
+            // The layout that used to blow up: node 0 is still the entry
+            // point and outranks the row picked as the re-link seed.
+            let triggering_layout = db.index.entry_point() == 0
+                && db.index.node_level(0) >= 1
+                && db.index.node_level(1) < db.index.node_level(0);
+            db.update(0, &[0.7, 0.7], None).unwrap();
+            let hits = db.search(&[1.0, 0.0], 3, 64).unwrap();
+            assert_eq!(hits.len(), 3, "seed {seed}: graph must stay connected");
+            if triggering_layout {
+                exercised += 1;
+            }
+        }
+        assert!(
+            exercised > 0,
+            "the sweep must actually cover the triggering layout"
+        );
+    }
 
     /// Memory layout guard: the metadata index must stay a dense 16 bytes
     /// per row. Field reordering (or padding-inducing type changes) would
