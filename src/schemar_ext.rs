@@ -77,3 +77,89 @@ impl<T> Default for Nullable<T> {
         Nullable(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Nullable` is transparent on the wire: it serializes exactly like
+    /// the inner `Option`, so payloads keep their `null`/value shape.
+    #[test]
+    fn serializes_like_the_inner_option() {
+        assert_eq!(
+            serde_json::to_value(Nullable(Some(7u32))).unwrap(),
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            serde_json::to_value(Nullable::<u32>(None)).unwrap(),
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
+    fn deserializes_from_value_and_null() {
+        let some: Nullable<u32> = serde_json::from_str("7").unwrap();
+        assert_eq!(some.0, Some(7));
+        let none: Nullable<u32> = serde_json::from_str("null").unwrap();
+        assert_eq!(none.0, None);
+    }
+
+    /// The schema MCP clients see must offer the inner type *or* null —
+    /// that `anyOf` is the whole point of this wrapper.
+    #[test]
+    fn schema_is_anyof_inner_or_null() {
+        let schema = Nullable::<u32>::json_schema(&mut SchemaGenerator::default());
+        let any_of = schema
+            .as_value()
+            .get("anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("anyOf branch");
+        assert_eq!(any_of.len(), 2);
+        assert_eq!(any_of[1], serde_json::json!({ "type": "null" }));
+        // The first branch is the inner type's schema (integer for u32).
+        assert_eq!(any_of[0].get("type"), Some(&serde_json::json!("integer")));
+    }
+
+    #[test]
+    fn schema_name_tracks_the_inner_type() {
+        assert_eq!(
+            Nullable::<u32>::schema_name(),
+            format!("Nullable_{}", u32::schema_name())
+        );
+    }
+
+    #[test]
+    fn deref_and_deref_mut_reach_the_inner_option() {
+        let mut n = Nullable(Some(1u32));
+        assert_eq!(*n, Some(1u32));
+        *n = Some(2u32);
+        assert_eq!(n.0, Some(2u32));
+        n.take();
+        assert_eq!(n.0, None);
+    }
+
+    #[test]
+    fn default_is_none() {
+        assert_eq!(Nullable::<u32>::default().0, None);
+    }
+
+    #[test]
+    fn converts_to_and_from_option() {
+        let n: Nullable<u32> = Nullable::from(Some(3u32));
+        let o: Option<u32> = n.into();
+        assert_eq!(o, Some(3u32));
+    }
+
+    /// `#[serde(default)]` on a missing `Nullable` field — the shape the
+    /// MCP `SearchRequest` relies on for `mode`.
+    #[test]
+    fn missing_field_defaults_to_none() {
+        #[derive(serde::Deserialize)]
+        struct WithDefault {
+            #[serde(default)]
+            mode: Nullable<u32>,
+        }
+        let v: WithDefault = serde_json::from_str("{}").unwrap();
+        assert_eq!(v.mode.0, None);
+    }
+}

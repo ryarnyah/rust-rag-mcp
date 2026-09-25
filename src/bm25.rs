@@ -65,7 +65,8 @@
 //! itself has no view of deletions), so a leftover posting can waste a
 //! lookup but can never surface a dead document.
 
-use anyhow::{Context, Result};
+use crate::sidecar;
+use anyhow::Result;
 use std::collections::HashMap;
 
 /// BM25 term-weighting parameter: controls term-frequency saturation.
@@ -82,7 +83,7 @@ const BM25_MAGIC: u64 = 0x424D_3235_0000_0001;
 
 /// Fixed sidecar header: magic, `vec_len`, `meta_record_count`,
 /// live-doc count, term count.
-const BM25_HEADER: usize = 32;
+const BM25_HEADER: usize = sidecar::HEADER_LEN;
 
 /// RRF smoothing constant (Cormack et al., SIGIR 2009). `60` is the
 /// value from the original paper and the de-facto standard: it keeps
@@ -324,33 +325,21 @@ pub fn serialize_bm25(index: &Bm25Index, vec_len: u64, meta_record_count: u64) -
         + docs.len() * 8;
 
     let mut buf = Vec::with_capacity(BM25_HEADER + body);
-    buf.extend_from_slice(&BM25_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&vec_len.to_le_bytes());
-    buf.extend_from_slice(&meta_record_count.to_le_bytes());
-    buf.extend_from_slice(
-        &u32::try_from(docs.len())
-            .context("too many bm25 documents")?
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(
-        &u32::try_from(terms.len())
-            .context("too many bm25 terms")?
-            .to_le_bytes(),
+    sidecar::push_header(
+        &mut buf,
+        BM25_MAGIC,
+        &sidecar::Header {
+            vec_len,
+            meta_record_count,
+            count_a: sidecar::to_u32(docs.len(), "bm25 documents")?,
+            count_b: sidecar::to_u32(terms.len(), "bm25 terms")?,
+        },
     );
 
     for term in terms {
         let postings = &index.postings[term];
-        buf.extend_from_slice(
-            &u32::try_from(term.len())
-                .context("bm25 term too long")?
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(term.as_bytes());
-        buf.extend_from_slice(
-            &u32::try_from(postings.len())
-                .context("too many bm25 postings")?
-                .to_le_bytes(),
-        );
+        sidecar::push_name(&mut buf, term, "bm25 term")?;
+        buf.extend_from_slice(&sidecar::to_u32(postings.len(), "bm25 postings")?.to_le_bytes());
         for &(doc, tf) in postings {
             buf.extend_from_slice(&doc.to_le_bytes());
             buf.extend_from_slice(&tf.to_le_bytes());
@@ -364,14 +353,6 @@ pub fn serialize_bm25(index: &Bm25Index, vec_len: u64, meta_record_count: u64) -
     Ok(buf)
 }
 
-/// Read a `u32` at `*cur`, advancing past it; `None` on any overrun.
-fn take_u32(bytes: &[u8], cur: &mut usize) -> Option<u32> {
-    let end = cur.checked_add(4)?;
-    let slice = bytes.get(*cur..end)?;
-    *cur = end;
-    Some(u32::from_le_bytes(slice.try_into().ok()?))
-}
-
 /// Parse and validate `db.bm25`. Returns `None` — meaning "rebuild from
 /// the metadata scan" — for *any* deviation: missing/foreign file, short
 /// read, bad magic, token mismatch, an id outside `vec_len`, an empty
@@ -380,27 +361,19 @@ fn take_u32(bytes: &[u8], cur: &mut usize) -> Option<u32> {
 /// record, truncated entries, or trailing bytes. Like `.srcidx`, every
 /// rejection just falls back to the always-correct scan.
 pub fn parse_bm25(bytes: &[u8], vec_len: u64, meta_record_count: u64) -> Option<Bm25Index> {
-    if bytes.len() < BM25_HEADER {
+    let header = sidecar::read_header(bytes, BM25_MAGIC)?;
+    if header.vec_len != vec_len || header.meta_record_count != meta_record_count {
         return None;
     }
-    let magic = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    if magic != BM25_MAGIC {
-        return None;
-    }
-    let got_vec_len = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let got_record_count = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-    if got_vec_len != vec_len || got_record_count != meta_record_count {
-        return None;
-    }
-    let doc_count = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
-    let term_count = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
+    let doc_count = header.count_a as usize;
+    let term_count = header.count_b as usize;
 
     // Allocation bound before trusting counts from a possibly corrupt
     // header: every length entry costs 8 bytes, every term costs at
     // least 4 (len) + 1 (min token) + 4 (count) + 8 (min posting) = 17;
     // 16 is a safe lower bound for the check (never rejects a valid
     // file, still caps both loops by file size).
-    let body = bytes.len() - BM25_HEADER;
+    let body = sidecar::body_len(bytes);
     if term_count
         .saturating_mul(16)
         .saturating_add(doc_count.saturating_mul(8))
@@ -412,16 +385,12 @@ pub fn parse_bm25(bytes: &[u8], vec_len: u64, meta_record_count: u64) -> Option<
     let mut cur = BM25_HEADER;
     let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::with_capacity(term_count);
     for _ in 0..term_count {
-        let term_len = take_u32(bytes, &mut cur)? as usize;
-        if term_len == 0 {
+        let term = sidecar::take_name(bytes, &mut cur)?;
+        if term.is_empty() {
             return None; // the tokenizer never emits empty terms
         }
-        let end = cur.checked_add(term_len)?;
-        let slice = bytes.get(cur..end)?;
-        let term = std::str::from_utf8(slice).ok()?.to_owned();
-        cur = end;
 
-        let n_postings = take_u32(bytes, &mut cur)? as usize;
+        let n_postings = sidecar::take_u32(bytes, &mut cur)? as usize;
         if n_postings == 0 {
             return None; // empty postings lists are dropped, not written
         }
@@ -431,8 +400,8 @@ pub fn parse_bm25(bytes: &[u8], vec_len: u64, meta_record_count: u64) -> Option<
         let mut list = Vec::with_capacity(n_postings);
         let mut prev: Option<u32> = None;
         for _ in 0..n_postings {
-            let doc = take_u32(bytes, &mut cur)?;
-            let tf = take_u32(bytes, &mut cur)?;
+            let doc = sidecar::take_u32(bytes, &mut cur)?;
+            let tf = sidecar::take_u32(bytes, &mut cur)?;
             if u64::from(doc) >= vec_len || tf == 0 {
                 return None;
             }
@@ -453,8 +422,8 @@ pub fn parse_bm25(bytes: &[u8], vec_len: u64, meta_record_count: u64) -> Option<
     let mut doc_len = HashMap::with_capacity(doc_count);
     let mut total_len: u64 = 0;
     for _ in 0..doc_count {
-        let doc = take_u32(bytes, &mut cur)?;
-        let len = take_u32(bytes, &mut cur)?;
+        let doc = sidecar::take_u32(bytes, &mut cur)?;
+        let len = sidecar::take_u32(bytes, &mut cur)?;
         if u64::from(doc) >= vec_len {
             return None;
         }

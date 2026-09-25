@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod r_vector;
 pub mod rag;
 pub mod schemar_ext;
+mod sidecar;
 pub mod syntax_chunker;
 pub mod wal;
 

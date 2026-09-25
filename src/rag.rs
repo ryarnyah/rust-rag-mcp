@@ -3,6 +3,7 @@ use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
 use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig, SearchHitOwned};
+use crate::sidecar;
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
 use crate::{
     DocumentChunk, DocumentStatus, HybridScoreComponents, IndexResult, RetrieverScore, SearchMode,
@@ -143,7 +144,7 @@ const SRCIDX_MAGIC: u64 = 0x5352_4349_4458_0001;
 
 /// Fixed sidecar header: magic, `vec_len`, `meta_record_count`,
 /// chunk-source count, doc-source count.
-const SRCIDX_HEADER: usize = 32;
+const SRCIDX_HEADER: usize = sidecar::HEADER_LEN;
 
 /// A parsed sidecar payload: `(chunk sources, doc sources)`.
 type SourceIndexPayload = (Vec<(String, Vec<u32>)>, Vec<(String, u32)>);
@@ -169,63 +170,28 @@ fn serialize_source_index(
         + docs.len() * 8;
     let mut buf = Vec::with_capacity(SRCIDX_HEADER + name_bytes + body);
 
-    buf.extend_from_slice(&SRCIDX_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&vec_len.to_le_bytes());
-    buf.extend_from_slice(&meta_record_count.to_le_bytes());
-    buf.extend_from_slice(
-        &u32::try_from(chunks.len())
-            .context("too many chunk sources")?
-            .to_le_bytes(),
-    );
-    buf.extend_from_slice(
-        &u32::try_from(docs.len())
-            .context("too many doc sources")?
-            .to_le_bytes(),
+    sidecar::push_header(
+        &mut buf,
+        SRCIDX_MAGIC,
+        &sidecar::Header {
+            vec_len,
+            meta_record_count,
+            count_a: sidecar::to_u32(chunks.len(), "chunk sources")?,
+            count_b: sidecar::to_u32(docs.len(), "doc sources")?,
+        },
     );
     for (source, ids) in chunks {
-        buf.extend_from_slice(
-            &u32::try_from(source.len())
-                .context("source name too long")?
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(source.as_bytes());
-        buf.extend_from_slice(
-            &u32::try_from(ids.len())
-                .context("too many ids for one source")?
-                .to_le_bytes(),
-        );
+        sidecar::push_name(&mut buf, source, "source name")?;
+        buf.extend_from_slice(&sidecar::to_u32(ids.len(), "ids for one source")?.to_le_bytes());
         for &id in ids {
             buf.extend_from_slice(&id.to_le_bytes());
         }
     }
     for (source, id) in docs {
-        buf.extend_from_slice(
-            &u32::try_from(source.len())
-                .context("source name too long")?
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(source.as_bytes());
+        sidecar::push_name(&mut buf, source, "source name")?;
         buf.extend_from_slice(&id.to_le_bytes());
     }
     Ok(buf)
-}
-
-/// Read a `u32` at `*cur`, advancing past it; `None` on any overrun.
-fn take_u32(bytes: &[u8], cur: &mut usize) -> Option<u32> {
-    let end = cur.checked_add(4)?;
-    let slice = bytes.get(*cur..end)?;
-    *cur = end;
-    Some(u32::from_le_bytes(slice.try_into().ok()?))
-}
-
-/// Read a length-prefixed UTF-8 name at `*cur`; `None` on any overrun
-/// or invalid UTF-8.
-fn take_name(bytes: &[u8], cur: &mut usize) -> Option<String> {
-    let len = take_u32(bytes, cur)? as usize;
-    let end = cur.checked_add(len)?;
-    let slice = bytes.get(*cur..end)?;
-    *cur = end;
-    std::str::from_utf8(slice).ok().map(str::to_owned)
 }
 
 /// Parse and validate `db.srcidx`. Returns `None` — meaning "rebuild
@@ -239,25 +205,17 @@ fn parse_source_index(
     vec_len: u64,
     meta_record_count: u64,
 ) -> Option<SourceIndexPayload> {
-    if bytes.len() < SRCIDX_HEADER {
+    let header = sidecar::read_header(bytes, SRCIDX_MAGIC)?;
+    if header.vec_len != vec_len || header.meta_record_count != meta_record_count {
         return None;
     }
-    let magic = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    if magic != SRCIDX_MAGIC {
-        return None;
-    }
-    let got_vec_len = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let got_record_count = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-    if got_vec_len != vec_len || got_record_count != meta_record_count {
-        return None;
-    }
-    let n_chunk_sources = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
-    let n_doc_sources = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
+    let n_chunk_sources = header.count_a as usize;
+    let n_doc_sources = header.count_b as usize;
 
     // Every entry costs at least 8 bytes (name length + id/count), so
     // this bounds both loops — and their allocations — by the file size
     // before trusting the counts from a potentially corrupt header.
-    let body = bytes.len() - SRCIDX_HEADER;
+    let body = sidecar::body_len(bytes);
     if n_chunk_sources
         .saturating_mul(8)
         .saturating_add(n_doc_sources.saturating_mul(8))
@@ -269,14 +227,14 @@ fn parse_source_index(
     let mut cur = SRCIDX_HEADER;
     let mut chunks = Vec::with_capacity(n_chunk_sources);
     for _ in 0..n_chunk_sources {
-        let source = take_name(bytes, &mut cur)?;
-        let n_ids = take_u32(bytes, &mut cur)? as usize;
+        let source = sidecar::take_name(bytes, &mut cur)?;
+        let n_ids = sidecar::take_u32(bytes, &mut cur)? as usize;
         if n_ids.saturating_mul(4) > bytes.len() - cur {
             return None;
         }
         let mut ids = Vec::with_capacity(n_ids);
         for _ in 0..n_ids {
-            let id = take_u32(bytes, &mut cur)? as u64;
+            let id = sidecar::take_u32(bytes, &mut cur)? as u64;
             if id >= vec_len {
                 return None;
             }
@@ -287,8 +245,8 @@ fn parse_source_index(
 
     let mut docs = Vec::with_capacity(n_doc_sources);
     for _ in 0..n_doc_sources {
-        let source = take_name(bytes, &mut cur)?;
-        let id = take_u32(bytes, &mut cur)? as u64;
+        let source = sidecar::take_name(bytes, &mut cur)?;
+        let id = sidecar::take_u32(bytes, &mut cur)? as u64;
         if id >= vec_len {
             return None;
         }
@@ -597,10 +555,10 @@ impl RagCore {
             .to_lowercase();
 
         let text = match ext.as_str() {
-            "pdf" => docs::extract_text(path).await?,
-            "docx" | "xlsx" | "pptx" => docs::extract_text(path).await?,
+            // Binary formats always go through the extractor; text files
+            // reuse the bytes we already hold when they are valid UTF-8.
+            "pdf" | "docx" | "xlsx" | "pptx" => docs::extract_text(path).await?,
             _ => {
-                // For text files, use the already-read bytes
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     text.to_string()
                 } else {
@@ -619,6 +577,48 @@ impl RagCore {
     pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
         self.index_file_with_progress(path, |_done, _total| async {})
             .await
+    }
+
+    /// Shared body of [`Self::index_file_with_progress`] and
+    /// [`Self::index_text`]: skip when the content hash already matches,
+    /// replace a stale document, chunk (syntax-aware when `ext` names a
+    /// language), store the chunks, and record the new metadata.
+    ///
+    /// `source` is the key everything is filed under — the canonicalized
+    /// path for files, the caller's id for raw text — and `content_hash`
+    /// is whatever that entry point hashes, so the skip decision stays
+    /// local to each one.
+    async fn index_prepared<F>(
+        &self,
+        source: &str,
+        content_hash: &str,
+        ext: &str,
+        text: &str,
+        on_chunk: F,
+    ) -> Result<IndexResult>
+    where
+        F: AsyncFnMut(usize, usize),
+    {
+        if let Some(status) = self.document_status(source).await? {
+            if status.content_hash == content_hash {
+                return Ok(IndexResult::Skipped);
+            }
+            self.delete_source_inner(source).await?;
+        }
+
+        let chunks = if language_for_extension(ext).is_some() {
+            self.syntax_chunker.chunk_text(text, source)
+        } else {
+            self.chunker.chunk_text(text, source)
+        };
+        let count = chunks.len();
+        self.index_chunks(chunks, on_chunk).await?;
+
+        let now = current_timestamp()?;
+        self.upsert_metadata(source, content_hash, now, count as u32)
+            .await?;
+
+        Ok(IndexResult::Indexed(count))
     }
 
     /// Same as [`Self::index_file`], but streams chunk-level progress to
@@ -643,66 +643,25 @@ impl RagCore {
 
         // Read file once to avoid TOCTOU between hash check and text extraction
         let (content_hash, text) = Self::read_file_for_indexing(path).await?;
-
-        if let Some(status) = self.document_status(&source_path).await? {
-            if status.content_hash == content_hash {
-                return Ok(IndexResult::Skipped);
-            }
-            self.delete_source_inner(&source_path).await?;
-        }
-
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
 
-        let count = {
-            let chunks = if language_for_extension(&ext).is_some() {
-                self.syntax_chunker.chunk_text(&text, &source_path)
-            } else {
-                self.chunker.chunk_text(&text, &source_path)
-            };
-            let count = chunks.len();
-            self.index_chunks(chunks, on_chunk).await?;
-            count
-        };
-
-        let now = current_timestamp()?;
-        self.upsert_metadata(&source_path, &content_hash, now, count as u32)
-            .await?;
-
-        Ok(IndexResult::Indexed(count))
+        self.index_prepared(&source_path, &content_hash, &ext, &text, on_chunk)
+            .await
     }
 
     /// Indexes the given text by chunking it and storing the chunks and metadata in the database.
     pub async fn index_text(&self, text: &str, source: &str) -> Result<IndexResult> {
         let _ops = self.ops.lock().await;
         let content_hash = Self::compute_text_hash(text);
-
-        if let Some(status) = self.document_status(source).await? {
-            if status.content_hash == content_hash {
-                return Ok(IndexResult::Skipped);
-            }
-            self.delete_source_inner(source).await?;
-        }
-
         let ext = source.rsplit('.').next().unwrap_or("").to_lowercase();
 
-        let chunks = if language_for_extension(&ext).is_some() {
-            self.syntax_chunker.chunk_text(text, source)
-        } else {
-            self.chunker.chunk_text(text, source)
-        };
-        let count = chunks.len();
         // `index_text` has no progress consumer; report nothing.
-        self.index_chunks(chunks, |_done, _total| async {}).await?;
-
-        let now = current_timestamp()?;
-        self.upsert_metadata(source, &content_hash, now, count as u32)
-            .await?;
-
-        Ok(IndexResult::Indexed(count))
+        self.index_prepared(source, &content_hash, &ext, text, |_done, _total| async {})
+            .await
     }
 
     /// Indexes the given chunks by generating embeddings and storing them in the database.

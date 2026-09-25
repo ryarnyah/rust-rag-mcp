@@ -151,6 +151,30 @@ enum Commands {
     Models,
 }
 
+/// `ef_construction` used by the commands that don't expose the flag.
+const DEFAULT_EF_CONSTRUCTION: usize = 150;
+
+/// Open a [`RagCore`] from the path/model options every subcommand repeats,
+/// so a new command cannot forget one of the six arguments.
+async fn open_core(
+    db_path: &str,
+    cache_path: &str,
+    model: &str,
+    chunk_size: usize,
+    overlap: usize,
+    ef_construction: usize,
+) -> anyhow::Result<rag::RagCore> {
+    rag::RagCore::new(
+        std::path::Path::new(db_path),
+        std::path::Path::new(cache_path),
+        model,
+        chunk_size,
+        overlap,
+        ef_construction,
+    )
+    .await
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -205,9 +229,9 @@ async fn main() -> anyhow::Result<()> {
             overlap,
             ef_construction,
         } => {
-            let core = rag::RagCore::new(
-                std::path::Path::new(&db_path),
-                std::path::Path::new(&cache_path),
+            let core = open_core(
+                &db_path,
+                &cache_path,
                 &model,
                 chunk_size,
                 overlap,
@@ -221,25 +245,15 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                let mut stack = vec![path.to_path_buf()];
-                while let Some(current) = stack.pop() {
-                    if current.is_dir() {
-                        if let Ok(mut entries) = tokio::fs::read_dir(&current).await {
-                            while let Ok(Some(entry)) = entries.next_entry().await {
-                                let file_path = entry.path();
-                                stack.push(file_path);
-                            }
+                for current in docs::walk_supported_files(path).await {
+                    match core.index_file(&current).await {
+                        Ok(rust_rag_mcp::IndexResult::Indexed(count)) => {
+                            println!("Indexed {}: {} chunks", current.display(), count)
                         }
-                    } else if current.is_file() && docs::supported_extension(&current) {
-                        match core.index_file(&current).await {
-                            Ok(rust_rag_mcp::IndexResult::Indexed(count)) => {
-                                println!("Indexed {}: {} chunks", current.display(), count)
-                            }
-                            Ok(rust_rag_mcp::IndexResult::Skipped) => {
-                                println!("Skipped {} (unchanged)", current.display())
-                            }
-                            Err(e) => eprintln!("Failed {}: {}", current.display(), e),
+                        Ok(rust_rag_mcp::IndexResult::Skipped) => {
+                            println!("Skipped {} (unchanged)", current.display())
                         }
+                        Err(e) => eprintln!("Failed {}: {}", current.display(), e),
                     }
                 }
             }
@@ -257,13 +271,13 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(
-                std::path::Path::new(&db_path),
-                std::path::Path::new(&cache_path),
+            let core = open_core(
+                &db_path,
+                &cache_path,
                 &model,
                 chunk_size,
                 overlap,
-                150,
+                DEFAULT_EF_CONSTRUCTION,
             )
             .await?;
             let query_str = query.join(" ");
@@ -317,13 +331,13 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(
-                std::path::Path::new(&db_path),
-                std::path::Path::new(&cache_path),
+            let core = open_core(
+                &db_path,
+                &cache_path,
                 &model,
                 chunk_size,
                 overlap,
-                150,
+                DEFAULT_EF_CONSTRUCTION,
             )
             .await?;
             let sources = core.list_sources().await?;
@@ -344,13 +358,13 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(
-                std::path::Path::new(&db_path),
-                std::path::Path::new(&cache_path),
+            let core = open_core(
+                &db_path,
+                &cache_path,
                 &model,
                 chunk_size,
                 overlap,
-                150,
+                DEFAULT_EF_CONSTRUCTION,
             )
             .await?;
             let count = core.chunk_count().await?;
@@ -371,13 +385,13 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
         } => {
-            let core = rag::RagCore::new(
-                std::path::Path::new(&db_path),
-                std::path::Path::new(&cache_path),
+            let core = open_core(
+                &db_path,
+                &cache_path,
                 &model,
                 chunk_size,
                 overlap,
-                150,
+                DEFAULT_EF_CONSTRUCTION,
             )
             .await?;
             match core.delete_source(&source_path).await {

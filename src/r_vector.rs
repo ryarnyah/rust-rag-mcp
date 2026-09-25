@@ -45,7 +45,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::wal::{WalOpType, WalRecord, WriteAheadLog};
+use crate::wal::{WalOpType, WalRecord, WriteAheadLog, open_null_file};
 
 // ============================================================================
 //  mmap helpers
@@ -87,6 +87,33 @@ fn map_file(file: &File) -> Result<MmapMut> {
         tracing::debug!(error = %e, "madvise(RANDOM) failed");
     }
     Ok(m)
+}
+
+/// Little-endian `u64` at `off`; `None` when the field would run past the
+/// end of the mapping (a truncated file, or an offset read off a corrupt
+/// header). Never indexes out of range, so a bad offset rejects instead of
+/// panicking.
+fn u64_at(bytes: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    let slice: [u8; 8] = bytes.get(off..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(slice))
+}
+
+/// Little-endian `u32` at `off`; `None` when it would run past the end.
+fn u32_at(bytes: &[u8], off: usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    let slice: [u8; 4] = bytes.get(off..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(slice))
+}
+
+/// [`u64_at`] with the corruption error every on-disk header read reports.
+fn read_u64(bytes: &[u8], off: usize, what: &str) -> Result<u64> {
+    u64_at(bytes, off).ok_or_else(|| VectorDbError::Corruption(what.to_string()))
+}
+
+/// [`u32_at`] with the corruption error every on-disk header read reports.
+fn read_u32(bytes: &[u8], off: usize, what: &str) -> Result<u32> {
+    u32_at(bytes, off).ok_or_else(|| VectorDbError::Corruption(what.to_string()))
 }
 
 // ============================================================================
@@ -577,11 +604,7 @@ impl MetadataStore {
             }
             let m = map_file(&store.file)?;
 
-            let magic = u64::from_le_bytes(
-                m[0..8]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("metadata file too small".into()))?,
-            );
+            let magic = read_u64(&m, 0, "metadata file too small")?;
             if magic != META_MAGIC {
                 return Err(VectorDbError::Corruption("invalid metadata magic".into()));
             }
@@ -947,9 +970,7 @@ impl HnswIndex {
             let mut m = map_file(&file)?;
 
             // Validate magic
-            let magic = u64::from_le_bytes(m[0..8].try_into().map_err(|_| {
-                VectorDbError::Corruption("file too small for HNSW header".to_string())
-            })?);
+            let magic = read_u64(&m, 0, "file too small for HNSW header")?;
             if magic != HNSW_MAGIC {
                 return Err(VectorDbError::Corruption("invalid HNSW magic".to_string()));
             }
@@ -962,29 +983,11 @@ impl HnswIndex {
             // Validate config compatibility
             let on_disk = Config {
                 dim: cfg.dim,
-                m: u64::from_le_bytes(
-                    m[32..40]
-                        .try_into()
-                        .map_err(|_| VectorDbError::Corruption("invalid m value".to_string()))?,
-                ) as usize,
-                m0: u64::from_le_bytes(
-                    m[40..48]
-                        .try_into()
-                        .map_err(|_| VectorDbError::Corruption("invalid m0 value".to_string()))?,
-                ) as usize,
-                max_level: u64::from_le_bytes(
-                    m[48..56]
-                        .try_into()
-                        .map_err(|_| VectorDbError::Corruption("invalid max_level".to_string()))?,
-                ) as usize,
-                ef_construction: u64::from_le_bytes(m[56..64].try_into().map_err(|_| {
-                    VectorDbError::Corruption("invalid ef_construction".to_string())
-                })?) as usize,
-                seed: u64::from_le_bytes(
-                    m[64..72]
-                        .try_into()
-                        .map_err(|_| VectorDbError::Corruption("invalid seed".to_string()))?,
-                ),
+                m: read_u64(&m, 32, "invalid m value")? as usize,
+                m0: read_u64(&m, 40, "invalid m0 value")? as usize,
+                max_level: read_u64(&m, 48, "invalid max_level")? as usize,
+                ef_construction: read_u64(&m, 56, "invalid ef_construction")? as usize,
+                seed: read_u64(&m, 64, "invalid seed")?,
                 initial_capacity: cfg.initial_capacity,
                 max_wal_segment_size: cfg.max_wal_segment_size,
                 max_total_wal_size: cfg.max_total_wal_size,
@@ -998,31 +1001,17 @@ impl HnswIndex {
                 )));
             }
 
-            let count = u64::from_le_bytes(
-                m[8..16]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid count".to_string()))?,
-            );
+            let count = read_u64(&m, 8, "invalid count")?;
             let seed = on_disk.seed ^ (count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
-            let stored_arena_end = u64::from_le_bytes(
-                m[24..32]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid arena end".to_string()))?,
-            ) as usize;
+            let stored_arena_end = read_u64(&m, 24, "invalid arena end")? as usize;
 
             // v4 fast path: trust the persisted directory when it is
             // structurally intact and agrees with the header — no walk, no
             // per-block reads at open. Any doubt falls back to the walk
             // below, because the self-describing blocks remain the source
             // of truth for both the directory and `arena_end`.
-            let dir_start = u64::from_le_bytes(
-                m[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
-                    .try_into()
-                    .map_err(|_| {
-                        VectorDbError::Corruption("invalid directory start".to_string())
-                    })?,
-            ) as usize;
+            let dir_start = read_u64(&m, HNSW_DIR_START_OFF, "invalid directory start")? as usize;
             if Self::validate_dir_region(&m, dir_start, count, stored_arena_end, &on_disk).is_some()
             {
                 return Ok(Self {
@@ -1107,7 +1096,7 @@ impl HnswIndex {
         let mut prev = 0u64;
         for i in 0..count {
             let at = dir_start + 8 * i as usize;
-            let off = u64::from_le_bytes(m[at..at + 8].try_into().ok()?);
+            let off = u64_at(m, at)?;
             let ok = if i == 0 {
                 off == HNSW_HEADER as u64
             } else {
@@ -1123,7 +1112,7 @@ impl HnswIndex {
         // the header/arena range it was flushed with.
         let last = prev as usize;
         let level = *m.get(last)?;
-        let size = u32::from_le_bytes(m.get(last + 2..last + 6)?.try_into().ok()?) as usize;
+        let size = u32_at(m, last + 2)? as usize;
         if level as usize > cfg.max_level || size != Self::node_bytes(cfg, level as usize) {
             return None;
         }
@@ -1153,9 +1142,7 @@ impl HnswIndex {
                     cfg.max_level
                 )));
             }
-            let size = u32::from_le_bytes(m[off + 2..off + 6].try_into().map_err(|_| {
-                VectorDbError::Corruption("node block header truncated".to_string())
-            })?) as usize;
+            let size = read_u32(m.as_ref(), off + 2, "node block header truncated")? as usize;
             if size != Self::node_bytes(cfg, level as usize) {
                 return Err(VectorDbError::Corruption(format!(
                     "node {i} block size {size} inconsistent with level {level}"
@@ -1354,11 +1341,7 @@ impl HnswIndex {
                     "node {id} block starts at {off}, leaving a gap after {walked_end}"
                 )));
             }
-            let size = u32::from_le_bytes(
-                self.mmap()[off + 2..off + 6]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("block header truncated".into()))?,
-            ) as usize;
+            let size = read_u32(self.mmap(), off + 2, "block header truncated")? as usize;
             if off + size > file_len {
                 return Err(VectorDbError::Corruption(format!(
                     "node {id} block extends past end of file"
@@ -2180,21 +2163,13 @@ impl VectorDb {
             m
         } else {
             let m = map_file(&file)?;
-            let magic = u64::from_le_bytes(
-                m[0..8]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("vec file too small".to_string()))?,
-            );
+            let magic = read_u64(&m, 0, "vec file too small")?;
             if magic != VEC_MAGIC {
                 return Err(VectorDbError::Corruption(
                     "invalid vector magic".to_string(),
                 ));
             }
-            let stored = u64::from_le_bytes(
-                m[8..16]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid dim".to_string()))?,
-            ) as usize;
+            let stored = read_u64(&m, 8, "invalid dim")? as usize;
             if stored != cfg.dim {
                 return Err(VectorDbError::DimensionMismatch {
                     expected: cfg.dim,
@@ -2210,11 +2185,7 @@ impl VectorDb {
                     "invalid row-area start {data_start}"
                 )));
             }
-            let len = u64::from_le_bytes(
-                m[16..24]
-                    .try_into()
-                    .map_err(|_| VectorDbError::Corruption("invalid len".to_string()))?,
-            ) as usize;
+            let len = read_u64(&m, 16, "invalid len")? as usize;
             let need = len
                 .checked_mul(stored)
                 .and_then(|b| b.checked_mul(4))
@@ -2916,13 +2887,33 @@ impl VectorDb {
         Ok(true)
     }
 
-    /// Search for k nearest neighbors
+    /// The ef actually handed to the graph search. Small-to-moderate `k`
+    /// reduces the inflation (`ef.max(2k)` plus one unit per tombstone, so
+    /// deleted rows don't crowd out live ones); very large `k` needs the
+    /// fuller multiple to keep the frontier wide enough.
+    fn effective_ef(&self, k: usize, ef: usize) -> usize {
+        if k <= 100 {
+            ef.max(k * 2) + self.deleted_count.min(32)
+        } else {
+            ef.max(k).max(k * 4) + self.deleted_count.min(64)
+        }
+    }
+
+    /// Shared engine behind [`Self::search`] and
+    /// [`Self::search_with_source_filter`]: reject a wrong dimension or a
+    /// placeholder query, build the distance closure over the mapped
+    /// vectors, and walk the graph for `graph_k` candidates.
     ///
-    /// # Errors
-    /// - `DimensionMismatch` if the query dimension differs from the db's
-    /// - `ZeroVector` if the query is all-zero (undefined for cosine distance)
-    /// - any distance/storage error while traversing the graph
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
+    /// `k` only shapes the [`Self::effective_ef`] formula — the filtered
+    /// search ranks with the *requested* k and then keeps whatever matches —
+    /// while `graph_k` is how many candidates the walk returns.
+    fn search_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        graph_k: usize,
+        ef: usize,
+    ) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.cfg.dim {
             return Err(VectorDbError::DimensionMismatch {
                 expected: self.cfg.dim,
@@ -2947,16 +2938,18 @@ impl VectorDb {
         };
         let is_deleted = |id: u32| self.meta.is_deleted(id);
 
-        let ef_actual = if k <= 100 {
-            // For small-to-moderate k, reduce ef inflation
-            ef.max(k * 2) + self.deleted_count.min(32)
-        } else {
-            // For very large k, maintain original formula
-            ef.max(k).max(k * 4) + self.deleted_count.min(64)
-        };
-
         self.index
-            .search(k, ef_actual, dist, &is_deleted)?
+            .search(graph_k, self.effective_ef(k, ef), dist, &is_deleted)
+    }
+
+    /// Search for k nearest neighbors
+    ///
+    /// # Errors
+    /// - `DimensionMismatch` if the query dimension differs from the db's
+    /// - `ZeroVector` if the query is all-zero (undefined for cosine distance)
+    /// - any distance/storage error while traversing the graph
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit<'_>>> {
+        self.search_candidates(query, k, k, ef)?
             .into_iter()
             .map(|(id, d)| {
                 Ok(SearchHit {
@@ -2989,41 +2982,9 @@ impl VectorDb {
         ef: usize,
         source_filter: &str,
     ) -> Result<Vec<SearchHit<'_>>> {
-        if query.len() != self.cfg.dim {
-            return Err(VectorDbError::DimensionMismatch {
-                expected: self.cfg.dim,
-                got: query.len(),
-            });
-        }
-        if is_placeholder_vector(query) {
-            // No direction to compare: report it, never return made-up scores.
-            return Err(VectorDbError::ZeroVector);
-        }
-
-        let view = self.vector_view();
-        // Query finiteness and norm are validated once here rather than
-        // re-checked for every visited candidate.
-        let metric = QueryCosine::new(query)?;
-        let dist = |id: u32| -> Result<f32> {
-            let v = view.get(id).ok_or(VectorDbError::IdOutOfBounds {
-                id,
-                capacity: view.file_size as u32,
-            })?;
-            metric.distance(v)
-        };
-        let is_deleted = |id: u32| self.meta.is_deleted(id);
-
-        let ef_actual = if k <= 100 {
-            ef.max(k * 2) + self.deleted_count.min(32)
-        } else {
-            ef.max(k).max(k * 4) + self.deleted_count.min(64)
-        };
-
-        // Search with expanded k to account for filtering
+        // Over-fetch so a filter that drops most of the graph can still fill k.
         let expanded_k = (k * 4).max(k + 100);
-        let raw_results = self
-            .index
-            .search(expanded_k, ef_actual, dist, &is_deleted)?;
+        let raw_results = self.search_candidates(query, k, expanded_k, ef)?;
 
         let mut filtered = Vec::new();
         for (id, d) in raw_results {
@@ -3208,23 +3169,6 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
-}
-
-/// Open a platform-appropriate null file handle (used as a dummy for mem::replace)
-fn open_null_file() -> io::Result<File> {
-    #[cfg(unix)]
-    {
-        std::fs::OpenOptions::new().read(true).open("/dev/null")
-    }
-    #[cfg(windows)]
-    {
-        std::fs::OpenOptions::new().read(true).open("NUL")
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        // Fallback: create a temporary file and immediately return it
-        std::fs::File::open(std::env::temp_dir().join(".null_dummy"))
-    }
 }
 
 // ============================================================================
@@ -4002,6 +3946,90 @@ mod tests {
         assert!(
             db.integrity_check().is_err(),
             "integrity_check must catch the damaged block"
+        );
+    }
+
+    /// `search_with_source_filter` must drop non-matching rows even when they
+    /// are the *nearest* neighbors, ignore metadata that is not JSON or carries
+    /// no `source` field, and reject the same inputs `search` rejects. (The
+    /// function currently has no callers in-tree, so this test is its contract.)
+    #[tokio::test]
+    async fn search_with_source_filter_drops_nearer_non_matching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(4).with_capacity(32).with_seed(3);
+        let mut db = VectorDb::open(&path, cfg).await.unwrap();
+
+        // Two "beta" rows sit almost exactly on the query...
+        db.insert(&[1.0, 0.01, 0.0, 0.0], Some(br#"{"source":"beta"}"#))
+            .unwrap();
+        db.insert(&[1.0, 0.02, 0.0, 0.0], Some(br#"{"source":"beta"}"#))
+            .unwrap();
+        // ...while the "alpha" rows are far enough away to only survive if the
+        // filter runs after ranking, not before.
+        db.insert(&[0.6, 0.8, 0.0, 0.0], Some(br#"{"source":"alpha"}"#))
+            .unwrap();
+        db.insert(&[0.8, 0.6, 0.0, 0.0], Some(br#"{"source":"alpha"}"#))
+            .unwrap();
+        // Metadata that is not JSON, or JSON without a `source`, never matches.
+        db.insert(&[1.0, 0.0, 0.1, 0.0], Some(b"not json at all"))
+            .unwrap();
+        db.insert(&[1.0, 0.0, 0.0, 0.1], Some(br#"{"path":"x"}"#))
+            .unwrap();
+
+        let source_of = |hit: &SearchHit<'_>| -> Option<String> {
+            serde_json::from_slice::<serde_json::Value>(hit.metadata)
+                .ok()?
+                .get("source")?
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+        let all = db.search(&query, 6, 64).unwrap();
+        assert_eq!(all.len(), 6, "unfiltered search must see every row");
+        assert_eq!(
+            source_of(&all[0]).as_deref(),
+            Some("beta"),
+            "the nearest rows are the ones the filter has to drop"
+        );
+
+        let alpha = db
+            .search_with_source_filter(&query, 6, 64, "alpha")
+            .unwrap();
+        assert_eq!(alpha.len(), 2, "only the two `source: alpha` rows match");
+        assert!(
+            alpha
+                .iter()
+                .all(|h| source_of(h).as_deref() == Some("alpha")),
+            "every returned row must match the filter"
+        );
+        let beta = db.search_with_source_filter(&query, 6, 64, "beta").unwrap();
+        assert_eq!(beta.len(), 2, "the nearer beta rows still match beta");
+
+        let one = db
+            .search_with_source_filter(&query, 1, 64, "alpha")
+            .unwrap();
+        assert_eq!(one.len(), 1, "k must cap the filtered results");
+
+        let none = db
+            .search_with_source_filter(&query, 6, 64, "missing")
+            .unwrap();
+        assert!(none.is_empty(), "an unused source matches nothing");
+
+        let dim_err = db
+            .search_with_source_filter(&[1.0, 0.0, 0.0], 6, 64, "alpha")
+            .unwrap_err();
+        assert!(
+            matches!(dim_err, VectorDbError::DimensionMismatch { .. }),
+            "expected a dimension mismatch, got {dim_err:?}"
+        );
+        let zero_err = db
+            .search_with_source_filter(&[0.0; 4], 6, 64, "alpha")
+            .unwrap_err();
+        assert!(
+            matches!(zero_err, VectorDbError::ZeroVector),
+            "expected a zero-vector rejection, got {zero_err:?}"
         );
     }
 

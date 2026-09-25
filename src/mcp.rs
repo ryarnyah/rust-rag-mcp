@@ -69,6 +69,18 @@ pub struct RagServer {
     core: Arc<RwLock<RagCore>>,
 }
 
+/// Serialize `resp` as the single JSON content block of a successful
+/// `tools/call` result.
+fn ok_json<T: serde::Serialize>(resp: T) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+}
+
+/// Build the `internal error` returned when a `RagCore` operation fails,
+/// prefixing the failure with `context` for the client log.
+fn internal_err(context: &str, e: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(format!("{context}: {e}"), None)
+}
+
 impl RagServer {
     pub async fn new(
         db_path: &std::path::Path,
@@ -182,7 +194,6 @@ impl RagServer {
             .and_then(|(_, v)| serde_json::from_value::<NumberOrString>(v.clone()).ok())
             .map(ProgressToken);
 
-        let mut stack = vec![path.to_path_buf()];
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut errors = Vec::new();
@@ -195,73 +206,64 @@ impl RagServer {
         // handler's `Send` bound.
         let progress = Arc::new(AtomicU64::new(0));
 
-        while let Some(current) = stack.pop() {
-            if current.is_dir() {
-                if let Ok(mut entries) = tokio::fs::read_dir(&current).await {
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        stack.push(entry.path());
+        for current in docs::walk_supported_files(path).await {
+            let file = current.display().to_string();
+            let peer = ctx.peer.clone();
+            let token = progress_token.clone();
+            let counter = progress.clone();
+            let notify_file = file.clone();
+            let result = {
+                let core = self.core.read().await;
+                // One notification per chunk, as it lands in the index.
+                core.index_file_with_progress(&current, move |done, total| {
+                    let peer = peer.clone();
+                    let token = token.clone();
+                    let file = notify_file.clone();
+                    let counter = counter.clone();
+                    async move {
+                        let Some(token) = token else { return };
+                        let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = peer
+                            .notify_progress(
+                                ProgressNotificationParam::new(token, value as f64)
+                                    .with_message(format!("{file}: chunk {done}/{total}")),
+                            )
+                            .await;
+                    }
+                })
+                .await
+            };
+            // Files with no chunk still get one notification, so the
+            // client sees the walk finish them.
+            let outcome = match &result {
+                Ok(IndexResult::Indexed(count)) => {
+                    indexed += 1;
+                    errors.push(format!("Indexed {} — {} chunks", file, count));
+                    if *count == 0 {
+                        Some(format!("{file} — no chunks"))
+                    } else {
+                        None
                     }
                 }
-            } else if current.is_file() && docs::supported_extension(&current) {
-                let file = current.display().to_string();
-                let peer = ctx.peer.clone();
-                let token = progress_token.clone();
-                let counter = progress.clone();
-                let notify_file = file.clone();
-                let result = {
-                    let core = self.core.read().await;
-                    // One notification per chunk, as it lands in the index.
-                    core.index_file_with_progress(&current, move |done, total| {
-                        let peer = peer.clone();
-                        let token = token.clone();
-                        let file = notify_file.clone();
-                        let counter = counter.clone();
-                        async move {
-                            let Some(token) = token else { return };
-                            let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                            let _ = peer
-                                .notify_progress(
-                                    ProgressNotificationParam::new(token, value as f64)
-                                        .with_message(format!("{file}: chunk {done}/{total}")),
-                                )
-                                .await;
-                        }
-                    })
-                    .await
-                };
-                // Files with no chunk still get one notification, so the
-                // client sees the walk finish them.
-                let outcome = match &result {
-                    Ok(IndexResult::Indexed(count)) => {
-                        indexed += 1;
-                        errors.push(format!("Indexed {} — {} chunks", file, count));
-                        if *count == 0 {
-                            Some(format!("{file} — no chunks"))
-                        } else {
-                            None
-                        }
-                    }
-                    Ok(IndexResult::Skipped) => {
-                        skipped += 1;
-                        Some(format!("{file} — unchanged"))
-                    }
-                    Err(e) => {
-                        errors.push(format!("Failed {}: {}", file, e));
-                        Some(format!("{file} — failed: {e}"))
-                    }
-                };
-                if let Some(message) = outcome
-                    && let Some(token) = progress_token.clone()
-                {
-                    let value = progress.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = ctx
-                        .peer
-                        .notify_progress(
-                            ProgressNotificationParam::new(token, value as f64)
-                                .with_message(message),
-                        )
-                        .await;
+                Ok(IndexResult::Skipped) => {
+                    skipped += 1;
+                    Some(format!("{file} — unchanged"))
                 }
+                Err(e) => {
+                    errors.push(format!("Failed {}: {}", file, e));
+                    Some(format!("{file} — failed: {e}"))
+                }
+            };
+            if let Some(message) = outcome
+                && let Some(token) = progress_token.clone()
+            {
+                let value = progress.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = ctx
+                    .peer
+                    .notify_progress(
+                        ProgressNotificationParam::new(token, value as f64).with_message(message),
+                    )
+                    .await;
             }
         }
 
@@ -271,7 +273,7 @@ impl RagServer {
             skipped,
             details: errors,
         };
-        Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+        ok_json(resp)
     }
 
     #[tool(description = "\
@@ -288,25 +290,19 @@ impl RagServer {
             core.index_text(&req.text, &req.source).await
         };
         match result {
-            Ok(IndexResult::Indexed(count)) => {
-                let resp = IndexTextResponse {
-                    status: "indexed",
-                    source: req.source,
-                    chunks: Some(count),
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
-            }
-            Ok(IndexResult::Skipped) => {
-                let resp = IndexTextResponse {
-                    status: "skipped",
-                    source: req.source,
-                    chunks: None,
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
-            }
-            Err(e) => Err(ErrorData::internal_error(
-                format!("Error indexing text '{}': {}", req.source, e),
-                None,
+            Ok(IndexResult::Indexed(count)) => ok_json(IndexTextResponse {
+                status: "indexed",
+                source: req.source,
+                chunks: Some(count),
+            }),
+            Ok(IndexResult::Skipped) => ok_json(IndexTextResponse {
+                status: "skipped",
+                source: req.source,
+                chunks: None,
+            }),
+            Err(e) => Err(internal_err(
+                &format!("Error indexing text '{}'", req.source),
+                e,
             )),
         }
     }
@@ -339,17 +335,13 @@ impl RagServer {
                         text: r.chunk.text.clone(),
                     })
                     .collect();
-                let resp = SearchResponse {
+                ok_json(SearchResponse {
                     mode,
                     count: items.len(),
                     results: items,
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
+                })
             }
-            Err(e) => Err(ErrorData::internal_error(
-                format!("Error searching: {}", e),
-                None,
-            )),
+            Err(e) => Err(internal_err("Error searching", e)),
         }
     }
 
@@ -366,16 +358,13 @@ impl RagServer {
             core.delete_source(&req.source_path).await
         };
         match result {
-            Ok(()) => {
-                let resp = DeleteSourceResponse {
-                    status: "deleted",
-                    source: req.source_path,
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
-            }
-            Err(e) => Err(ErrorData::internal_error(
-                format!("Error deleting source '{}': {}", req.source_path, e),
-                None,
+            Ok(()) => ok_json(DeleteSourceResponse {
+                status: "deleted",
+                source: req.source_path,
+            }),
+            Err(e) => Err(internal_err(
+                &format!("Error deleting source '{}'", req.source_path),
+                e,
             )),
         }
     }
@@ -394,29 +383,23 @@ impl RagServer {
             core.document_status(&req.source_path).await
         };
         match result {
-            Ok(Some(status)) => {
-                let resp = DocumentStatusResponse {
-                    found: true,
-                    source: status.source_path,
-                    content_hash: Some(status.content_hash),
-                    indexed_at: Some(status.indexed_at),
-                    chunk_count: Some(status.chunk_count),
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
-            }
-            Ok(None) => {
-                let resp = DocumentStatusResponse {
-                    found: false,
-                    source: req.source_path,
-                    content_hash: None,
-                    indexed_at: None,
-                    chunk_count: None,
-                };
-                Ok(CallToolResult::success(vec![ContentBlock::json(resp)?]))
-            }
-            Err(e) => Err(ErrorData::internal_error(
-                format!("Error checking status for '{}': {}", req.source_path, e),
-                None,
+            Ok(Some(status)) => ok_json(DocumentStatusResponse {
+                found: true,
+                source: status.source_path,
+                content_hash: Some(status.content_hash),
+                indexed_at: Some(status.indexed_at),
+                chunk_count: Some(status.chunk_count),
+            }),
+            Ok(None) => ok_json(DocumentStatusResponse {
+                found: false,
+                source: req.source_path,
+                content_hash: None,
+                indexed_at: None,
+                chunk_count: None,
+            }),
+            Err(e) => Err(internal_err(
+                &format!("Error checking status for '{}'", req.source_path),
+                e,
             )),
         }
     }

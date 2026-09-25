@@ -6,13 +6,19 @@ use rust_rag_mcp::mcp::RagServer;
 use rust_rag_mcp::rag::RagCore;
 use tempfile::tempdir;
 
-const TEST_FIXTURES_DIR: &str = "../../test-fixtures";
+/// Fixture directory, anchored on the manifest dir so it resolves no matter
+/// what the runner's working directory is. (The old relative
+/// `"../../test-fixtures"` pointed *outside* the repo from the package root,
+/// so every fixture extraction test passed by silently skipping.)
+fn fixtures_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-fixtures")
+}
 
 /// Helper to create a RagCore for testing (uses small model, fast settings)
 async fn test_rag_core(dir: &std::path::Path) -> RagCore {
     RagCore::new(
         dir,
-        &dir.join("cache"),
+        &fixtures::model_cache_dir(),
         "Xenova/bge-small-en-v1.5",
         512,
         64,
@@ -27,7 +33,7 @@ async fn test_rag_server_instantiation() {
     let dir = tempdir().unwrap();
     let server = RagServer::new(
         dir.path(),
-        &dir.path().join("cache"),
+        &fixtures::model_cache_dir(),
         "Xenova/bge-small-en-v1.5",
         512,
         64,
@@ -755,7 +761,7 @@ async fn test_rag_server_close_persists_sidecar() {
     let dir = tempdir().unwrap();
     let server = RagServer::new(
         dir.path(),
-        &dir.path().join("cache"),
+        &fixtures::model_cache_dir(),
         "Xenova/bge-small-en-v1.5",
         512,
         64,
@@ -786,11 +792,8 @@ async fn test_rag_server_close_persists_sidecar() {
 
 #[tokio::test]
 async fn test_extract_sample_pdf() {
-    let pdf_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.pdf");
-    if !pdf_path.exists() {
-        eprintln!("Skipping - sample.pdf not found");
-        return;
-    }
+    let pdf_path = fixtures_dir().join("sample.pdf");
+    assert!(pdf_path.exists(), "committed fixture sample.pdf is missing");
     let text = docs::extract_text(&pdf_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real PDF");
     assert!(
@@ -802,11 +805,11 @@ async fn test_extract_sample_pdf() {
 
 #[tokio::test]
 async fn test_extract_sample_docx() {
-    let docx_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.docx");
-    if !docx_path.exists() {
-        eprintln!("Skipping - sample.docx not found");
-        return;
-    }
+    let docx_path = fixtures_dir().join("sample.docx");
+    assert!(
+        docx_path.exists(),
+        "committed fixture sample.docx is missing"
+    );
     let text = docs::extract_text(&docx_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real DOCX");
     assert!(
@@ -818,11 +821,11 @@ async fn test_extract_sample_docx() {
 
 #[tokio::test]
 async fn test_extract_sample_xlsx() {
-    let xlsx_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.xlsx");
-    if !xlsx_path.exists() {
-        eprintln!("Skipping - sample.xlsx not found");
-        return;
-    }
+    let xlsx_path = fixtures_dir().join("sample.xlsx");
+    assert!(
+        xlsx_path.exists(),
+        "committed fixture sample.xlsx is missing"
+    );
     let text = docs::extract_text(&xlsx_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real XLSX");
     assert!(
@@ -834,11 +837,11 @@ async fn test_extract_sample_xlsx() {
 
 #[tokio::test]
 async fn test_extract_sample_ppt() {
-    let ppt_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.pptx");
-    if !ppt_path.exists() {
-        eprintln!("Skipping - sample.pptx not found");
-        return;
-    }
+    let ppt_path = fixtures_dir().join("sample.pptx");
+    assert!(
+        ppt_path.exists(),
+        "committed fixture sample.pptx is missing"
+    );
     let text = docs::extract_text(&ppt_path).await.unwrap();
     assert!(!text.is_empty(), "Should extract text from real PPT");
     assert!(

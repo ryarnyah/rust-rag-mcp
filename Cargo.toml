@@ -72,6 +72,9 @@ tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 serial_test = "4"
+# `client` lets tests speak MCP to [`mcp::RagServer`] over an in-process
+# duplex transport, exercising the real tool handlers end to end.
+rmcp = { version = "3.1", features = ["client"] }
 
 [profile.release]
 opt-level = 3

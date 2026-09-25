@@ -866,7 +866,7 @@ fn now_ms() -> u64 {
 }
 
 /// Open a platform-appropriate null file handle (used as a dummy for mem::replace)
-fn open_null_file() -> io::Result<File> {
+pub(crate) fn open_null_file() -> io::Result<File> {
     #[cfg(unix)]
     {
         OpenOptions::new().read(true).open("/dev/null")
