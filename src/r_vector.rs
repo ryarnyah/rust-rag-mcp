@@ -752,11 +752,22 @@ impl MetadataStore {
 //  HNSW Index
 // ============================================================================
 
-/// Format v3: variable-length node blocks sized by their level (see
-/// [`HnswIndex::node_bytes`]) placed in an append-only arena, addressed
-/// through an in-memory offset directory instead of `id * fixed_size`.
-const HNSW_MAGIC: u64 = 0x484E_5357_0000_0003;
+/// Format v4: variable-length node blocks sized by their level (see
+/// [`HnswIndex::node_bytes`]) in an append-only arena, plus the offset
+/// directory **persisted in a trailing region of the file** (v3 kept it as an
+/// 8-bytes-per-node heap `Vec` rebuilt by walking the blocks at open).
+/// The region starts at the `dir_start` u64 stored at [`HNSW_DIR_START_OFF`]
+/// in the header and runs to the end of the file; entry `i` (the byte offset
+/// of node `id`'s block) sits at `dir_start + 8 * i`.
+const HNSW_MAGIC: u64 = 0x484E_5357_0000_0004;
 const HNSW_HEADER: usize = 128;
+/// Header offset of the `dir_start` field (u64 LE): first byte of the
+/// trailing directory region.
+const HNSW_DIR_START_OFF: usize = 72;
+/// Initial directory region size (512 entries); grows by doubling when the
+/// region fills, and relocates to the end of the file when the block arena
+/// would run into it.
+const DIR_REGION_INIT: usize = 4096;
 const HNSW_FLAG_DELETED: u8 = 1;
 const NONE: u32 = u32::MAX;
 
@@ -767,42 +778,42 @@ struct HnswIndex {
     mmap: Option<MmapMut>,
     cfg: Config,
     rng: Rng,
-    /// Offset directory: `dir[id]` is the byte offset of node `id`'s block.
+    /// Live entries in the *persisted* offset directory: node `id`'s block
+    /// offset is `u64` at `dir_start() + 8 * id`, for `id < dir_len` (the
+    /// region's bytes live in the mapping, so this `usize` is the only heap
+    /// part left — v3 kept all 8 bytes per node in a `Vec`).
     ///
-    /// v3 stores each node in a variable-length block sized for *its* level
-    /// (levels are sampled once at insertion and never change), so blocks are
-    /// not at a fixed stride and need an index. The directory is rebuilt from
-    /// the file at open time (blocks are self-describing) and only ever grows
-    /// by appending, matching the append-only arena layout.
+    /// Entries are written as blocks are allocated; `flush()` syncs the
+    /// region *before* the header/arena range, so on disk the region can be
+    /// ahead of the header (harmless: unclaimed slots) but never behind it.
     ///
-    /// # Not persisted (considered, deferred)
+    /// # Crash healing
     ///
-    /// At 8 bytes per node this is the largest heap structure left after the
-    /// compact-layout work (~80 MB per 10M nodes). Persisting it as a
-    /// trailing section of the `.hnsw` file (magic bump) was considered and
-    /// deferred:
+    /// Blocks remain the source of truth. `open()` structurally validates the
+    /// region — bounds, non-zero strictly-increasing entries starting at
+    /// `HNSW_HEADER`, the last block's self-describing header, and agreement
+    /// with the persisted `arena_end` — and on any doubt (a torn region from
+    /// a crash mid-msync, a header the region does not match, an orphaned
+    /// entry past `count`) falls back to walking the self-describing blocks,
+    /// exactly as v3 always did, rewriting the region from the walk. Because
+    /// entries are never rewritten with different values, a valid region is
+    /// always the one that was flushed together with the blocks it indexes.
     ///
-    /// - *What it would actually save.* The directory is touched on every
-    ///   graph hop, so those pages stay hot in page cache either way; the
-    ///   difference is only that file-backed pages become reclaimable under
-    ///   memory pressure (then re-faulted per hop) while a heap `Vec` never
-    ///   is. A modest win under pressure, not a step change.
-    /// - *It turns derived state into synchronized state.* Today the
-    ///   directory is recomputed from the arena, so a crash between a node
-    ///   append and anything else cannot desynchronize them; the open-time
-    ///   walk also validates every block and heals `arena_end`. A persisted
-    ///   directory would need its own crash-consistency contract (append
-    ///   arena + directory section, torn writes on either side) and could
-    ///   no longer skip the walk without giving up that validation.
-    /// - *The `u32` alternative* (4 bytes/node, no format change since the
-    ///   directory is memory-only) caps the arena at 4 GiB and doubles the
-    ///   element type surface at every lookup — a sharp edge for a saving
-    ///   that only matters at very large node counts.
+    /// # Deferred (with reasons)
     ///
-    /// Revisit if the directory's heap footprint becomes measurable at
-    /// multi-hundred-million-node scale; until then a flat `Vec<u64>` of
-    /// derived state is both the simplest and the fastest option.
-    dir: Vec<u64>,
+    /// - *Per-block validation at open.* The trusted path checks the
+    ///   directory's structure and endpoints, not every neighbor count and
+    ///   link — re-walking every block is precisely the O(N) open cost this
+    ///   format bump exists to skip. Deep validation lives in
+    ///   [`HnswIndex::integrity_check`] (O(N), used by tests, compaction and
+    ///   diagnostics); [`HnswIndex::node_offset`] bounds-checks every lookup,
+    ///   so tampering surfaces loudly instead of silently.
+    /// - *Narrowing entries to `u32`*: would halve the region but caps the
+    ///   arena at 4 GiB.
+    /// - *A checksum over the region*: crash tears already read as zero
+    ///   slots or fail the structural checks; only targeted mid-file bit-rot
+    ///   slips through, which is `integrity_check`'s job.
+    dir_len: usize,
 }
 
 thread_local! {
@@ -898,10 +909,14 @@ impl HnswIndex {
             .map_err(VectorDbError::Io)?;
 
         if !exists {
-            // Initialize new index: fixed header plus an arena pre-sized for
-            // a handful of level-0 blocks; the arena doubles as nodes arrive.
+            // Initialize new index: fixed header, an arena pre-sized for a
+            // handful of level-0 blocks, and the trailing directory region
+            // at the end of the file. The arena doubles as nodes arrive
+            // (relocating the region when it would run into it).
             let initial = cfg.initial_capacity.max(16);
-            let size = HNSW_HEADER + initial * Self::node_bytes(cfg, 0);
+            let blocks = initial * Self::node_bytes(cfg, 0);
+            let dir_start = HNSW_HEADER + blocks;
+            let size = dir_start + DIR_REGION_INIT;
             file.set_len(size as u64).map_err(VectorDbError::Io)?;
             let mut m = map_file(&file)?;
             m[0..8].copy_from_slice(&HNSW_MAGIC.to_le_bytes());
@@ -915,6 +930,9 @@ impl HnswIndex {
             m[48..56].copy_from_slice(&(cfg.max_level as u64).to_le_bytes());
             m[56..64].copy_from_slice(&(cfg.ef_construction as u64).to_le_bytes());
             m[64..72].copy_from_slice(&cfg.seed.to_le_bytes());
+            // First byte of the directory region (entries start at 0 here).
+            m[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                .copy_from_slice(&(dir_start as u64).to_le_bytes());
             // Only the header page has been written on a fresh file.
             m.flush_range(0, HNSW_HEADER).map_err(VectorDbError::Io)?;
             Ok(Self {
@@ -922,7 +940,7 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: *cfg,
                 rng: Rng::new(cfg.seed),
-                dir: Vec::with_capacity(initial),
+                dir_len: 0,
             })
         } else {
             // Load existing index
@@ -987,58 +1005,67 @@ impl HnswIndex {
             );
             let seed = on_disk.seed ^ (count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
-            // Rebuild the offset directory by walking the self-describing
-            // node blocks. Every block is validated (level bounds, size
-            // consistent with the level, fits in the file) as it is visited,
-            // so a corrupt directory fails at open instead of panicking on
-            // first graph access.
-            let mut dir = Vec::with_capacity(count as usize);
-            let mut off = HNSW_HEADER;
-            for i in 0..count {
-                if off + 8 > m.len() {
-                    return Err(VectorDbError::Corruption(format!(
-                        "node {i} block header truncated at offset {off}"
-                    )));
-                }
-                let level = m[off];
-                if level as usize > on_disk.max_level {
-                    return Err(VectorDbError::Corruption(format!(
-                        "node {i} has level {level} > configured maximum {}",
-                        on_disk.max_level
-                    )));
-                }
-                let size = u32::from_le_bytes(m[off + 2..off + 6].try_into().map_err(|_| {
-                    VectorDbError::Corruption("node block header truncated".to_string())
-                })?) as usize;
-                if size != Self::node_bytes(&on_disk, level as usize) {
-                    return Err(VectorDbError::Corruption(format!(
-                        "node {i} block size {size} inconsistent with level {level}"
-                    )));
-                }
-                if off + size > m.len() {
-                    return Err(VectorDbError::Corruption(format!(
-                        "node {i} block extends past end of file"
-                    )));
-                }
-                dir.push(off as u64);
-                off += size;
-            }
-
-            // A crash between a block write and the header update can leave
-            // arena_end lagging behind (or ahead of) the last complete block;
-            // the walk is the source of truth, so heal the header.
             let stored_arena_end = u64::from_le_bytes(
                 m[24..32]
                     .try_into()
                     .map_err(|_| VectorDbError::Corruption("invalid arena end".to_string()))?,
             ) as usize;
-            if stored_arena_end != off {
+
+            // v4 fast path: trust the persisted directory when it is
+            // structurally intact and agrees with the header — no walk, no
+            // per-block reads at open. Any doubt falls back to the walk
+            // below, because the self-describing blocks remain the source
+            // of truth for both the directory and `arena_end`.
+            let dir_start = u64::from_le_bytes(
+                m[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                    .try_into()
+                    .map_err(|_| {
+                        VectorDbError::Corruption("invalid directory start".to_string())
+                    })?,
+            ) as usize;
+            if Self::validate_dir_region(&m, dir_start, count, stored_arena_end, &on_disk).is_some()
+            {
+                return Ok(Self {
+                    file,
+                    mmap: Some(m),
+                    cfg: on_disk,
+                    rng: Rng::new(seed),
+                    dir_len: count as usize,
+                });
+            }
+
+            // Rebuild the offset directory by walking the self-describing
+            // node blocks. Every block is validated (level bounds, size
+            // consistent with the level, fits in the file) as it is visited,
+            // so a corrupt directory fails at open instead of panicking on
+            // first graph access.
+            tracing::debug!(
+                count,
+                "HNSW directory region not trusted; rebuilding from node walk"
+            );
+            let (dir, walked_end) = Self::walk_blocks(&m, count, &on_disk)?;
+
+            // A crash between a block write and the header update can leave
+            // arena_end lagging behind (or ahead of) the last complete block;
+            // the walk is the source of truth, so heal the header.
+            if stored_arena_end != walked_end {
                 tracing::debug!(
                     stored_arena_end,
-                    walked_end = off,
+                    walked_end,
                     "HNSW arena_end healed from node walk"
                 );
-                m[24..32].copy_from_slice(&(off as u64).to_le_bytes());
+                m[24..32].copy_from_slice(&(walked_end as u64).to_le_bytes());
+            }
+
+            // Give the rebuilt entries a region that holds them all and
+            // never collides with the block arena, then write them in. (Not
+            // flushed here: a crash before the next `flush()` just means the
+            // next open walks again.)
+            let (mut m, dir_start) =
+                Self::ensure_dir_region(&file, m, dir_start, dir.len() * 8, walked_end)?;
+            for (i, &off) in dir.iter().enumerate() {
+                let at = dir_start + 8 * i;
+                m[at..at + 8].copy_from_slice(&off.to_le_bytes());
             }
 
             Ok(Self {
@@ -1046,9 +1073,136 @@ impl HnswIndex {
                 mmap: Some(m),
                 cfg: on_disk,
                 rng: Rng::new(seed),
-                dir,
+                dir_len: dir.len(),
             })
         }
+    }
+
+    /// Structural validation of the persisted directory region: region bounds
+    /// and capacity for `count` entries, entries non-zero and strictly
+    /// increasing (the first exactly `HNSW_HEADER`), and the last block's
+    /// self-describing header chaining to exactly the persisted `arena_end`.
+    ///
+    /// Returns `Some(end of last block)` when the region can be trusted
+    /// (which implies `stored_arena_end` is correct), `None` when `open` must
+    /// fall back to walking the blocks. Deliberately *not* a per-block
+    /// validation — that is the O(N) walk this path exists to skip; deep
+    /// checks live in [`Self::integrity_check`].
+    fn validate_dir_region(
+        m: &MmapMut,
+        dir_start: usize,
+        count: u64,
+        stored_arena_end: usize,
+        cfg: &Config,
+    ) -> Option<usize> {
+        if dir_start < HNSW_HEADER || dir_start > m.len() {
+            return None;
+        }
+        if count > ((m.len() - dir_start) / 8) as u64 {
+            return None;
+        }
+        if count == 0 {
+            return (stored_arena_end == HNSW_HEADER).then_some(HNSW_HEADER);
+        }
+        let mut prev = 0u64;
+        for i in 0..count {
+            let at = dir_start + 8 * i as usize;
+            let off = u64::from_le_bytes(m[at..at + 8].try_into().ok()?);
+            let ok = if i == 0 {
+                off == HNSW_HEADER as u64
+            } else {
+                off > prev
+            };
+            if !ok {
+                return None;
+            }
+            prev = off;
+        }
+        // The last block must exist, describe itself consistently, and chain
+        // to the persisted arena_end — that cross-check ties the region to
+        // the header/arena range it was flushed with.
+        let last = prev as usize;
+        let level = *m.get(last)?;
+        let size = u32::from_le_bytes(m.get(last + 2..last + 6)?.try_into().ok()?) as usize;
+        if level as usize > cfg.max_level || size != Self::node_bytes(cfg, level as usize) {
+            return None;
+        }
+        let end = last.checked_add(size)?;
+        (end == stored_arena_end).then_some(end)
+    }
+
+    /// Rebuild the offset directory by walking the self-describing node
+    /// blocks, validating each one (level bounds, size consistent with the
+    /// level, fits in the file). Returns the entries plus the byte offset
+    /// just past the last block.
+    fn walk_blocks(m: &MmapMut, count: u64, cfg: &Config) -> Result<(Vec<u64>, usize)> {
+        // The walk fails as soon as blocks run out, so the physical file
+        // bounds the entry count — never preallocate from the header alone.
+        let mut dir = Vec::with_capacity((count as usize).min(m.len() / 8 + 1));
+        let mut off = HNSW_HEADER;
+        for i in 0..count {
+            if off + 8 > m.len() {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {i} block header truncated at offset {off}"
+                )));
+            }
+            let level = m[off];
+            if level as usize > cfg.max_level {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {i} has level {level} > configured maximum {}",
+                    cfg.max_level
+                )));
+            }
+            let size = u32::from_le_bytes(m[off + 2..off + 6].try_into().map_err(|_| {
+                VectorDbError::Corruption("node block header truncated".to_string())
+            })?) as usize;
+            if size != Self::node_bytes(cfg, level as usize) {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {i} block size {size} inconsistent with level {level}"
+                )));
+            }
+            if off + size > m.len() {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {i} block extends past end of file"
+                )));
+            }
+            dir.push(off as u64);
+            off += size;
+        }
+        Ok((dir, off))
+    }
+
+    /// Make sure the directory region starts at or after `zone` (the end of
+    /// the block arena) and has room for `need` bytes of entries, relocating
+    /// the region to the end of the file when not. Blocks never move — only
+    /// the region's base (`dir_start` in the header) changes.
+    fn ensure_dir_region(
+        file: &File,
+        m: MmapMut,
+        dir_start: usize,
+        need: usize,
+        zone: usize,
+    ) -> Result<(MmapMut, usize)> {
+        let region_ok = dir_start >= HNSW_HEADER
+            && dir_start >= zone
+            && dir_start <= m.len()
+            && m.len() - dir_start >= need;
+        if region_ok {
+            return Ok((m, dir_start));
+        }
+        // The old region (if any) becomes block slack; the new one starts at
+        // the current end of the file with slack for the entries plus an
+        // initial region's worth of growth.
+        let new_start = m.len();
+        drop(m);
+        let new_len = new_start
+            .checked_add(need + DIR_REGION_INIT)
+            .ok_or_else(|| VectorDbError::Corruption("HNSW file size overflow".to_string()))?;
+        file.set_len(new_len as u64).map_err(VectorDbError::Io)?;
+        let mut m = map_file(file)?;
+        m[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+            .copy_from_slice(&(new_start as u64).to_le_bytes());
+        Ok((m, new_start))
     }
 
     fn mmap(&self) -> &MmapMut {
@@ -1090,6 +1244,24 @@ impl HnswIndex {
         self.mmap_mut()[24..32].copy_from_slice(&(end as u64).to_le_bytes());
     }
 
+    /// First byte of the persisted directory region (header field).
+    fn dir_start(&self) -> usize {
+        u64::from_le_bytes(
+            self.mmap()[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    /// Raw directory read: byte offset of node `i`'s block, without the
+    /// `dir_len`/arena checks [`Self::node_offset`] applies — callers either
+    /// hold a `dir_len` bound already (allocation paths) or are validating
+    /// entries explicitly (`integrity_check`).
+    fn dir_entry(&self, i: usize) -> u64 {
+        let at = self.dir_start() + 8 * i;
+        u64::from_le_bytes(self.mmap()[at..at + 8].try_into().unwrap())
+    }
+
     fn entry_point(&self) -> u32 {
         u32::from_le_bytes(self.mmap()[16..20].try_into().unwrap())
     }
@@ -1112,10 +1284,21 @@ impl HnswIndex {
 
     fn node_offset(&self, id: u32) -> usize {
         // Panics on an unregistered id — the same failure mode the previous
-        // fixed-stride arithmetic had for out-of-range nodes. Callers that
-        // can observe a missing node (integrity checks, recovery) test the
-        // directory first.
-        self.dir[id as usize] as usize
+        // directory Vec had for out-of-range nodes. Callers that can observe
+        // a missing node (integrity checks, recovery) test the directory
+        // first.
+        let i = id as usize;
+        if i >= self.dir_len {
+            panic!("directory lookup for unregistered node {id}");
+        }
+        let off = self.dir_entry(i) as usize;
+        // Bounds-check on every lookup: the directory lives in the file now,
+        // so a tampered entry must surface loudly here instead of silently
+        // indexing the mapping at a garbage offset.
+        if off < HNSW_HEADER || off.saturating_add(8) > self.arena_end() {
+            panic!("corrupt directory entry for node {id}: block offset {off} outside the arena");
+        }
+        off
     }
 
     /// Validate every structural invariant the graph layout relies on.
@@ -1132,20 +1315,30 @@ impl HnswIndex {
     /// paths. The first violation is returned as `VectorDbError::Corruption`.
     fn integrity_check(&self) -> Result<()> {
         let count = self.count();
-        if self.dir.len() < count {
+        if self.dir_len < count {
             return Err(VectorDbError::Corruption(format!(
                 "directory holds {} node blocks but count is {count}",
-                self.dir.len()
+                self.dir_len
+            )));
+        }
+        // The persisted region must physically hold every live entry before
+        // it is read below.
+        if self.dir_start() + self.dir_len * 8 > self.mmap().len() {
+            return Err(VectorDbError::Corruption(format!(
+                "directory region truncated: {} entries do not fit past offset {}",
+                self.dir_len,
+                self.dir_start()
             )));
         }
 
         // Directory / arena consistency: every registered block sits inside
-        // the file, is ordered (no overlaps), and its stored size matches
-        // the level it declares.
+        // the file, chains exactly onto its predecessor (the arena is dense:
+        // appends land at the end, orphans reclaim their exact space), and
+        // its stored size matches the level it declares.
         let file_len = self.mmap().len();
         let mut walked_end = HNSW_HEADER;
         for id in 0..count {
-            let off = self.dir[id] as usize;
+            let off = self.dir_entry(id) as usize;
             if off + 8 > file_len {
                 return Err(VectorDbError::Corruption(format!(
                     "node {id} block header lies past end of file"
@@ -1154,6 +1347,11 @@ impl HnswIndex {
             if off < walked_end {
                 return Err(VectorDbError::Corruption(format!(
                     "node {id} block overlaps its predecessor"
+                )));
+            }
+            if off > walked_end {
+                return Err(VectorDbError::Corruption(format!(
+                    "node {id} block starts at {off}, leaving a gap after {walked_end}"
                 )));
             }
             let size = u32::from_le_bytes(
@@ -1292,17 +1490,60 @@ impl HnswIndex {
         (0..c).map(move |i| self.layer_neighbor(id, layer, i))
     }
 
-    /// Extend the file (by doubling) until the arena covers `end` bytes.
+    /// Extend the file (by doubling) until the block arena covers `end`
+    /// bytes without crossing into the directory region, relocating the
+    /// region to the new end of the file when it would. Block offsets never
+    /// change — only the region's base (`dir_start`) does, and the entries'
+    /// values stay valid because they index blocks, not the region.
     fn ensure_arena(&mut self, end: usize) -> Result<()> {
-        if end <= self.mmap().len() {
+        if end <= self.dir_start() {
             return Ok(());
         }
+        let region = self.mmap().len() - self.dir_start();
+        let target = end
+            .checked_add(region)
+            .ok_or_else(|| VectorDbError::Corruption("HNSW file size overflow".to_string()))?;
         let mut new_len = self.mmap().len().max(HNSW_HEADER + 1024);
-        while new_len < end {
+        while new_len < target {
             new_len = new_len
                 .checked_mul(2)
                 .ok_or_else(|| VectorDbError::Corruption("HNSW file size overflow".to_string()))?;
         }
+        let old_start = self.dir_start();
+        let new_start = new_len - region;
+        self.mmap = None;
+        self.file
+            .set_len(new_len as u64)
+            .map_err(VectorDbError::Io)?;
+        self.mmap = Some(map_file(&self.file)?);
+        {
+            let m = self.mmap_mut();
+            // The regions cannot overlap (the file at least doubled while
+            // the region is smaller than the file), but a temporary keeps
+            // the copy obviously safe.
+            let bytes = m[old_start..old_start + region].to_vec();
+            m[new_start..new_start + region].copy_from_slice(&bytes);
+            m[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                .copy_from_slice(&(new_start as u64).to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Grow the trailing directory region (by extending the file — the
+    /// region's base never moves) when `entries` would not fit. Growth is at
+    /// least the initial region size and doubles the slack once it is
+    /// larger, so remapping is amortized, not per-insert.
+    fn ensure_dir_capacity(&mut self, entries: usize) -> Result<()> {
+        let dir_start = self.dir_start();
+        let capacity = self.mmap().len() - dir_start;
+        if entries * 8 <= capacity {
+            return Ok(());
+        }
+        let new_len = self
+            .mmap()
+            .len()
+            .checked_add(capacity.max(DIR_REGION_INIT))
+            .ok_or_else(|| VectorDbError::Corruption("HNSW file size overflow".to_string()))?;
         self.mmap = None;
         self.file
             .set_len(new_len as u64)
@@ -1320,20 +1561,28 @@ impl HnswIndex {
     fn write_node_block(&mut self, level: u8) -> Result<()> {
         let size = Self::node_bytes(&self.cfg, level as usize);
         let off = self.arena_end();
+        // Block slack first (may relocate the directory region and remap),
+        // then room for the new entry (may extend the region and remap).
         self.ensure_arena(off + size)?;
+        self.ensure_dir_capacity(self.dir_len + 1)?;
+        let entry_at = self.dir_start() + 8 * self.dir_len;
         {
             let m = self.mmap_mut();
             m[off] = level;
             m[off + 1] = 0; // flags
             m[off + 2..off + 6].copy_from_slice(&(size as u32).to_le_bytes());
             m[off + 6..off + 8].copy_from_slice(&0u16.to_le_bytes());
+            // Register the block in the persisted directory region.
+            m[entry_at..entry_at + 8].copy_from_slice(&(off as u64).to_le_bytes());
         }
-        self.dir.push(off as u64);
-        let id = (self.dir.len() - 1) as u32;
+        let id = self.dir_len as u32;
+        self.dir_len += 1;
+        // The arena must cover the block before its fields are written
+        // through `node_offset` (which bounds-checks against `arena_end`).
+        self.set_arena_end(off + size);
         for l in 0..=level as usize {
             self.set_layer_count(id, l, 0);
         }
-        self.set_arena_end(off + size);
         Ok(())
     }
 
@@ -1349,9 +1598,12 @@ impl HnswIndex {
         // A previous insertion may have aborted after allocating its block
         // but before counting it. Drop such orphans (reclaiming their arena
         // space) so directory and count stay in lockstep before this
-        // allocation appends anything.
-        while self.dir.len() > self.count() {
-            let orphan = self.dir.pop().expect("directory non-empty above count");
+        // allocation appends anything. The popped entry's bytes stay in the
+        // region; the next write overwrites them (at the same offset, since
+        // the arena was reclaimed there).
+        while self.dir_len > self.count() {
+            let orphan = self.dir_entry(self.dir_len - 1);
+            self.dir_len -= 1;
             self.set_arena_end(orphan as usize);
         }
         // Crash gaps: rows exist for these ids but their node block was
@@ -1786,13 +2038,25 @@ impl HnswIndex {
             .collect()
     }
 
-    /// Sync written graph bytes: the fixed header plus the whole node arena.
+    /// Sync written graph bytes: the directory entries, then the fixed
+    /// header plus the whole node arena.
+    ///
+    /// The region goes first: the dangerous state would be a header (with
+    /// `dir_start`, `count`, `arena_end`) claiming entries that are not yet
+    /// on disk, so entries are synced before the range that claims them. A
+    /// crash in between instead leaves extra unclaimed entries — harmless,
+    /// overwritten later — and `open()` cross-checks either way.
     ///
     /// Blocks are appended-only and `arena_end` is bumped as they are
-    /// written, so `[0, arena_end)` covers every possibly-dirtied byte and
-    /// skips only file slack beyond the arena.
+    /// written, so `[0, arena_end)` covers every possibly-dirtied header and
+    /// block byte and skips only file slack beyond the arena.
     fn flush(&self) -> Result<()> {
         let m = self.mmap();
+        let entries = self.dir_len * 8;
+        if entries > 0 {
+            m.flush_range(self.dir_start(), entries)
+                .map_err(VectorDbError::Io)?;
+        }
         let end = self.arena_end().min(m.len());
         m.flush_range(0, end).map_err(VectorDbError::Io)
     }
@@ -3455,36 +3719,197 @@ mod tests {
             (count, arena_before)
         };
 
-        // Reopen rebuilds the directory by walking the blocks: counts and
-        // arena_end must reconstruct exactly.
+        // Reopen must reconstruct counts and arena_end exactly — whether it
+        // trusts the persisted directory region or falls back to walking.
         let db = VectorDb::open(&path, cfg).await.unwrap();
         assert_eq!(db.index.count(), count);
         assert_eq!(
             db.index.arena_end(),
             arena_before,
-            "walk must reproduce arena"
+            "reopen must reproduce arena"
         );
         db.integrity_check().unwrap();
     }
 
-    /// The v3 node layout changed with variable-length blocks; files written
-    /// by the previous fixed-stride format must be rejected, not misread.
+    /// v4 changed the header (a `dir_start` field) and added the trailing
+    /// directory region; files written by the previous in-memory-directory
+    /// format must be rejected, not misread (their bytes 72..80 are zero,
+    /// which would look like a directory region starting inside the header).
     #[tokio::test]
     async fn open_rejects_previous_hnsw_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.hnsw");
         let mut bytes = vec![0u8; HNSW_HEADER];
-        bytes[0..8].copy_from_slice(&0x484E_5357_0000_0002u64.to_le_bytes()); // v2 magic
+        bytes[0..8].copy_from_slice(&0x484E_5357_0000_0003u64.to_le_bytes()); // v3 magic
         std::fs::write(&path, &bytes).unwrap();
 
         let cfg = Config::new(4).with_capacity(8);
         let err = match HnswIndex::open(&path, &cfg).await {
             Err(e) => e,
-            Ok(_) => panic!("opening a v2-format HNSW file must fail"),
+            Ok(_) => panic!("opening a v3-format HNSW file must fail"),
         };
         assert!(
             matches!(&err, VectorDbError::Corruption(m) if m.contains("invalid HNSW magic")),
             "expected magic rejection, got {err:?}"
+        );
+    }
+
+    /// The directory must live in the `.hnsw` file itself: offsets,
+    /// `arena_end` and the entry count must survive a reopen exactly, across
+    /// both region growth paths (block-slack relocation once the arena fills
+    /// the initial zone, and region extension once 512 entries outgrow the
+    /// initial 4 KiB region), with the graph still searchable.
+    #[tokio::test]
+    async fn hnsw_directory_region_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        // capacity 8 makes the initial block zone fill after a handful of
+        // inserts (forcing region relocation); 600 entries exceed the
+        // 4 KiB / 8 B = 512-entry initial region (forcing extension).
+        let cfg = Config::new(16).with_capacity(8);
+        let mut rng = Rng::new(21);
+
+        let (offsets, arena, count) = {
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            for _ in 0..600 {
+                let v = random_nonzero(&mut rng, 16);
+                db.insert(&v, None).unwrap();
+            }
+            let count = db.index.count();
+            assert_eq!(count, 600);
+            // Region must have grown past the initial 4 KiB (512 entries).
+            assert!(
+                db.index.mmap().len() - db.index.dir_start() > DIR_REGION_INIT,
+                "initial directory region must extend for 600 entries"
+            );
+            db.integrity_check().unwrap();
+            let offsets: Vec<u64> = (0..count).map(|i| db.index.dir_entry(i)).collect();
+            let arena = db.index.arena_end();
+            db.close().await.unwrap();
+            (offsets, arena, count)
+        };
+
+        let db = VectorDb::open(&path, cfg).await.unwrap();
+        assert_eq!(db.index.count(), count);
+        assert_eq!(db.index.arena_end(), arena, "reopen must reproduce arena");
+        for (i, &expected) in offsets.iter().enumerate() {
+            assert_eq!(
+                db.index.dir_entry(i),
+                expected,
+                "directory entry {i} changed across reopen"
+            );
+        }
+        db.integrity_check().unwrap();
+        // The trusted directory must actually drive graph traversal.
+        let query = random_nonzero(&mut rng, 16);
+        let hits = db.search(&query, 5, 64).unwrap();
+        assert!(!hits.is_empty(), "search over a reopened index must work");
+    }
+
+    /// A torn directory region (a crash mid-msync leaves never-written slots
+    /// as zeroes) must not fail open: blocks are the source of truth, so the
+    /// walk fallback rebuilds exactly the offsets the region used to hold.
+    #[tokio::test]
+    async fn hnsw_corrupt_directory_region_heals_from_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(8).with_capacity(32);
+
+        let (offsets, arena, count) = {
+            let mut rng = Rng::new(7);
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            for _ in 0..64 {
+                let v = random_nonzero(&mut rng, 8);
+                db.insert(&v, None).unwrap();
+            }
+            let count = db.index.count();
+            let offsets: Vec<u64> = (0..count).map(|i| db.index.dir_entry(i)).collect();
+            let arena = db.index.arena_end();
+            db.close().await.unwrap();
+            (offsets, arena, count)
+        };
+
+        // Zero every entry in the trailing region, simulating a torn flush.
+        let hnsw = hnsw_path(&path);
+        let mut bytes = std::fs::read(&hnsw).unwrap();
+        let dir_start = u64::from_le_bytes(
+            bytes[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(dir_start >= HNSW_HEADER && dir_start < bytes.len());
+        for slot in bytes[dir_start..].iter_mut() {
+            *slot = 0;
+        }
+        std::fs::write(&hnsw, &bytes).unwrap();
+
+        // Reopen falls back to the walk and reconstructs the same state.
+        let db = VectorDb::open(&path, cfg).await.unwrap();
+        assert_eq!(db.index.count(), count);
+        assert_eq!(db.index.arena_end(), arena, "walk must heal arena");
+        for (i, &expected) in offsets.iter().enumerate() {
+            assert_eq!(
+                db.index.dir_entry(i),
+                expected,
+                "walk-rebuilt entry {i} must match the persisted one"
+            );
+        }
+        db.integrity_check().unwrap();
+    }
+
+    /// The fast open path trusts a structurally intact directory instead of
+    /// re-walking every block — so block damage *away from the endpoints* is
+    /// deliberately not caught at open (that is `integrity_check`'s job, the
+    /// documented cost of skipping the O(N) walk). This pins both halves of
+    /// that contract: open succeeds, the walk would have failed, and the
+    /// checker reports the damage.
+    #[tokio::test]
+    async fn hnsw_open_trusts_directory_and_defers_block_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(8).with_capacity(64).with_seed(3);
+
+        {
+            let mut rng = Rng::new(5);
+            let mut db = VectorDb::open(&path, cfg).await.unwrap();
+            for _ in 0..40 {
+                let v = random_nonzero(&mut rng, 8);
+                db.insert(&v, None).unwrap();
+            }
+            db.close().await.unwrap();
+        }
+
+        // Corrupt the *size* field of a middle block (not the last one, whose
+        // header the open-time cross-check reads).
+        let hnsw = hnsw_path(&path);
+        let mut bytes = std::fs::read(&hnsw).unwrap();
+        let dir_start = u64::from_le_bytes(
+            bytes[HNSW_DIR_START_OFF..HNSW_DIR_START_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        assert!(count >= 3, "need a middle block to corrupt");
+        let middle = u64::from_le_bytes(
+            bytes[dir_start + 8 * (count / 2) as usize..dir_start + 8 * (count / 2) as usize + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        bytes[middle + 2..middle + 6].copy_from_slice(&1u32.to_le_bytes()); // size 1: not node_bytes(level)
+        std::fs::write(&hnsw, &bytes).unwrap();
+
+        // Open succeeds on the trusted directory...
+        let db = VectorDb::open(&path, cfg).await.unwrap();
+        assert_eq!(db.index.count(), count as usize);
+        // ...proof the walk was skipped: rebuilding from the blocks fails.
+        assert!(
+            HnswIndex::walk_blocks(db.index.mmap(), count, &db.cfg).is_err(),
+            "the walk must reject the damaged block that open did not read"
+        );
+        // ...and deep validation reports it.
+        assert!(
+            db.integrity_check().is_err(),
+            "integrity_check must catch the damaged block"
         );
     }
 
