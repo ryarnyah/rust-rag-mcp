@@ -160,6 +160,106 @@ async fn test_rag_chunk_count() {
     core.close().await.unwrap();
 }
 
+/// Full `.srcidx` sidecar lifecycle: close persists it, a reopen trusts
+/// it, and a sidecar whose generation tokens no longer match the
+/// database (stale from an older run, or plain garbage) is ignored in
+/// favor of the metadata scan — never believed, never fatal.
+#[tokio::test]
+async fn test_rag_source_index_sidecar_reopen() {
+    let dir = tempdir().unwrap();
+    let sidecar = dir.path().join("db.srcidx");
+
+    // Generation 1: two sources, re-indexed once so the tokens cover an
+    // insert *and* a delete (tombstone) mutation.
+    let gen1_sources = {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text("Rust is a systems programming language.", "a.rs")
+            .await
+            .unwrap();
+        core.index_text("Ownership and borrowing make Rust unique.", "a.rs")
+            .await
+            .unwrap();
+        core.index_text("Memory safety without a garbage collector.", "b.md")
+            .await
+            .unwrap();
+        let sources = core.list_sources().await.unwrap();
+        assert_eq!(sources, vec!["a.rs".to_string(), "b.md".to_string()]);
+        core.close().await.unwrap();
+        sources
+    }; // core dropped here: the db file locks release for the reopen
+
+    assert!(sidecar.exists(), "close must persist the sidecar");
+    let gen1 = std::fs::read(&sidecar).unwrap();
+
+    // Reopen on the same generation: the sidecar validates and must
+    // reproduce the exact same view (this is the skip-the-scan path).
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert_eq!(core.list_sources().await.unwrap(), gen1_sources);
+        core.close().await.unwrap();
+    }
+
+    // Generation 2: one more source. The sidecar on disk now describes
+    // a newer database than gen1.
+    {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text("Second generation content.", "c.txt")
+            .await
+            .unwrap();
+        core.close().await.unwrap();
+    }
+    let all_sources = vec!["a.rs".to_string(), "b.md".to_string(), "c.txt".to_string()];
+
+    // Stale sidecar (gen1 against a gen2 database): tokens mismatch ->
+    // rebuild from metadata -> the *new* truth, not the sidecar's.
+    std::fs::write(&sidecar, &gen1).unwrap();
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert_eq!(
+            core.list_sources().await.unwrap(),
+            all_sources,
+            "a stale sidecar must be rejected in favor of the scan"
+        );
+        core.close().await.unwrap();
+    }
+
+    // Corrupt/foreign sidecar: same fallback, no error.
+    std::fs::write(&sidecar, b"not a sidecar at all").unwrap();
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert_eq!(core.list_sources().await.unwrap(), all_sources);
+        core.close().await.unwrap();
+    }
+}
+
+/// The MCP server never reached `close()` before (only the CLI commands
+/// did), which would have left the sidecar stale on every server
+/// shutdown. Pin both persistence points of the server path: startup
+/// rebuild and `RagServer::close`.
+#[tokio::test]
+async fn test_rag_server_close_persists_sidecar() {
+    let dir = tempdir().unwrap();
+    let server = RagServer::new(
+        dir.path(),
+        &dir.path().join("cache"),
+        "Xenova/bge-small-en-v1.5",
+        512,
+        64,
+        150,
+    )
+    .await
+    .unwrap();
+
+    let sidecar = dir.path().join("db.srcidx");
+    assert!(sidecar.exists(), "startup must persist the sidecar");
+
+    // Remove it so only close() can bring it back — this pins the
+    // shutdown wiring in main.rs (close after the transport ends).
+    std::fs::remove_file(&sidecar).unwrap();
+    server.close().await.unwrap();
+    assert!(sidecar.exists(), "close must re-persist the sidecar");
+}
+
 #[tokio::test]
 async fn test_extract_sample_pdf() {
     let pdf_path = std::path::Path::new(TEST_FIXTURES_DIR).join("sample.pdf");

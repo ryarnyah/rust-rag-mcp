@@ -84,6 +84,15 @@ impl RagServer {
             core: Arc::new(RwLock::new(core)),
         })
     }
+
+    /// Shut down the server's core: takes the write lock (draining any
+    /// in-flight tool handler, which hold read locks), persists the
+    /// `.srcidx` sidecar at this quiescent point, and releases the
+    /// database file locks.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let core = self.core.write().await;
+        core.close().await
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

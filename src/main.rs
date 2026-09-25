@@ -176,12 +176,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             let service = server
+                .clone()
                 .serve(rmcp::transport::stdio())
                 .await
                 .inspect_err(|e| {
                     tracing::error!("MCP server error: {:?}", e);
                 })?;
-            service.waiting().await?;
+            let transport_result = service.waiting().await;
+            // Shut down even when the transport failed: close persists the
+            // `.srcidx` sidecar (its only chance in a long-running server)
+            // and releases the db locks.
+            let close_result = server.close().await;
+            transport_result?;
+            close_result?;
         }
 
         Commands::Index {

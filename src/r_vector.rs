@@ -2623,6 +2623,19 @@ impl VectorDb {
         self.deleted_count
     }
 
+    /// Number of metadata records appended to `.meta` — live records and
+    /// tombstones alike (compaction rewrites the file and starts over from
+    /// the live set).
+    ///
+    /// Together with [`Self::len`] this forms the generation token for
+    /// derived indexes (see `rag::MetadataIndex`'s `.srcidx` sidecar):
+    /// every insert appends a row *and* a record, every delete appends a
+    /// tombstone record, so `(len, meta_record_count)` moves on every
+    /// mutation that can invalidate derived state — and only on those.
+    pub fn meta_record_count(&self) -> u32 {
+        self.meta.record_count
+    }
+
     /// Get deletion statistics
     ///
     /// Returns (deleted_count, total_count, deletion_ratio)
@@ -3259,6 +3272,14 @@ impl AsyncVectorDb {
     /// Returns (deleted_count, total_count, deletion_ratio)
     pub async fn deletion_stats(&self) -> (usize, usize, f32) {
         self.db.read().await.deletion_stats()
+    }
+
+    /// Metadata record count — see [`VectorDb::meta_record_count`]; one
+    /// half of the `.srcidx` sidecar's generation token, read under the
+    /// caller's quiescence guarantee (sidecar writes happen only at
+    /// startup and in `close()`).
+    pub async fn meta_record_count(&self) -> u32 {
+        self.db.read().await.meta_record_count()
     }
 
     /// Validate structural integrity of the whole database (async read).
@@ -3992,6 +4013,43 @@ mod tests {
         assert!(
             exercised > 0,
             "the sweep must actually cover the triggering layout"
+        );
+    }
+
+    /// The `.srcidx` sidecar (see `rag::MetadataIndex`) is trusted
+    /// exactly when `(len, meta_record_count)` matches the database, so
+    /// the premise to pin is that both tokens move on every mutation
+    /// that can change the source maps — an insert appends a row *and*
+    /// a metadata record, a delete appends a tombstone record — and
+    /// that a repeated delete (which leaves the maps untouched) does
+    /// not.
+    #[tokio::test]
+    async fn meta_record_count_tracks_map_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = Config::new(4).with_capacity(8).with_seed(5);
+        let mut db = VectorDb::open(&path, cfg).await.unwrap();
+
+        let (rows0, records0) = (db.len(), db.meta_record_count());
+
+        let id = db.insert(&[1.0, 0.0, 0.0, 0.0], Some(b"payload")).unwrap();
+        let (rows1, records1) = (db.len(), db.meta_record_count());
+        assert!(rows1 > rows0, "insert must append a row");
+        assert!(records1 > records0, "insert must append a record");
+
+        assert!(db.delete(id).unwrap(), "a fresh id must delete");
+        let records2 = db.meta_record_count();
+        assert!(
+            records2 > records1,
+            "the tombstone must append a record even though no row moves"
+        );
+        assert_eq!(db.len(), rows1, "delete must not move rows");
+
+        assert!(!db.delete(id).unwrap(), "repeated delete is a no-op");
+        assert_eq!(
+            db.meta_record_count(),
+            records2,
+            "a no-op delete must not move the token"
         );
     }
 
