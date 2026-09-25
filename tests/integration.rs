@@ -100,6 +100,75 @@ async fn test_rag_index_text_dedup() {
     core.close().await.unwrap();
 }
 
+/// Chunk progress must fire once per stored chunk, counting `1..=total` in
+/// insertion order — each report is what the MCP layer forwards as a
+/// `notifications/progress` message. A skipped (unchanged) file produces no
+/// chunk, so it must produce no report either.
+#[tokio::test]
+async fn test_index_file_reports_progress_per_chunk() {
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    // Chunks hold 512 words with 64 words of overlap, so a few thousand
+    // words guarantee more than one chunk.
+    let text = (0..3000)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let path = dir.path().join("progress.txt");
+    tokio::fs::write(&path, &text).await.unwrap();
+
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = reports.clone();
+    let result = core
+        .index_file_with_progress(&path, move |done, total| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push((done, total));
+            }
+        })
+        .await
+        .unwrap();
+    let count = match result {
+        rust_rag_mcp::IndexResult::Indexed(count) => count,
+        rust_rag_mcp::IndexResult::Skipped => panic!("Fresh file must be indexed"),
+    };
+    assert!(count > 1, "Test needs several chunks, got {count}");
+    {
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), count, "Exactly one report per chunk");
+        for (i, &(done, total)) in reports.iter().enumerate() {
+            assert_eq!(
+                (done, total),
+                (i + 1, count),
+                "Reports must run 1..={count} in order"
+            );
+        }
+    }
+
+    // Unchanged content is skipped: no chunk, no report.
+    let skipped_reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = skipped_reports.clone();
+    let result = core
+        .index_file_with_progress(&path, move |done, total| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push((done, total));
+            }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, rust_rag_mcp::IndexResult::Skipped));
+    assert!(
+        skipped_reports.lock().unwrap().is_empty(),
+        "A skipped file must not report chunk progress"
+    );
+
+    core.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_rag_delete_source() {
     let dir = tempdir().unwrap();

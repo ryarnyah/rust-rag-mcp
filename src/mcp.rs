@@ -10,6 +10,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 #[derive(Debug, serde::Serialize)]
@@ -160,7 +161,8 @@ impl RagServer {
         Index a file or directory into the RAG knowledge base. \
         Reads, chunks, embeds, and stores for semantic search. \
         Supports PDF, DOCX, XLSX, PPTX, TXT, MD, RS, PY, JS, TS, GO, JAVA, C, CPP, H, JSON, YAML, YML, TOML, XML, CSV, HTML, CSS. \
-        Unchanged files skipped. Returns summary of indexed/skipped/failed.")]
+        Unchanged files skipped. Returns summary of indexed/skipped/failed. \
+        When the request carries a `progressToken`, a progress notification is sent for every chunk indexed.")]
     async fn index_path(
         &self,
         Parameters(req): Parameters<IndexPathRequest>,
@@ -184,7 +186,14 @@ impl RagServer {
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut errors = Vec::new();
-        let mut progress = 0u64;
+        // Monotonic progress for the client's token: one unit per chunk
+        // stored, plus one per file that produced no chunk (skipped or
+        // failed), so every notification still moves it forward. Shared
+        // with the per-chunk closure below, which clones everything it
+        // needs — a closure *borrowing* these locals would drag their
+        // references through the indexing future and break the tool
+        // handler's `Send` bound.
+        let progress = Arc::new(AtomicU64::new(0));
 
         while let Some(current) = stack.pop() {
             if current.is_dir() {
@@ -194,29 +203,62 @@ impl RagServer {
                     }
                 }
             } else if current.is_file() && docs::supported_extension(&current) {
+                let file = current.display().to_string();
+                let peer = ctx.peer.clone();
+                let token = progress_token.clone();
+                let counter = progress.clone();
+                let notify_file = file.clone();
                 let result = {
                     let core = self.core.read().await;
-                    core.index_file(&current).await
+                    // One notification per chunk, as it lands in the index.
+                    core.index_file_with_progress(&current, move |done, total| {
+                        let peer = peer.clone();
+                        let token = token.clone();
+                        let file = notify_file.clone();
+                        let counter = counter.clone();
+                        async move {
+                            let Some(token) = token else { return };
+                            let value = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            let _ = peer
+                                .notify_progress(
+                                    ProgressNotificationParam::new(token, value as f64)
+                                        .with_message(format!("{file}: chunk {done}/{total}")),
+                                )
+                                .await;
+                        }
+                    })
+                    .await
                 };
-                match result {
+                // Files with no chunk still get one notification, so the
+                // client sees the walk finish them.
+                let outcome = match &result {
                     Ok(IndexResult::Indexed(count)) => {
                         indexed += 1;
-                        errors.push(format!("Indexed {} — {} chunks", current.display(), count));
+                        errors.push(format!("Indexed {} — {} chunks", file, count));
+                        if *count == 0 {
+                            Some(format!("{file} — no chunks"))
+                        } else {
+                            None
+                        }
                     }
                     Ok(IndexResult::Skipped) => {
                         skipped += 1;
+                        Some(format!("{file} — unchanged"))
                     }
                     Err(e) => {
-                        errors.push(format!("Failed {}: {}", current.display(), e));
+                        errors.push(format!("Failed {}: {}", file, e));
+                        Some(format!("{file} — failed: {e}"))
                     }
-                }
-                progress += 1;
-                if let Some(ref token) = progress_token {
+                };
+                if let Some(message) = outcome
+                    && let Some(token) = progress_token.clone()
+                {
+                    let value = progress.fetch_add(1, Ordering::SeqCst) + 1;
                     let _ = ctx
                         .peer
                         .notify_progress(
-                            ProgressNotificationParam::new(token.clone(), progress as f64)
-                                .with_message(current.display().to_string()),
+                            ProgressNotificationParam::new(token, value as f64)
+                                .with_message(message),
                         )
                         .await;
                 }

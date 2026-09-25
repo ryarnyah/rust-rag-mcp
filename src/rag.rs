@@ -613,7 +613,27 @@ impl RagCore {
     }
 
     /// Indexes the specified file by extracting its text, chunking it, and storing the chunks and metadata in the database.
+    ///
+    /// Convenience wrapper around [`Self::index_file_with_progress`] for
+    /// callers with no interest in chunk-level progress (the CLI).
     pub async fn index_file(&self, path: &Path) -> Result<IndexResult> {
+        self.index_file_with_progress(path, |_done, _total| async {})
+            .await
+    }
+
+    /// Same as [`Self::index_file`], but streams chunk-level progress to
+    /// `on_chunk`: the hook is awaited once per chunk, *after* that chunk
+    /// has been embedded and stored, with `(done, total)` for this file —
+    /// `done` counts `1..=total` in insertion order, `total` being the
+    /// number of chunks the file produced. The MCP layer uses it to emit
+    /// one progress notification per stored chunk.
+    ///
+    /// A file skipped as unchanged yields no chunk at all, so the hook is
+    /// never called for it.
+    pub async fn index_file_with_progress<F>(&self, path: &Path, on_chunk: F) -> Result<IndexResult>
+    where
+        F: AsyncFnMut(usize, usize),
+    {
         let _ops = self.ops.lock().await;
         let source_path = path
             .canonicalize()
@@ -644,7 +664,7 @@ impl RagCore {
                 self.chunker.chunk_text(&text, &source_path)
             };
             let count = chunks.len();
-            self.index_chunks(chunks).await?;
+            self.index_chunks(chunks, on_chunk).await?;
             count
         };
 
@@ -675,7 +695,8 @@ impl RagCore {
             self.chunker.chunk_text(text, source)
         };
         let count = chunks.len();
-        self.index_chunks(chunks).await?;
+        // `index_text` has no progress consumer; report nothing.
+        self.index_chunks(chunks, |_done, _total| async {}).await?;
 
         let now = current_timestamp()?;
         self.upsert_metadata(source, &content_hash, now, count as u32)
@@ -685,16 +706,29 @@ impl RagCore {
     }
 
     /// Indexes the given chunks by generating embeddings and storing them in the database.
-    async fn index_chunks(&self, chunks: Vec<DocumentChunk>) -> Result<()> {
+    ///
+    /// `on_chunk` is awaited after each chunk is stored (see
+    /// [`Self::index_file_with_progress`] for the `(done, total)` contract).
+    /// Embeddings are still computed per batch — only the *reporting* is
+    /// per chunk, interleaved with the inserts of that batch.
+    async fn index_chunks<F>(&self, chunks: Vec<DocumentChunk>, on_chunk: F) -> Result<()>
+    where
+        F: AsyncFnMut(usize, usize),
+    {
         if chunks.is_empty() {
             return Ok(());
         }
 
         const BATCH_SIZE: usize = 64;
+        let total = chunks.len();
+        let mut done = 0usize;
+        let mut on_chunk = on_chunk;
 
         for batch in chunks.chunks(BATCH_SIZE) {
             let embeddings = self.embedding.embed_chunks(batch).await?;
-            self.insert_batch(batch, &embeddings).await?;
+            self.insert_batch(batch, &embeddings, done, total, &mut on_chunk)
+                .await?;
+            done += batch.len();
         }
 
         self.vectors_db.flush().await?;
@@ -702,8 +736,21 @@ impl RagCore {
         Ok(())
     }
 
-    async fn insert_batch(&self, batch: &[DocumentChunk], embeddings: &[Vec<f32>]) -> Result<()> {
-        for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
+    /// `done_before` is how many chunks of this document were already
+    /// stored, so the per-chunk hook reports a running `done` across
+    /// batches rather than restarting at 1 per batch.
+    async fn insert_batch<F>(
+        &self,
+        batch: &[DocumentChunk],
+        embeddings: &[Vec<f32>],
+        done_before: usize,
+        total: usize,
+        on_chunk: &mut F,
+    ) -> Result<()>
+    where
+        F: AsyncFnMut(usize, usize),
+    {
+        for (i, (chunk, embedding)) in batch.iter().zip(embeddings.iter()).enumerate() {
             let chunk_meta = ChunkMetadata {
                 id: chunk.id.clone(),
                 text: chunk.text.clone(),
@@ -725,6 +772,11 @@ impl RagCore {
             // Lexical index: same id, exact stored text (its
             // remove_document contract needs the identical string).
             self.bm25.write().await.add_document(vec_id, &chunk.text);
+
+            // Report only once the chunk is fully stored (vector row,
+            // metadata, postings), so `done` never runs ahead of what a
+            // search would already return.
+            on_chunk(done_before + i + 1, total).await;
         }
         Ok(())
     }
