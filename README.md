@@ -142,10 +142,7 @@ instruction (`passage: `, `search_document: `, `title: none | text: `, ...) wher
 requires one — BGE/mxbai/Arctic documents are never prefixed. Symmetric models (MiniLM, MPNet, GTE,
 Jina, ...) are embedded verbatim with no prefixes.
 
-> **Switching models or upgrading across prefix-policy changes requires a fresh re-index.**
-> Vectors are only compatible when model *and* prefix policy match what they were indexed with;
-> content-hash dedup will not re-embed unchanged files on its own. Delete the old `.rag-db` (or run
-> `delete-source` + re-`index`) when changing `--model`.
+**Switching models or upgrading across prefix-policy changes requires a fresh re-index.**
 
 ## CLI Reference
 
