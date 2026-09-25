@@ -645,21 +645,13 @@ impl RagCore {
     /// Performs a semantic search for the given query string, returning the top_k most relevant results.
     /// Optionally filters results by the specified source.
     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        let query_chunk = vec![DocumentChunk {
-            id: "query".to_string(),
-            text: query.to_string(),
-            source: "query".to_string(),
-            chunk_index: 0,
-            start_offset: 0,
-            end_offset: 0,
-        }];
-        let query_embedding_vec = self.embedding.embed_chunks(&query_chunk).await?;
+        // Asymmetric models embed queries with a different instruction than
+        // passages — go through embed_query, not the document path.
+        let query_embedding = self.embedding.embed_query(query).await?;
 
-        if query_embedding_vec.is_empty() || query_embedding_vec[0].is_empty() {
+        if query_embedding.is_empty() {
             return Err(anyhow::anyhow!("Failed to generate query embedding"));
         }
-
-        let query_embedding = &query_embedding_vec[0];
 
         // P5: Adaptive ef_search based on k
         // Small k: use lower ef (faster), large k: use higher ef (more thorough)
@@ -668,7 +660,7 @@ impl RagCore {
         // Search vectors with optional source filter
         let search_results = self
             .vectors_db
-            .search(query_embedding, top_k, ef as usize)
+            .search(&query_embedding, top_k, ef as usize)
             .await?;
 
         let mut results = Vec::new();

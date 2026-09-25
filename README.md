@@ -95,6 +95,18 @@ PDF, DOCX, XLSX, PPTX — extract text and index it alongside your source code. 
 
 40+ models from BGE, MiniLM, Nomic, Snowflake, Jina, GTE, and more. Runs entirely offline via ONNX.
 
+Asymmetric models are embedded with their official task instructions: queries get `query: ` (E5),
+`search_query: ` (Nomic, ModernBERT), a `task: search result | query: ` prompt (EmbeddingGemma), or a
+retrieval instruction sentence (BGE, mxbai, Snowflake Arctic); documents get the matching passage
+instruction (`passage: `, `search_document: `, `title: none | text: `, ...) where the model's card
+requires one — BGE/mxbai/Arctic documents are never prefixed. Symmetric models (MiniLM, MPNet, GTE,
+Jina, ...) are embedded verbatim with no prefixes.
+
+> **Switching models or upgrading across prefix-policy changes requires a fresh re-index.**
+> Vectors are only compatible when model *and* prefix policy match what they were indexed with;
+> content-hash dedup will not re-embed unchanged files on its own. Delete the old `.rag-db` (or run
+> `delete-source` + re-`index`) when changing `--model`.
+
 ## CLI Reference
 
 ### Start MCP Server
