@@ -1143,6 +1143,181 @@ async fn test_wal_recovery_metadata_restored_when_data_flushed_without_metadata(
     Ok(())
 }
 
+/// A crash between `flush()`'s vector-file sync and its graph sync leaves
+/// rows durable with no node block — and page-cache writeback can split
+/// the two files either way. WAL replay must give such a row a block
+/// *and link it*: an unlinked row is invisible to search while passing
+/// every count-based check, and the recovery flush clears the log that
+/// could still heal it.
+///
+/// The crash state is built by hand: the vector file is patched to be
+/// durable through row 5, the graph and metadata files are rolled back to
+/// a five-row baseline, and the WAL keeps both pending inserts — exactly
+/// what `flush()` step 1a (vector sync) completing without 1b (graph
+/// sync) produces.
+#[tokio::test]
+async fn test_wal_replay_links_rows_missing_graph_blocks() -> Result<()> {
+    let db_path = "test_wal_graph_heal.db";
+    let hnsw_path = format!("{}.hnsw", db_path);
+    let meta_path = format!("{}.meta", db_path);
+    cleanup(db_path);
+
+    let open_cfg = || Config::new(4).with_capacity(32).with_seed(7);
+
+    // Stage 1: flushed, consistent five-row baseline — the rollback point.
+    {
+        let mut db = VectorDb::open(db_path, open_cfg()).await?;
+        for v in [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0, 0.0],
+            [0.0, 0.5, 0.5, 0.0],
+        ] {
+            db.insert(&v, None)?;
+        }
+        db.flush().await?;
+    }
+    let base_hnsw = fs::read(&hnsw_path)?;
+    let base_meta = fs::read(&meta_path)?;
+
+    // Stage 2: rows 5 and 6 reach the WAL and the dirty mmaps only.
+    {
+        let mut db = VectorDb::open(db_path, open_cfg()).await?;
+        db.insert(&[0.0, 0.0, 0.0, 1.0], Some(b"five"))?;
+        db.insert(&[0.7, 0.7, 0.7, 0.7], Some(b"six"))?;
+        // No flush: drop == crash (the WAL writer still fsyncs on the way
+        // down; the data files keep only what page cache happens to hold).
+    }
+
+    // Stage 3: pin the crash state. Row 5's bytes are already in the
+    // vector file, so only the length header needs patching (16..24);
+    // the graph and metadata files roll back to the five-row baseline.
+    // The WAL is left alone — it still holds inserts 5 and 6.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(db_path)?;
+        f.seek(SeekFrom::Start(16))?;
+        f.write_all(&6u64.to_le_bytes())?;
+        f.flush()?;
+        fs::write(&hnsw_path, &base_hnsw)?;
+        fs::write(&meta_path, &base_meta)?;
+    }
+
+    // Stage 4: replay must backfill row 5's metadata, give row 5 a node
+    // block *and link it*, and fully insert row 6.
+    {
+        let db = VectorDb::open(db_path, open_cfg()).await?;
+
+        assert_eq!(db.len(), 7, "both WAL inserts must replay");
+        assert_eq!(
+            db.meta_record_count(),
+            7,
+            "generation tokens must reflect the replayed state"
+        );
+        assert_eq!(
+            db.deleted_count(),
+            0,
+            "the backfilled row counts live again"
+        );
+        assert_eq!(
+            db.get_meta(5)?.map(|m| m.to_vec()),
+            Some(b"five".to_vec()),
+            "row 5's metadata must come back from the log"
+        );
+        db.integrity_check()?;
+
+        // Membership is the regression that matters: an unlinked row
+        // passes count checks but can never appear in results.
+        let hits = db.search(&[0.0, 0.0, 0.0, 1.0], 7, 128)?;
+        let ids: Vec<u32> = hits.iter().map(|h| h.id).collect();
+        assert!(
+            ids.contains(&5),
+            "row 5 must be linked into the graph, got {ids:?}"
+        );
+        assert!(ids.contains(&6), "row 6 must be in the graph, got {ids:?}");
+        assert_eq!(hits.len(), 7, "all seven rows are live and reachable");
+        assert_eq!(hits[0].id, 5, "exact-match query ranks its row first");
+    }
+
+    cleanup(db_path);
+    Ok(())
+}
+
+/// The suffix sweep in `recover_from_wal` covers rows whose insert record
+/// is already past the log: here the graph file is rolled back a row
+/// while the vector and metadata files stay current, and the only WAL
+/// record left is the row's *delete*. Replay must still give the row its
+/// block (the log that could have healed it in-band is gone), which is
+/// what lets `integrity_check`'s node-count equality hold — a row without
+/// a block is exactly the state neither direction of the old `count > len`
+/// check could see.
+#[tokio::test]
+async fn test_wal_replay_suffix_heals_row_without_insert_record() -> Result<()> {
+    let db_path = "test_wal_graph_suffix.db";
+    let hnsw_path = format!("{}.hnsw", db_path);
+    cleanup(db_path);
+
+    let open_cfg = || Config::new(4).with_capacity(32).with_seed(11);
+
+    // Stage 1: five rows, flushed — snapshot the graph file.
+    {
+        let mut db = VectorDb::open(db_path, open_cfg()).await?;
+        for v in [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0, 0.0],
+            [0.0, 0.5, 0.5, 0.0],
+        ] {
+            db.insert(&v, None)?;
+        }
+        db.flush().await?;
+    }
+    let base_hnsw = fs::read(&hnsw_path)?;
+
+    // Stage 2: row 5 lands, everything flushes (WAL cleared) — then the
+    // graph file is rolled back alone: a row whose block never made it
+    // while the vector and metadata files did.
+    {
+        let mut db = VectorDb::open(db_path, open_cfg()).await?;
+        db.insert(&[0.0, 0.0, 0.0, 1.0], Some(b"five"))?;
+        db.flush().await?;
+    }
+    fs::write(&hnsw_path, &base_hnsw)?;
+
+    // Stage 3: delete row 5 — the WAL's only record, logged after the
+    // stage-2 checkpoint, so replay sees a delete but never its insert.
+    {
+        let mut db = VectorDb::open(db_path, open_cfg()).await?;
+        assert!(db.delete(5)?, "row 5 exists at delete time");
+        // no flush: drop == crash
+    }
+
+    // Stage 4: replay the tombstone, then the suffix sweep must register
+    // the missing block so the row counts are equal again.
+    {
+        let db = VectorDb::open(db_path, open_cfg()).await?;
+
+        assert!(db.is_deleted(5), "the delete must replay");
+        assert_eq!(db.deleted_count(), 1);
+        db.integrity_check()?;
+        // The dead row must stay out of results, live rows stay in.
+        let hits = db.search(&[0.0, 0.0, 0.0, 1.0], 5, 128)?;
+        assert_eq!(hits.len(), 5, "five live rows, tombstone excluded");
+        assert!(
+            hits.iter().all(|h| h.id != 5),
+            "the tombstoned row must not surface"
+        );
+    }
+
+    cleanup(db_path);
+    Ok(())
+}
+
 // Regression: compact() used to leave VectorDb pointing at the shut-down WAL
 // writer and a dummy lock handle, so inserts failed and no advisory lock was
 // held after compaction. It must also discard stale pre-compaction WAL records

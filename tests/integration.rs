@@ -456,6 +456,111 @@ async fn test_rag_bm25_sidecar_reopen() {
     }
 }
 
+/// Deletes are WAL-only (`delete_source` never flushes), so both sidecars
+/// must stay correct across a crash whose recovery runs entirely through
+/// WAL replay: the replayed tombstones move `meta_record_count`, the old
+/// generation tokens no longer match, and the rebuild from the scan sees
+/// the post-replay state. The crash state is pinned by rolling the data
+/// files back to the pre-delete bytes while leaving the WAL and both
+/// sidecars in place — without replay, the restored files would present
+/// the deleted source as live and validate the stale sidecars.
+#[tokio::test]
+async fn test_rag_wal_replayed_deletes_invalidate_sidecars() {
+    let dir = tempdir().unwrap();
+    let srcidx = dir.path().join("db.srcidx");
+    let bm25_sidecar = dir.path().join("db.bm25");
+    let data_files = ["db", "db.hnsw", "db.meta"].map(|n| dir.path().join(n));
+
+    // Generation 1: both sources indexed, closed — sidecars on disk.
+    let chunks_before = {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text(
+            "The flibbertigibbet token appears only in the doomed document.",
+            "doomed.txt",
+        )
+        .await
+        .unwrap();
+        core.index_text("Eternal content about giraffes.", "keeper.txt")
+            .await
+            .unwrap();
+        assert!(
+            !core
+                .search_lexical("flibbertigibbet", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "baseline: the doomed token is indexed"
+        );
+        let n = core.chunk_count().await.unwrap();
+        core.close().await.unwrap();
+        n
+    };
+    let srcidx_gen1 = std::fs::read(&srcidx).unwrap();
+    let bm25_gen1 = std::fs::read(&bm25_sidecar).unwrap();
+    let backups: Vec<Vec<u8>> = data_files
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+
+    // The crash window: reopen, delete without ever flushing, then drop.
+    // Tombstones live only in the WAL (fsynced by the writer's shutdown)
+    // and in dirty pages the restore below discards.
+    {
+        let core = test_rag_core(dir.path()).await;
+        core.delete_source("doomed.txt").await.unwrap();
+        // deliberately no close: drop == crash
+    }
+    for (p, bytes) in data_files.iter().zip(&backups) {
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    // Recovery: replay must apply the tombstones, which moves the
+    // generation tokens, which rejects both pre-delete sidecars.
+    {
+        let core = test_rag_core(dir.path()).await;
+
+        assert_eq!(
+            core.list_sources().await.unwrap(),
+            vec!["keeper.txt".to_string()],
+            "a stale .srcidx trusted through replay would list the phantom source"
+        );
+        assert!(
+            core.search_lexical("flibbertigibbet", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "without replay the restored rows are live and the stale sidecar would match"
+        );
+        assert!(
+            !core.search_lexical("giraffes", 5).await.unwrap().is_empty(),
+            "the surviving source stays lexically searchable"
+        );
+        let hybrid = core.search_hybrid("flibbertigibbet", 5).await.unwrap();
+        assert!(
+            hybrid.iter().all(|r| r.chunk.source != "doomed.txt"),
+            "dead content must not surface in hybrid results: {hybrid:?}"
+        );
+        assert_eq!(
+            core.chunk_count().await.unwrap(),
+            chunks_before,
+            "tombstones never shrink the row count"
+        );
+        core.close().await.unwrap();
+    }
+
+    // A rebuilt payload is strictly smaller than the generation it
+    // replaced; trusting and re-persisting the stale file would keep its
+    // bytes (only the token header would differ).
+    assert!(
+        std::fs::read(&srcidx).unwrap().len() < srcidx_gen1.len(),
+        "the rebuilt .srcidx must have dropped the deleted source"
+    );
+    assert!(
+        std::fs::read(&bm25_sidecar).unwrap().len() < bm25_gen1.len(),
+        "the rebuilt .bm25 must have dropped the deleted postings"
+    );
+}
+
 /// The MCP server never reached `close()` before (only the CLI commands
 /// did), which would have left the sidecar stale on every server
 /// shutdown. Pin both persistence points of the server path — startup

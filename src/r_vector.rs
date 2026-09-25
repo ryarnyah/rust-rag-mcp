@@ -2320,6 +2320,22 @@ impl VectorDb {
                         self.deleted_count = self.deleted_count.saturating_sub(1);
                         recovered_count += 1;
                     }
+                    // A durable row is not necessarily a *graphed* row:
+                    // `flush()` syncs the vector file before the graph, and
+                    // page-cache writeback can persist one file without the
+                    // other, so rows can exist with no node block. The
+                    // branches above restore the row or its metadata only —
+                    // never the graph. Register (and link) the block now,
+                    // while the log still holds the record that created the
+                    // row: the flush below clears it, and a row without a
+                    // block is invisible to search yet passes every
+                    // count-based check.
+                    if (record.vector_id as usize) < self.len()
+                        && (record.vector_id as usize) >= self.index.count()
+                    {
+                        self.rebuild_hnsw_node(record.vector_id)?;
+                        recovered_count += 1;
+                    }
                 }
                 WalOpType::Delete => {
                     // Skip if already deleted or out of bounds (idempotent)
@@ -2356,6 +2372,16 @@ impl VectorDb {
                     // Checkpoint marker: all prior ops are safe on disk
                 }
             }
+        }
+
+        // Belt and braces for the same gap in rows whose insert record is
+        // already past this log: a pre-checkpoint insert cannot leave one
+        // (the checkpoint lands after the graph sync), so this loop should
+        // never fire — but a leftover would become a permanent, silent
+        // recall loss the moment the flush below clears the log.
+        for id in self.index.count() as u32..self.len() as u32 {
+            self.rebuild_hnsw_node(id)?;
+            recovered_count += 1;
         }
 
         tracing::info!("WAL recovery: recovered {} records", recovered_count);
@@ -2692,7 +2718,11 @@ impl VectorDb {
             )));
         }
 
-        if self.index.count() > len {
+        // Every row owns a node block — placeholders get unlinked ones —
+        // so either direction is corruption: blocks past the rows are
+        // orphaned addresses, rows past the blocks are rows search can
+        // never reach.
+        if self.index.count() != len {
             return Err(VectorDbError::Corruption(format!(
                 "graph has {} nodes but the vector file holds {len} rows",
                 self.index.count()

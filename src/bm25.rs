@@ -40,9 +40,12 @@
 //! meta_record_count)` from the freshly opened database (WAL replay
 //! included), and the file is used only on an exact match. Both tokens
 //! move on every insert and delete, so a sidecar missing any mutation
-//! cannot validate — and compaction renumbers ids, mismatching too. It is
-//! a cache of derived state: absent, stale, or corrupt all mean "rebuild
-//! from the metadata scan", which is always correct.
+//! cannot validate. Compaction renumbers ids against a fresh `(live,
+//! live)` token, which mismatches any other generation — a sidecar that
+//! round-tripped to exactly those tokens would evade the check, which
+//! is another reason compaction stays unreachable through `RagCore`.
+//! It is a cache of derived state: absent, stale, or corrupt all mean
+//! "rebuild from the metadata scan", which is always correct.
 //!
 //! It is written at quiescent points only — after a startup rebuild, and
 //! in `close()` under the `ops` mutex every mutator holds. A crash before
@@ -730,8 +733,8 @@ mod tests {
             "tombstone moves record count"
         );
         assert!(
-            parse_bm25(&bytes, 9, 19).is_none(),
-            "compaction rewrites both"
+            parse_bm25(&bytes, 9, 9).is_none(),
+            "a post-compaction (live, live) generation differs too"
         );
     }
 

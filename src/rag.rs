@@ -31,9 +31,13 @@ use tokio::sync::{Mutex, RwLock};
 ///   metadata record, a delete appends a tombstone record — so a
 ///   sidecar missing any insert/delete since it was written cannot
 ///   match. Compaction rewrites the files with renumbered ids and a
-///   fresh record count, so it mismatches too and forces the correct
-///   rebuild. (Compaction is not reachable through `RagCore`; wiring it
-///   up would need the maps renumbered in lockstep, sidecar included.)
+///   fresh `(live, live)` record count, which mismatches a sidecar
+///   from any other generation — though one written at exactly those
+///   tokens would evade the check (a round trip such as *k* deletes,
+///   *k* inserts, compact back to the old length). That hole is why
+///   compaction being unreachable through `RagCore` is load-bearing:
+///   wiring it up would need the maps renumbered in lockstep, sidecar
+///   included — and a generation token compaction cannot forge.
 /// - *When it is written*: only at quiescent points — after a startup
 ///   rebuild, and in `close()` with the `ops` mutex held, which every
 ///   mutator also holds, so tokens can never race the maps. A crash
@@ -1077,8 +1081,8 @@ mod tests {
         // A row append (insert) or a tombstone (delete) moves a token.
         assert!(parse_source_index(&bytes, 11, 20).is_none());
         assert!(parse_source_index(&bytes, 10, 21).is_none());
-        // Compaction rewrites both.
-        assert!(parse_source_index(&bytes, 9, 19).is_none());
+        // A post-compaction generation is `(live, live)`.
+        assert!(parse_source_index(&bytes, 9, 9).is_none());
     }
 
     /// Foreign file, short read, or mid-body truncation at *any* offset
