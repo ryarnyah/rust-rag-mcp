@@ -69,3 +69,11 @@ impl<T> From<Nullable<T>> for Option<T> {
         v.0
     }
 }
+
+/// An absent field deserializes to `None` (callers then apply their own
+/// default) — `#[serde(default)]` on a `Nullable` field needs this.
+impl<T> Default for Nullable<T> {
+    fn default() -> Self {
+        Nullable(None)
+    }
+}

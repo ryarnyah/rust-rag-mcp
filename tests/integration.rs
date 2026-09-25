@@ -232,10 +232,235 @@ async fn test_rag_source_index_sidecar_reopen() {
     }
 }
 
+/// Hybrid search end-to-end: lexical mode finds exact identifiers,
+/// hybrid fuses both retrievers, and the RRF score contract holds
+/// (positive, rank-monotonic, capped at one contribution per list).
+#[tokio::test]
+async fn test_rag_hybrid_and_lexical_search() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    core.index_text(
+        "Rust is a systems programming language focused on safety.",
+        "rust.md",
+    )
+    .await
+    .unwrap();
+    core.index_text(
+        "The parse_source_index function validates sidecar tokens.",
+        "sidecar.rs",
+    )
+    .await
+    .unwrap();
+    core.index_text("Banana bread recipes for beginners.", "cooking.txt")
+        .await
+        .unwrap();
+
+    // Lexical mode: exact identifier, ranked first — the query never
+    // touches the embedding model, and the tokenizer splits the
+    // identifier the same way on both sides (underscore boundaries).
+    let lexical = core
+        .search_with_mode("parse_source_index", 5, rust_rag_mcp::SearchMode::Lexical)
+        .await
+        .unwrap();
+    assert!(!lexical.is_empty(), "exact identifier must match lexically");
+    assert_eq!(lexical[0].chunk.source, "sidecar.rs");
+    assert!(lexical[0].score > 0.0);
+
+    // Semantic mode keeps the dense-only contract.
+    let semantic = core
+        .search_with_mode(
+            "systems programming safety",
+            5,
+            rust_rag_mcp::SearchMode::Semantic,
+        )
+        .await
+        .unwrap();
+    assert!(!semantic.is_empty());
+    assert!(semantic[0].score > 0.0);
+
+    // Hybrid: every document appears in both retrievers' pools (the
+    // corpus is smaller than the pool), so the top fused score is
+    // exactly two RRF contributions — 2/(60+1) — and never more, and
+    // every score is positive and rank-monotonic.
+    let hybrid = core
+        .search_with_mode(
+            "parse_source_index safety",
+            5,
+            rust_rag_mcp::SearchMode::Hybrid,
+        )
+        .await
+        .unwrap();
+    assert!(!hybrid.is_empty());
+    assert!(
+        hybrid[0].score <= 2.0 / 61.0 + 1e-9,
+        "top RRF score must be one contribution per list, got {}",
+        hybrid[0].score
+    );
+    for pair in hybrid.windows(2) {
+        assert!(
+            pair[0].score >= pair[1].score,
+            "hybrid results must be sorted by fused score"
+        );
+    }
+    assert!(
+        hybrid.iter().any(|r| r.chunk.source == "sidecar.rs"),
+        "fused results must contain the lexically matched document"
+    );
+
+    // top_k is respected in every mode.
+    for mode in [
+        rust_rag_mcp::SearchMode::Hybrid,
+        rust_rag_mcp::SearchMode::Semantic,
+        rust_rag_mcp::SearchMode::Lexical,
+    ] {
+        let results = core.search_with_mode("rust", 2, mode).await.unwrap();
+        assert!(results.len() <= 2, "{mode:?} exceeded top_k");
+    }
+
+    core.close().await.unwrap();
+}
+
+/// Deleting a source must drop it from the lexical index too — both
+/// via the in-process `remove_document` wiring and (as backstop) the
+/// query-time liveness guard — while leaving other sources intact.
+#[tokio::test]
+async fn test_rag_delete_source_removes_from_lexical_index() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    core.index_text(
+        "The flibbertigibbet token appears only in the doomed document.",
+        "doomed.txt",
+    )
+    .await
+    .unwrap();
+    core.index_text("Eternal content about giraffes.", "keeper.txt")
+        .await
+        .unwrap();
+
+    let before = core.search_lexical("flibbertigibbet", 5).await.unwrap();
+    assert_eq!(before.len(), 1, "token indexed exactly once");
+
+    core.delete_source("doomed.txt").await.unwrap();
+
+    assert!(
+        core.search_lexical("flibbertigibbet", 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "deleted content must not surface lexically"
+    );
+    // Hybrid can never be *empty* for any query — the dense side
+    // returns the nearest live neighbours even for gibberish — so the
+    // contract here is narrower: the dead document must not appear.
+    let hybrid = core.search_hybrid("flibbertigibbet", 5).await.unwrap();
+    assert!(
+        hybrid.iter().all(|r| r.chunk.source != "doomed.txt"),
+        "deleted content must not surface in hybrid results: {hybrid:?}"
+    );
+    assert!(
+        !core.search_lexical("giraffes", 5).await.unwrap().is_empty(),
+        "surviving source stays searchable"
+    );
+
+    core.close().await.unwrap();
+}
+
+/// Full `.bm25` sidecar lifecycle, mirroring `.srcidx`: close
+/// persists it, a reopen trusts it, and any deviation — stale
+/// generation tokens (including an insert that happened after the last
+/// persist and was never closed), plain garbage — forces the rebuild
+/// that makes lexical search correct again.
+#[tokio::test]
+async fn test_rag_bm25_sidecar_reopen() {
+    let dir = tempdir().unwrap();
+    let sidecar = dir.path().join("db.bm25");
+
+    // Generation 1, clean close: the sidecar lands on disk.
+    {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text("Alpha content about herons.", "a.txt")
+            .await
+            .unwrap();
+        core.index_text("Beta content about egrets.", "b.txt")
+            .await
+            .unwrap();
+        core.close().await.unwrap();
+    }
+    assert!(sidecar.exists(), "close must persist the bm25 sidecar");
+    let gen1 = std::fs::read(&sidecar).unwrap();
+
+    // Reopen on the same generation: sidecar validates; lexical search
+    // must reproduce the corpus (the skip-the-scan path).
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert!(!core.search_lexical("herons", 5).await.unwrap().is_empty());
+        assert!(!core.search_lexical("egrets", 5).await.unwrap().is_empty());
+        core.close().await.unwrap();
+    }
+
+    // Generation 2: a new source, closed — the on-disk sidecar now
+    // describes a newer database than gen1.
+    {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text("Xylophone content in the newer generation.", "c.txt")
+            .await
+            .unwrap();
+        core.close().await.unwrap();
+    }
+
+    // Stale sidecar (gen1 against gen2): tokens mismatch -> rebuild —
+    // trusting the stale file would silently lose "xylophone".
+    std::fs::write(&sidecar, &gen1).unwrap();
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert!(
+            !core
+                .search_lexical("xylophone", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a stale sidecar must be rejected in favor of the scan"
+        );
+        core.close().await.unwrap();
+    }
+
+    // Corrupt/foreign sidecar: same fallback, no error.
+    std::fs::write(&sidecar, b"not a sidecar at all").unwrap();
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert!(!core.search_lexical("herons", 5).await.unwrap().is_empty());
+        core.close().await.unwrap();
+    }
+
+    // Crash simulation: an insert after the last persist, never
+    // closed. The sidecar on disk still carries the pre-insert tokens,
+    // so the next open must reject it and see the un-persisted insert.
+    {
+        let core = test_rag_core(dir.path()).await;
+        core.index_text("Wombat content appears after the crash point.", "d.txt")
+            .await
+            .unwrap();
+        // deliberately no close: drop == crash from the sidecar's view
+    }
+    {
+        let core = test_rag_core(dir.path()).await;
+        assert!(
+            !core.search_lexical("wombat", 5).await.unwrap().is_empty(),
+            "an insert invalidates the previously persisted sidecar tokens"
+        );
+        // Hybrid runs off the rebuilt index too.
+        assert!(!core.search_hybrid("wombat", 5).await.unwrap().is_empty());
+        core.close().await.unwrap();
+    }
+}
+
 /// The MCP server never reached `close()` before (only the CLI commands
 /// did), which would have left the sidecar stale on every server
-/// shutdown. Pin both persistence points of the server path: startup
-/// rebuild and `RagServer::close`.
+/// shutdown. Pin both persistence points of the server path — startup
+/// rebuild and `RagServer::close` — for both sidecars (`.srcidx` and
+/// `.bm25`).
 #[tokio::test]
 async fn test_rag_server_close_persists_sidecar() {
     let dir = tempdir().unwrap();
@@ -251,13 +476,23 @@ async fn test_rag_server_close_persists_sidecar() {
     .unwrap();
 
     let sidecar = dir.path().join("db.srcidx");
+    let bm25_sidecar = dir.path().join("db.bm25");
     assert!(sidecar.exists(), "startup must persist the sidecar");
+    assert!(
+        bm25_sidecar.exists(),
+        "startup must persist the bm25 sidecar"
+    );
 
-    // Remove it so only close() can bring it back — this pins the
+    // Remove both so only close() can bring them back — this pins the
     // shutdown wiring in main.rs (close after the transport ends).
     std::fs::remove_file(&sidecar).unwrap();
+    std::fs::remove_file(&bm25_sidecar).unwrap();
     server.close().await.unwrap();
     assert!(sidecar.exists(), "close must re-persist the sidecar");
+    assert!(
+        bm25_sidecar.exists(),
+        "close must re-persist the bm25 sidecar"
+    );
 }
 
 #[tokio::test]

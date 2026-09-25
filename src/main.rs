@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use rmcp::ServiceExt;
-use rust_rag_mcp::{docs, mcp, rag};
+use rust_rag_mcp::{SearchMode, docs, mcp, rag};
 
 #[derive(Parser)]
 #[command(
@@ -77,6 +77,11 @@ enum Commands {
 
         #[arg(long, default_value_t = 5)]
         top_k: usize,
+
+        /// Retrieval mode: `hybrid` (HNSW + BM25 fused with RRF),
+        /// `semantic` (dense only), or `lexical` (BM25 only, no model)
+        #[arg(long, value_enum, default_value = "hybrid")]
+        mode: SearchMode,
 
         #[arg(long, default_value_t = 512)]
         chunk_size: usize,
@@ -248,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
             cache_path,
             model,
             top_k,
+            mode,
             chunk_size,
             overlap,
         } => {
@@ -261,15 +267,21 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             let query_str = query.join(" ");
-            let results: Vec<rust_rag_mcp::SearchResult> = core.search(&query_str, top_k).await?;
+            let results: Vec<rust_rag_mcp::SearchResult> =
+                core.search_with_mode(&query_str, top_k, mode).await?;
 
             if results.is_empty() {
                 println!("No results found.");
             } else {
                 for (i, result) in results.iter().enumerate() {
                     println!(
-                        "[{}] (score: {:.4}) [{}:{}] {}",
+                        "[{}] ({}, score: {:.4}) [{}:{}] {}",
                         i + 1,
+                        match mode {
+                            SearchMode::Hybrid => "rrf",
+                            SearchMode::Semantic => "cosine",
+                            SearchMode::Lexical => "bm25",
+                        },
                         result.score,
                         result.chunk.source,
                         result.chunk.chunk_index,

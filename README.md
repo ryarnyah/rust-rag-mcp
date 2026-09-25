@@ -53,6 +53,27 @@ A from-scratch HNSW implementation with:
 - **PostgreSQL-style WAL** — LOG-BEFORE-APPLY with crash recovery and segment rotation
 - **Soft deletes with compaction** — tombstone tracking with automatic background cleanup
 
+### Hybrid Search (BM25 + HNSW)
+
+Every search runs two retrievers — dense HNSW (paraphrase, semantics) and BM25 lexical
+(exact identifiers, rare tokens, acronyms) — and fuses their ranked lists with Reciprocal
+Rank Fusion (RRF, `k = 60`). Only *ranks* are fused, so cosine similarity and BM25 weights
+never have to be comparable: a document that ranks well under either retriever surfaces.
+
+The BM25 index is a from-scratch inverted index (`bm25` module, Okapi BM25, `k1 = 1.2`,
+`b = 0.75`, language-neutral tokenizer). It is managed like the HNSW index: persisted as a
+`db.bm25` sidecar with generation tokens, validated at open, maintained incrementally on
+index/delete, and rebuilt from the metadata scan when anything mismatches — a rebuild
+re-tokenizes stored chunks, it never re-embeds.
+
+Three modes, shared by the MCP `search` tool and the CLI `--mode` flag:
+
+| Mode | Retrievers | Score |
+|------|-----------|-------|
+| `hybrid` (default) | HNSW + BM25, RRF-fused | RRF weight in `(0, ~0.033]`, monotonic in fused rank |
+| `semantic` | HNSW only | cosine similarity in `[0, 1]` |
+| `lexical` | BM25 only (no query embedding) | unbounded BM25 weight |
+
 ### Syntax-Aware Code Chunking
 
 Source code is parsed into an AST and chunked by semantic boundaries:
@@ -157,7 +178,7 @@ rust-rag-mcp search <QUERY>... [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--top-k <N>` | `5` | Number of results |
-| `--source <SOURCE>` | — | Filter by source |
+| `--mode <MODE>` | `hybrid` | `hybrid` (HNSW + BM25, RRF), `semantic`, or `lexical` (BM25 only, skips embedding) |
 | `--db-path <PATH>` | `.rag-db` | Database path |
 | `--cache-path <PATH>` | `.rag-cache` | Cache path |
 | `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
@@ -251,6 +272,7 @@ LanceDB logs are set to `warn` by default to reduce noise.
 rust-rag-mcp
 ├── r_vector    HNSW index + mmap storage (2,000+ lines)
 ├── wal         PostgreSQL-style write-ahead log
+├── bm25        BM25 lexical index + RRF hybrid fusion
 ├── syntax_chunker  Tree-sitter AST-aware chunking (25 languages)
 ├── embeddings  fastembed ONNX local embeddings
 ├── docs        PDF/DOCX/XLSX/PPTX text extraction

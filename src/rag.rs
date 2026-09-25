@@ -1,9 +1,10 @@
+use crate::bm25::{Bm25Index, parse_bm25, rrf_fuse, serialize_bm25};
 use crate::chunker::Chunker;
 use crate::docs;
 use crate::embeddings::EmbeddingService;
-use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig};
+use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig, SearchHitOwned};
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
-use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchResult};
+use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchMode, SearchResult};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -324,6 +325,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Candidate pool per retriever in hybrid search, before RRF fusion.
+/// Depth is what lets RRF do its job: a document ranked #45 in *both*
+/// lists (2/105 ≈ 0.019) outranks one ranked #1 in only one list
+/// (1/61 ≈ 0.016) — but only if both lists are deep enough to still
+/// contain it. Shallow enough that the dense side stays within the
+/// adaptive `ef` cap (`k·4` clamped to 200 → ef 200 for a 50 pool) and
+/// the lexical side within a single postings scan. Ignored when
+/// `top_k` is larger.
+const HYBRID_POOL: usize = 50;
+
 pub struct RagCore {
     vectors_db: AsyncVectorDb,
     embedding: EmbeddingService,
@@ -340,6 +351,15 @@ pub struct RagCore {
     ops: Arc<Mutex<()>>,
     /// Where the source-index sidecar lives: `<db>/db.srcidx`.
     source_index_path: PathBuf,
+    /// Lexical (BM25) index powering hybrid and lexical search. Doc
+    /// ids are vector ids, so it is maintained in lockstep with
+    /// `vectors_db` — inserts in `insert_batch`, removals in
+    /// `delete_source_inner` — always under `ops`. Persisted as the
+    /// `db.bm25` sidecar at the same quiescent points as
+    /// `source_index_path` (see [`crate::bm25`] for the full contract).
+    bm25: RwLock<Bm25Index>,
+    /// Where the lexical-index sidecar lives: `<db>/db.bm25`.
+    bm25_index_path: PathBuf,
 }
 
 /// Serialized chunk data with full metadata - stored in vector metadata field
@@ -395,15 +415,23 @@ impl RagCore {
         // the scan, which is always correct.
         let metadata_index = MetadataIndex::new();
         let source_index_path = db_path.join("db.srcidx");
+        let bm25_index_path = db_path.join("db.bm25");
 
-        let loaded = match Self::load_source_index(&source_index_path, &vectors_db).await {
+        let srcidx_ok = match Self::load_source_index(&source_index_path, &vectors_db).await {
             Some((chunks, docs)) => {
                 metadata_index.replace(chunks, docs).await;
                 true
             }
             None => false,
         };
-        if !loaded {
+
+        // Same contract for the lexical sidecar: exact generation
+        // tokens or a rebuild from the scan.
+        let bm25_loaded = Self::load_bm25(&bm25_index_path, &vectors_db).await;
+        let bm25_ok = bm25_loaded.is_some();
+        let mut bm25 = bm25_loaded.unwrap_or_else(Bm25Index::new);
+
+        if !srcidx_ok || !bm25_ok {
             let total = vectors_db.len().await;
             for id in 0..total as u32 {
                 if vectors_db.is_deleted(id).await {
@@ -412,9 +440,15 @@ impl RagCore {
                 if let Ok(Some(metadata_bytes)) = vectors_db.get_meta(id).await {
                     if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes)
                     {
-                        metadata_index.add_chunk(chunk_meta.source, id).await;
+                        if !srcidx_ok {
+                            metadata_index.add_chunk(chunk_meta.source, id).await;
+                        }
+                        if !bm25_ok {
+                            bm25.add_document(id, &chunk_meta.text);
+                        }
                     } else if let Ok(doc_meta) =
                         serde_json::from_slice::<DocumentMetadataEntry>(&metadata_bytes)
+                        && !srcidx_ok
                     {
                         metadata_index
                             .add_doc_metadata(doc_meta.source_path, id)
@@ -422,10 +456,15 @@ impl RagCore {
                     }
                 }
             }
-            // Startup is quiescent — no other handle exists yet — so the
-            // rebuilt index can be persisted immediately. A failed write
-            // only means the scan runs again next time.
-            Self::persist_source_index(&source_index_path, &vectors_db, &metadata_index).await;
+            // Startup is quiescent — no other handle exists yet — so a
+            // rebuilt sidecar can be persisted immediately. A failed
+            // write only means the scan runs again next time.
+            if !srcidx_ok {
+                Self::persist_source_index(&source_index_path, &vectors_db, &metadata_index).await;
+            }
+            if !bm25_ok {
+                Self::persist_bm25(&bm25_index_path, &vectors_db, &bm25).await;
+            }
         }
 
         Ok(Self {
@@ -436,6 +475,8 @@ impl RagCore {
             metadata_index,
             ops: Arc::new(Mutex::new(())),
             source_index_path,
+            bm25: RwLock::new(bm25),
+            bm25_index_path,
         })
     }
 
@@ -483,6 +524,42 @@ impl RagCore {
         let meta_record_count = vectors_db.meta_record_count().await as u64;
         let (chunks, docs) = metadata_index.snapshot().await;
         let bytes = serialize_source_index(vec_len, meta_record_count, &chunks, &docs)?;
+        write_atomic(path, &bytes)
+    }
+
+    /// Load the `db.bm25` sidecar if it exists *and* validates against
+    /// the current database state; `None` (rebuild from the metadata
+    /// scan) covers a missing file, a token mismatch, and every form of
+    /// corruption — like `.srcidx`, the sidecar is a cache, so rejection
+    /// never needs a reason beyond a debug log.
+    async fn load_bm25(path: &Path, vectors_db: &AsyncVectorDb) -> Option<Bm25Index> {
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let vec_len = vectors_db.len().await as u64;
+        let meta_record_count = vectors_db.meta_record_count().await as u64;
+        let parsed = parse_bm25(&bytes, vec_len, meta_record_count)?;
+        tracing::debug!(path = %path.display(), "loaded bm25 sidecar");
+        Some(parsed)
+    }
+
+    /// Persist the `db.bm25` sidecar — only ever called at a quiescent
+    /// point (startup before any other handle exists, or `close()` with
+    /// `ops` held, which every mutator also holds). Failure is warned
+    /// about, never propagated: a lost sidecar degrades to the startup
+    /// re-tokenization (no embedding involved).
+    async fn persist_bm25(path: &Path, vectors_db: &AsyncVectorDb, bm25: &Bm25Index) {
+        if let Err(e) = Self::write_bm25(path, vectors_db, bm25).await {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to persist bm25 sidecar; it will be rebuilt at next startup"
+            );
+        }
+    }
+
+    async fn write_bm25(path: &Path, vectors_db: &AsyncVectorDb, bm25: &Bm25Index) -> Result<()> {
+        let vec_len = vectors_db.len().await as u64;
+        let meta_record_count = vectors_db.meta_record_count().await as u64;
+        let bytes = serialize_bm25(bm25, vec_len, meta_record_count)?;
         write_atomic(path, &bytes)
     }
 
@@ -638,15 +715,20 @@ impl RagCore {
             self.metadata_index
                 .add_chunk(chunk.source.clone(), vec_id)
                 .await;
+            // Lexical index: same id, exact stored text (its
+            // remove_document contract needs the identical string).
+            self.bm25.write().await.add_document(vec_id, &chunk.text);
         }
         Ok(())
     }
 
-    /// Performs a semantic search for the given query string, returning the top_k most relevant results.
-    /// Optionally filters results by the specified source.
-    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        // Asymmetric models embed queries with a different instruction than
-        // passages — go through embed_query, not the document path.
+    /// Dense retrieval shared by [`Self::search`] (semantic mode) and
+    /// [`Self::search_hybrid`]: embed the query with the model's
+    /// query-side instruction, run HNSW, and return hits ranked
+    /// best-first with their metadata attached.
+    async fn dense_hits(&self, query: &str, k: usize) -> Result<Vec<SearchHitOwned>> {
+        // Asymmetric models embed queries with a different instruction
+        // than passages — go through embed_query, not the document path.
         let query_embedding = self.embedding.embed_query(query).await?;
 
         if query_embedding.is_empty() {
@@ -655,43 +737,144 @@ impl RagCore {
 
         // P5: Adaptive ef_search based on k
         // Small k: use lower ef (faster), large k: use higher ef (more thorough)
-        let ef = (top_k as u32 * 4).clamp(40, 200);
+        let ef = (k as u32 * 4).clamp(40, 200);
 
-        // Search vectors with optional source filter
-        let search_results = self
+        Ok(self
             .vectors_db
-            .search(&query_embedding, top_k, ef as usize)
-            .await?;
+            .search(&query_embedding, k, ef as usize)
+            .await?)
+    }
 
-        let mut results = Vec::new();
-        for hit in search_results {
-            // Deserialize chunk metadata
-            match serde_json::from_slice::<ChunkMetadata>(&hit.metadata) {
-                Ok(chunk_meta) => {
-                    let chunk = DocumentChunk {
-                        id: chunk_meta.id,
-                        text: chunk_meta.text,
-                        source: chunk_meta.source,
-                        chunk_index: chunk_meta.chunk_index,
-                        start_offset: chunk_meta.start_offset as usize,
-                        end_offset: chunk_meta.end_offset as usize,
-                    };
-                    results.push(SearchResult {
-                        score: hit.score as f64,
-                        chunk,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        vector_id = hit.id,
-                        error = %e,
-                        "Failed to deserialize chunk metadata, skipping result"
-                    );
-                }
+    /// Extracts the [`DocumentChunk`] out of a vector's serialized
+    /// metadata; `None` (with a warning, never a hard error) covers
+    /// unparsable rows such as document-metadata entries.
+    fn chunk_from_metadata(vector_id: u32, bytes: &[u8]) -> Option<DocumentChunk> {
+        match serde_json::from_slice::<ChunkMetadata>(bytes) {
+            Ok(chunk_meta) => Some(DocumentChunk {
+                id: chunk_meta.id,
+                text: chunk_meta.text,
+                source: chunk_meta.source,
+                chunk_index: chunk_meta.chunk_index,
+                start_offset: chunk_meta.start_offset as usize,
+                end_offset: chunk_meta.end_offset as usize,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    vector_id,
+                    error = %e,
+                    "Failed to deserialize chunk metadata, skipping result"
+                );
+                None
             }
         }
+    }
 
+    /// Performs a semantic search for the given query string, returning the top_k most relevant results.
+    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        let hits = self.dense_hits(query, top_k).await?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|hit| {
+                Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
+                    score: hit.score as f64,
+                    chunk,
+                })
+            })
+            .collect())
+    }
+
+    /// BM25-only retrieval: no embedding, so no model invocation at
+    /// all. Scores are raw BM25 weights (unbounded, comparable only
+    /// within this mode).
+    ///
+    /// The lexical index has no view of vector-table tombstones, so
+    /// every candidate is liveness-checked here — see [`crate::bm25`]
+    /// on why a stale posting can waste a lookup but never surface a
+    /// dead document.
+    pub async fn search_lexical(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        let candidates = self.bm25.read().await.search(query, top_k);
+        let mut results = Vec::with_capacity(candidates.len());
+        for (id, score) in candidates {
+            if self.vectors_db.is_deleted(id).await {
+                continue;
+            }
+            let Ok(Some(bytes)) = self.vectors_db.get_meta(id).await else {
+                continue;
+            };
+            if let Some(chunk) = Self::chunk_from_metadata(id, &bytes) {
+                results.push(SearchResult { score, chunk });
+            }
+        }
         Ok(results)
+    }
+
+    /// Hybrid retrieval: dense HNSW + BM25, fused with Reciprocal Rank
+    /// Fusion ([`crate::bm25::rrf_fuse`], `k = 60`).
+    ///
+    /// Each retriever is asked for the same candidate pool — deep
+    /// enough for RRF to see real ranking signal from both sides — and
+    /// only *ranks* are fused, so cosine scores and BM25 weights never
+    /// have to be compared. The returned score is the RRF score
+    /// (`Σ 1/(60 + rank)`, typically in `(0, ~0.033]`): monotonic in
+    /// fused rank, not a similarity.
+    pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let pool = top_k.max(HYBRID_POOL);
+
+        let dense = self.dense_hits(query, pool).await?;
+        let lexical = self.bm25.read().await.search(query, pool);
+
+        let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
+        let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
+        let fused = rrf_fuse(&[dense_ids, lexical_ids], top_k);
+
+        // Dense hits arrive with metadata attached; lexical-only
+        // candidates need a fetch (after the liveness guard).
+        let mut dense_meta: HashMap<u32, Vec<u8>> = dense
+            .into_iter()
+            .map(|hit| (hit.id, hit.metadata))
+            .collect();
+
+        let mut results = Vec::with_capacity(fused.len());
+        for (id, rrf_score) in fused {
+            let bytes = match dense_meta.remove(&id) {
+                Some(bytes) => bytes,
+                None => {
+                    if self.vectors_db.is_deleted(id).await {
+                        continue;
+                    }
+                    match self.vectors_db.get_meta(id).await {
+                        Ok(Some(bytes)) => bytes,
+                        _ => continue,
+                    }
+                }
+            };
+            if let Some(chunk) = Self::chunk_from_metadata(id, &bytes) {
+                results.push(SearchResult {
+                    score: rrf_score,
+                    chunk,
+                });
+            }
+        }
+        Ok(results)
+    }
+
+    /// Dispatches on [`SearchMode`]; the MCP tool and CLI search
+    /// command both funnel through here so the modes behave
+    /// identically everywhere.
+    pub async fn search_with_mode(
+        &self,
+        query: &str,
+        top_k: usize,
+        mode: SearchMode,
+    ) -> Result<Vec<SearchResult>> {
+        match mode {
+            SearchMode::Hybrid => self.search_hybrid(query, top_k).await,
+            SearchMode::Semantic => self.search(query, top_k).await,
+            SearchMode::Lexical => self.search_lexical(query, top_k).await,
+        }
     }
 
     /// Returns the total number of chunks stored in the database.
@@ -720,6 +903,19 @@ impl RagCore {
         // k = number of chunks for this source (much smaller than total vectors)
         let chunk_ids = self.metadata_index.get_chunk_ids(source_path).await;
         for id in chunk_ids {
+            // Lexical index removal reads the stored text *before* the
+            // tombstone lands: `remove_document` needs the exact string
+            // the postings were built from (see [`crate::bm25`]). A
+            // failed read just leaves a posting that the query-time
+            // liveness guard neutralizes.
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await
+                && let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes)
+            {
+                self.bm25
+                    .write()
+                    .await
+                    .remove_document(id, &chunk_meta.text);
+            }
             if let Err(e) = self.vectors_db.delete(id).await {
                 tracing::warn!(vector_id = id, error = %e, "Failed to delete vector");
             }
@@ -745,13 +941,11 @@ impl RagCore {
             .map_err(|e| anyhow::anyhow!("Flush failed: {}", e))
     }
 
-    /// Properly shut down the database, waiting for WAL writer to finish
-    /// and release all file locks
-    /// Properly shut down the database: persist the `.srcidx` sidecar
-    /// first (this is the quiescent point the design allows — `ops` is
-    /// held, so the tokens and maps are read with no mutator in
-    /// flight), then wait for the WAL writer to finish and release its
-    /// file locks.
+    /// Properly shut down the database: persist the `.srcidx` and
+    /// `.bm25` sidecars first (these are the quiescent points the
+    /// designs allow — `ops` is held, so tokens and payloads are read
+    /// with no mutator in flight), then wait for the WAL writer to
+    /// finish and release its file locks.
     pub async fn close(&self) -> Result<()> {
         let _ops = self.ops.lock().await;
         Self::persist_source_index(
@@ -760,6 +954,8 @@ impl RagCore {
             &self.metadata_index,
         )
         .await;
+        let bm25 = self.bm25.read().await;
+        Self::persist_bm25(&self.bm25_index_path, &self.vectors_db, &bm25).await;
         self.vectors_db
             .close()
             .await

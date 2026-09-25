@@ -29,6 +29,7 @@ struct IndexTextResponse {
 
 #[derive(Debug, serde::Serialize)]
 struct SearchResponse {
+    mode: crate::SearchMode,
     count: usize,
     results: Vec<SearchResultItem>,
 }
@@ -87,8 +88,8 @@ impl RagServer {
 
     /// Shut down the server's core: takes the write lock (draining any
     /// in-flight tool handler, which hold read locks), persists the
-    /// `.srcidx` sidecar at this quiescent point, and releases the
-    /// database file locks.
+    /// `.srcidx` and `.bm25` sidecars at this quiescent point, and
+    /// releases the database file locks.
     pub async fn close(&self) -> anyhow::Result<()> {
         let core = self.core.write().await;
         core.close().await
@@ -118,13 +119,18 @@ pub struct IndexTextRequest {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
     #[schemars(
-        description = "Natural language query. Embedded and compared against stored chunks via cosine similarity."
+        description = "Natural language query. In hybrid mode it is both embedded (cosine over HNSW) and tokenized for BM25; in semantic mode it is embedded only; in lexical mode it is tokenized only (no model invocation)."
     )]
     pub query: String,
     #[schemars(
         description = "Maximum results to return (default: 5). Higher values return more candidates but take longer."
     )]
     pub top_k: schemar_ext::Nullable<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Retrieval mode (optional; omit or null = hybrid). `hybrid`: HNSW dense + BM25 lexical ranked lists fused with Reciprocal Rank Fusion — scores are RRF weights in (0, ~0.033], monotonic in fused rank, not similarities. `semantic`: dense only, scores are cosine similarity in [0,1]. `lexical`: BM25 only, scores are unbounded BM25 weights, and the query is never embedded."
+    )]
+    pub mode: schemar_ext::Nullable<crate::SearchMode>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -259,17 +265,18 @@ impl RagServer {
     }
 
     #[tool(description = "\
-        Search the RAG knowledge base using semantic similarity. \
-        Query is embedded and compared against stored chunks via cosine similarity. \
-        Results ranked by score (0.0-1.0) with matching text, source, chunk index, and score.")]
+        Search the RAG knowledge base. By default runs hybrid search: dense HNSW retrieval and BM25 lexical retrieval are fused with Reciprocal Rank Fusion (RRF), so exact identifiers and rare terms (lexical strength) and paraphrase (semantic strength) both surface. \
+        Optional `mode`: `hybrid` (default), `semantic` (embedded cosine similarity only), `lexical` (BM25 only — no embedding, best for exact identifiers). \
+        Score meaning depends on mode: RRF weight (0, ~0.033] for hybrid, cosine [0,1] for semantic, unbounded BM25 weight for lexical. Results carry matching text, source, chunk index, and score.")]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let top_k = req.top_k.unwrap_or(5);
+        let mode = req.mode.0.unwrap_or_default();
         let result = {
             let core = self.core.read().await;
-            core.search(&req.query, top_k).await
+            core.search_with_mode(&req.query, top_k, mode).await
         };
         match result {
             Ok(results) => {
@@ -285,6 +292,7 @@ impl RagServer {
                     })
                     .collect();
                 let resp = SearchResponse {
+                    mode,
                     count: items.len(),
                     results: items,
                 };
