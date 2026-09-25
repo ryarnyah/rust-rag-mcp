@@ -74,6 +74,25 @@ Three modes, shared by the MCP `search` tool and the CLI `--mode` flag:
 | `semantic` | HNSW only | cosine similarity in `[0, 1]` |
 | `lexical` | BM25 only (no query embedding) | unbounded BM25 weight |
 
+Because an RRF weight is intentionally tiny (it encodes *rank agreement*, not similarity), every hybrid result also carries
+`components` — the raw per-retriever score and the 1-based pool rank that were fused:
+
+```json
+{
+  "score": 0.0325,
+  "components": {
+    "dense":  { "score": 0.8412, "rank": 1 },
+    "lexical": { "score": 7.1325, "rank": 2 }
+  }
+}
+```
+
+`score` is exactly `Σ 1 / (60 + rank)` over the sides present (`1/61 + 1/62` above), so you can reproduce the fused number
+and see *why* a document placed where it did — cosine and BM25 stay on their own interpretable scales. A side that is
+missing (or `null` in JSON) means the document never entered that retriever's top-50 pool. The CLI prints the same
+components inline: `(rrf, score: 0.0325; dense: 0.8412 @1, bm25: 7.1325 @2)`. Semantic and lexical results omit
+`components` — their `score` already is the raw value.
+
 ### Syntax-Aware Code Chunking
 
 Source code is parsed into an AST and chunked by semantic boundaries:

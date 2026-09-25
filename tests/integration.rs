@@ -321,6 +321,121 @@ async fn test_rag_hybrid_and_lexical_search() {
     core.close().await.unwrap();
 }
 
+/// Hybrid results carry per-retriever components (cosine + BM25, each
+/// with its 1-based pool rank) that reproduce the fused RRF score
+/// exactly — `Σ 1/(RRF_K + rank)` over the sides present — while the
+/// other modes omit components because their score already is the raw
+/// value. A query matching only one document lexically forces both
+/// "in both pools" and "dense-only" component shapes.
+#[tokio::test]
+async fn test_rag_hybrid_components_explain_rrf_score() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    core.index_text(
+        "Rust is a systems programming language focused on safety.",
+        "rust.md",
+    )
+    .await
+    .unwrap();
+    core.index_text(
+        "The parse_source_index function validates sidecar tokens.",
+        "sidecar.rs",
+    )
+    .await
+    .unwrap();
+    core.index_text("Banana bread recipes for beginners.", "cooking.txt")
+        .await
+        .unwrap();
+
+    // The query's tokens exist only in sidecar.rs, so the lexical list
+    // holds exactly one document while the dense pool (top-50 over a
+    // 3-document corpus) holds everything.
+    let hybrid = core
+        .search_with_mode("parse_source_index", 5, rust_rag_mcp::SearchMode::Hybrid)
+        .await
+        .unwrap();
+    assert!(!hybrid.is_empty());
+
+    let mut saw_both = false;
+    let mut saw_dense_only = false;
+    for result in &hybrid {
+        let components = result
+            .components
+            .as_ref()
+            .expect("hybrid results carry components");
+
+        // The components must explain the fused score bit-for-bit:
+        // the same rank values rrf_fuse consumed.
+        let recomputed: f64 = [components.dense.as_ref(), components.lexical.as_ref()]
+            .iter()
+            .flatten()
+            .map(|side| 1.0 / (rust_rag_mcp::bm25::RRF_K + side.rank as f64))
+            .sum();
+        assert!(
+            (recomputed - result.score).abs() < 1e-12,
+            "components {components:?} must reproduce score {}",
+            result.score
+        );
+
+        match (&components.dense, &components.lexical) {
+            (Some(dense), Some(lexical)) => {
+                assert!(
+                    (0.0..=1.0).contains(&dense.score),
+                    "dense component is cosine similarity, got {}",
+                    dense.score
+                );
+                assert!(
+                    lexical.score > 0.0,
+                    "lexical component is a raw BM25 weight, got {}",
+                    lexical.score
+                );
+                assert!(dense.rank >= 1 && lexical.rank >= 1, "ranks are 1-based");
+                saw_both = true;
+            }
+            (Some(dense), None) => {
+                assert!(
+                    (0.0..=1.0).contains(&dense.score),
+                    "dense component is cosine similarity, got {}",
+                    dense.score
+                );
+                assert!(dense.rank >= 1, "ranks are 1-based");
+                saw_dense_only = true;
+            }
+            (None, _) => panic!(
+                "dense pool covers the whole corpus; {} cannot be lexical-only",
+                result.chunk.source
+            ),
+        }
+    }
+    assert!(
+        saw_both,
+        "sidecar.rs matched both retrievers and must show both components"
+    );
+    assert!(
+        saw_dense_only,
+        "documents without query-token overlap must show dense-only components"
+    );
+
+    // Non-hybrid modes: score is already interpretable, no components.
+    for mode in [
+        rust_rag_mcp::SearchMode::Semantic,
+        rust_rag_mcp::SearchMode::Lexical,
+    ] {
+        let results = core
+            .search_with_mode("parse_source_index", 5, mode)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results.iter().all(|r| r.components.is_none()),
+            "{mode:?} must not carry hybrid components"
+        );
+    }
+
+    core.close().await.unwrap();
+}
+
 /// Deleting a source must drop it from the lexical index too — both
 /// via the in-process `remove_document` wiring and (as backstop) the
 /// query-time liveness guard — while leaving other sources intact.

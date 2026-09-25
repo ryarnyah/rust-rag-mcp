@@ -38,6 +38,11 @@ struct SearchResponse {
 struct SearchResultItem {
     rank: usize,
     score: f64,
+    /// Hybrid only: the per-retriever (dense cosine / BM25) scores and
+    /// ranks behind the RRF weight. Omitted for other modes, whose
+    /// `score` already is the raw value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    components: Option<crate::HybridScoreComponents>,
     source: String,
     chunk_index: u32,
     text: String,
@@ -267,7 +272,7 @@ impl RagServer {
     #[tool(description = "\
         Search the RAG knowledge base. By default runs hybrid search: dense HNSW retrieval and BM25 lexical retrieval are fused with Reciprocal Rank Fusion (RRF), so exact identifiers and rare terms (lexical strength) and paraphrase (semantic strength) both surface. \
         Optional `mode`: `hybrid` (default), `semantic` (embedded cosine similarity only), `lexical` (BM25 only — no embedding, best for exact identifiers). \
-        Score meaning depends on mode: RRF weight (0, ~0.033] for hybrid, cosine [0,1] for semantic, unbounded BM25 weight for lexical. Results carry matching text, source, chunk index, and score.")]
+        Score meaning depends on mode: RRF weight (0, ~0.033] for hybrid, cosine [0,1] for semantic, unbounded BM25 weight for lexical. In hybrid mode each result also carries `components` — the dense cosine score/rank and BM25 weight/rank that were fused (a side is null when the document missed that retriever's top-pool). Results carry matching text, source, chunk index, and score.")]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -286,6 +291,7 @@ impl RagServer {
                     .map(|(i, r)| SearchResultItem {
                         rank: i + 1,
                         score: r.score,
+                        components: r.components.clone(),
                         source: r.chunk.source.clone(),
                         chunk_index: r.chunk.chunk_index,
                         text: r.chunk.text.clone(),

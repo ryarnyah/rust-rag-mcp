@@ -4,7 +4,10 @@ use crate::docs;
 use crate::embeddings::EmbeddingService;
 use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig, SearchHitOwned};
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
-use crate::{DocumentChunk, DocumentStatus, IndexResult, SearchMode, SearchResult};
+use crate::{
+    DocumentChunk, DocumentStatus, HybridScoreComponents, IndexResult, RetrieverScore, SearchMode,
+    SearchResult,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -782,6 +785,7 @@ impl RagCore {
                 Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
                     score: hit.score as f64,
                     chunk,
+                    components: None,
                 })
             })
             .collect())
@@ -806,7 +810,11 @@ impl RagCore {
                 continue;
             };
             if let Some(chunk) = Self::chunk_from_metadata(id, &bytes) {
-                results.push(SearchResult { score, chunk });
+                results.push(SearchResult {
+                    score,
+                    chunk,
+                    components: None,
+                });
             }
         }
         Ok(results)
@@ -821,6 +829,12 @@ impl RagCore {
     /// have to be compared. The returned score is the RRF score
     /// (`Σ 1/(60 + rank)`, typically in `(0, ~0.033]`): monotonic in
     /// fused rank, not a similarity.
+    ///
+    /// Because the fused number alone is hard to interpret, every
+    /// result also carries [`SearchResult::components`]: the raw
+    /// cosine/BM25 scores and the 1-based pool ranks that were fused,
+    /// so callers can reproduce `score` and see why a document ranked
+    /// where it did.
     pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         if top_k == 0 {
             return Ok(Vec::new());
@@ -832,6 +846,37 @@ impl RagCore {
 
         let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
         let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
+
+        // Per-retriever components indexed with the *same* enumerate
+        // ranks rrf_fuse consumes (rank = index + 1 over these exact
+        // lists), so `Σ 1/(RRF_K + rank)` over the sides present
+        // reproduces the fused score bit-for-bit.
+        let dense_sides: HashMap<u32, RetrieverScore> = dense
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| {
+                (
+                    hit.id,
+                    RetrieverScore {
+                        score: hit.score as f64,
+                        rank: i as u32 + 1,
+                    },
+                )
+            })
+            .collect();
+        let lexical_sides: HashMap<u32, RetrieverScore> = lexical
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, score))| {
+                (
+                    id,
+                    RetrieverScore {
+                        score,
+                        rank: i as u32 + 1,
+                    },
+                )
+            })
+            .collect();
         let fused = rrf_fuse(&[dense_ids, lexical_ids], top_k);
 
         // Dense hits arrive with metadata attached; lexical-only
@@ -859,6 +904,10 @@ impl RagCore {
                 results.push(SearchResult {
                     score: rrf_score,
                     chunk,
+                    components: Some(HybridScoreComponents {
+                        dense: dense_sides.get(&id).cloned(),
+                        lexical: lexical_sides.get(&id).cloned(),
+                    }),
                 });
             }
         }

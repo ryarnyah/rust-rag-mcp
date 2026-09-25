@@ -274,8 +274,25 @@ async fn main() -> anyhow::Result<()> {
                 println!("No results found.");
             } else {
                 for (i, result) in results.iter().enumerate() {
+                    // Hybrid results explain their RRF weight with the
+                    // per-retriever score @ rank behind it; a missing
+                    // side ("—") never entered that retriever's pool.
+                    let components = match &result.components {
+                        Some(c) => format!(
+                            "; dense: {}, bm25: {}",
+                            match &c.dense {
+                                Some(side) => format!("{:.4} @{}", side.score, side.rank),
+                                None => "—".to_string(),
+                            },
+                            match &c.lexical {
+                                Some(side) => format!("{:.4} @{}", side.score, side.rank),
+                                None => "—".to_string(),
+                            },
+                        ),
+                        None => String::new(),
+                    };
                     println!(
-                        "[{}] ({}, score: {:.4}) [{}:{}] {}",
+                        "[{}] ({}, score: {:.4}{}) [{}:{}] {}",
                         i + 1,
                         match mode {
                             SearchMode::Hybrid => "rrf",
@@ -283,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
                             SearchMode::Lexical => "bm25",
                         },
                         result.score,
+                        components,
                         result.chunk.source,
                         result.chunk.chunk_index,
                         result.chunk.text,
