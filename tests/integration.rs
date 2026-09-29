@@ -936,3 +936,102 @@ fn test_chunker_offset_accuracy() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn bench_metadata_snapshot() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[derive(Clone)]
+    struct MetadataIndex {
+        source_to_ids: Arc<RwLock<HashMap<String, Vec<u32>>>>,
+    }
+
+    let idx = MetadataIndex {
+        source_to_ids: Arc::new(RwLock::new(HashMap::new())),
+    };
+
+    // Setup: 1000 sources with 100 IDs each
+    {
+        let mut map = idx.source_to_ids.write().await;
+        for s in 0..1000 {
+            let source = format!("source_{}", s);
+            let ids: Vec<u32> = (0..100).collect();
+            map.insert(source, ids);
+        }
+    }
+
+    // Benchmark: 100 snapshots
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let map = idx.source_to_ids.read().await;
+        let mut entries: Vec<(String, Vec<u32>)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort();
+        let _ = entries;
+    }
+    let elapsed = start.elapsed();
+    println!("Baseline (100 snapshots of 1000 sources): {:.2} ms", elapsed.as_secs_f64() * 1000.0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_chunker_performance() {
+    use rust_rag_mcp::chunker::Chunker;
+    use std::time::Instant;
+
+    let chunker = Chunker::new(512, 64);
+
+    // Generate large text document
+    let words: Vec<String> = (0..10000).map(|i| format!("word_{}", i)).collect();
+    let large_text = words.join(" ");
+
+    // Benchmark: 100 iterations of chunking
+    let start = Instant::now();
+    for _ in 0..100 {
+        let _ = chunker.chunk_text(&large_text, "test.txt");
+    }
+    let elapsed = start.elapsed();
+    
+    let avg_ms = elapsed.as_secs_f64() / 100.0 * 1000.0;
+    println!("Chunker (10k words, 100 iterations): {:?}", elapsed);
+    println!("Per-iteration: {:.4} ms", avg_ms);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_search_ef_scaling() {
+    use rust_rag_mcp::r_vector::{AsyncVectorDb, Config};
+    use std::time::Instant;
+
+    let cfg = Config::new(384).with_m(16).with_ef_construction(200);
+    let db = AsyncVectorDb::open("test_ef_scale.db", cfg).await.unwrap();
+
+    // Insert 1000 vectors
+    for i in 0..1000 {
+        let v: Vec<f32> = (0..384)
+            .map(|j| (((i * 13 + j * 17) % 1000) as f32 / 1000.0))
+            .collect();
+        let _ = db.insert(&v, Some(format!("doc_{}", i).as_bytes())).await;
+    }
+
+    let query: Vec<f32> = (0..384).map(|_| 0.5).collect();
+
+    // Benchmark different k values with adaptive ef_search
+    let k_values = vec![1, 10, 50, 100, 500];
+    for k in k_values {
+        let start = Instant::now();
+        for _ in 0..10 {
+            let _ = db.search(&query, k, 200).await; // static ef for comparison
+        }
+        let elapsed = start.elapsed();
+        println!("Search k={:3}: 10x avg {:.3} ms", k, elapsed.as_secs_f64() / 10.0 * 1000.0);
+    }
+
+    let _ = std::fs::remove_file("test_ef_scale.db");
+    let _ = std::fs::remove_file("test_ef_scale.db.hnsw");
+    let _ = std::fs::remove_file("test_ef_scale.db.meta");
+    let _ = std::fs::remove_file("test_ef_scale.db.wal");
+}
