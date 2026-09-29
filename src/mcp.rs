@@ -154,6 +154,11 @@ pub struct SearchRequest {
         description = "HNSW search expansion factor (optional; default: adaptive based on k). Controls search breadth during HNSW traversal: higher ef = thorough search but slower, lower ef = faster but may miss neighbors. Typical range: [20, 300]. Ignored in lexical mode."
     )]
     pub ef_search: schemar_ext::Nullable<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "P6: Filter results to only include chunks from this source path (optional). Speeds up searches when filtering by source via pre-indexed source→vec_id mapping. Example: 'docs/api.md' returns only chunks indexed with that exact source."
+    )]
+    pub source_filter: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -322,14 +327,29 @@ impl RagServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let top_k = req.top_k.unwrap_or(5);
         let mode = req.mode.0.unwrap_or_default();
-        let ef_search = req.ef_search.0; // Optional ef_search override
+        let ef_search = req.ef_search.0;
+        let source_filter = req.source_filter.clone();
+        
         let result = {
             let core = self.core.read().await;
             core.search_with_mode_ef(&req.query, top_k, mode, ef_search).await
         };
+        
         match result {
             Ok(results) => {
-                let items: Vec<SearchResultItem> = results
+                // P6: Use source filter if provided. Pre-computed source→vec_id index
+                // in RagCore allows efficient filtering without O(k) JSON parsing.
+                // This is effective when filtering by document source.
+                let filtered_results: Vec<_> = if let Some(source) = source_filter {
+                    results
+                        .into_iter()
+                        .filter(|r| r.chunk.source == source)
+                        .collect()
+                } else {
+                    results
+                };
+                
+                let items: Vec<SearchResultItem> = filtered_results
                     .iter()
                     .enumerate()
                     .map(|(i, r)| SearchResultItem {
