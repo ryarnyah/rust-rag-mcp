@@ -274,6 +274,11 @@ impl Bm25Index {
         if ranked.len() > k && k < ranked.len() / 4 {
             // Use partial sort (select + sort top-k) for large result sets
             if k > 0 {
+                tracing::debug!(
+                    candidates = ranked.len(),
+                    top_k = k,
+                    "BM25: using partial sort optimization"
+                );
                 let (_, _, _) = ranked.select_nth_unstable_by(k - 1, |a, b| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -288,6 +293,11 @@ impl Bm25Index {
             }
         } else {
             // For small result sets, full sort is simpler and nearly as fast
+            tracing::debug!(
+                candidates = ranked.len(),
+                top_k = k,
+                "BM25: using full sort (small result set)"
+            );
             ranked.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)

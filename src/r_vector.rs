@@ -2323,7 +2323,14 @@ impl VectorDb {
                 WalOpType::Insert => {
                     if (record.vector_id as usize) >= self.len() {
                         // Vector not yet in file, full insert
-                        self.insert_from_wal(&record)?;
+                        if let Err(e) = self.insert_from_wal(&record) {
+                            tracing::warn!(
+                                vector_id = record.vector_id,
+                                error = %e,
+                                "WAL recovery: failed to insert vector, continuing"
+                            );
+                            continue;
+                        }
                         recovered_count += 1;
                     } else if self.meta.get(record.vector_id).is_none() {
                         // Vector data exists but metadata missing (data flushed
@@ -2932,6 +2939,12 @@ impl VectorDb {
         self.index.mark_deleted(id);
         self.deleted_count += 1;
 
+        tracing::info!(
+            vector_id = id,
+            deleted_count_total = self.deleted_count,
+            "Vector deleted (soft tombstone)"
+        );
+
         Ok(true)
     }
 
@@ -2963,6 +2976,11 @@ impl VectorDb {
         ef: usize,
     ) -> Result<Vec<(u32, f32)>> {
         if query.len() != self.cfg.dim {
+            tracing::warn!(
+                expected_dim = self.cfg.dim,
+                got_dim = query.len(),
+                "Query dimension mismatch; embedding config mismatch?"
+            );
             return Err(VectorDbError::DimensionMismatch {
                 expected: self.cfg.dim,
                 got: query.len(),
