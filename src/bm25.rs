@@ -171,25 +171,25 @@ impl Bm25Index {
         }
 
         let tokens = tokenize(text);
+        let tokens_len = tokens.len();
 
         // Term frequencies for this document.
-        let mut tf: HashMap<&str, u32> = HashMap::with_capacity(tokens.len());
-        for token in &tokens {
-            *tf.entry(token.as_str()).or_insert(0) += 1;
+        // P5: Use BTreeMap instead of HashMap for better cache locality
+        // and naturally sorted iteration when updating postings.
+        let mut tf: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for token in tokens {
+            *tf.entry(token).or_insert(0) += 1;
         }
 
-        // P4: Optimize string allocation by reusing term Strings from tokens
-        // instead of cloning &str. Avoids per-term allocation in hot path.
+        // Iterate in sorted order (naturally deduped by BTreeMap keys)
         for (term, freq) in tf {
-            use std::borrow::Cow;
-            let term_owned = Cow::Borrowed(term);
             self.postings
-                .entry(term_owned.into_owned())
+                .entry(term)
                 .or_default()
                 .push((id, freq));
         }
-        self.total_len += tokens.len() as u64;
-        self.doc_len.insert(id, tokens.len() as u32);
+        self.total_len += tokens_len as u64;
+        self.doc_len.insert(id, tokens_len as u32);
     }
 
     /// Removes a document from the index.

@@ -924,28 +924,25 @@ impl RagCore {
 
         // Dense hits arrive with metadata attached; lexical-only
         // candidates need a fetch (after the liveness guard).
-        // P4: Cache deserialized DocumentChunks to avoid re-parsing on retrieval
-        let mut dense_meta: HashMap<u32, (Vec<u8>, Option<DocumentChunk>)> = dense
+        // P5: Cache raw metadata only, deserialize lazily for final top-k results
+        // Avoids parsing pool-sized results when only top_k are needed
+        let dense_meta: HashMap<u32, Vec<u8>> = dense
             .into_iter()
-            .map(|hit| {
-                let chunk = Self::chunk_from_metadata(hit.id, &hit.metadata);
-                (hit.id, (hit.metadata, chunk))
-            })
+            .map(|hit| (hit.id, hit.metadata))
             .collect();
 
         let mut results = Vec::with_capacity(fused.len());
         for (id, rrf_score) in fused {
-            let chunk = match dense_meta.remove(&id) {
-                Some((_, Some(chunk))) => Some(chunk),
-                Some((_, None)) => None, // cached as unparsable
-                None => {
-                    if self.vectors_db.is_deleted(id).await {
-                        continue;
-                    }
-                    match self.vectors_db.get_meta(id).await {
-                        Ok(Some(bytes)) => Self::chunk_from_metadata(id, &bytes),
-                        _ => continue,
-                    }
+            let chunk = if let Some(raw_bytes) = dense_meta.get(&id) {
+                // Deserialize only for final top-k results
+                Self::chunk_from_metadata(id, raw_bytes)
+            } else {
+                if self.vectors_db.is_deleted(id).await {
+                    continue;
+                }
+                match self.vectors_db.get_meta(id).await {
+                    Ok(Some(bytes)) => Self::chunk_from_metadata(id, &bytes),
+                    _ => continue,
                 }
             };
             if let Some(chunk) = chunk {
