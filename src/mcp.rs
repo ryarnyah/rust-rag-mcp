@@ -149,6 +149,11 @@ pub struct SearchRequest {
         description = "Retrieval mode (optional; omit or null = hybrid). `hybrid`: HNSW dense + BM25 lexical ranked lists fused with Reciprocal Rank Fusion — scores are RRF weights in (0, ~0.033], monotonic in fused rank, not similarities. `semantic`: dense only, scores are cosine similarity in [0,1]. `lexical`: BM25 only, scores are unbounded BM25 weights, and the query is never embedded."
     )]
     pub mode: schemar_ext::Nullable<crate::SearchMode>,
+    #[serde(default)]
+    #[schemars(
+        description = "HNSW search expansion factor (optional; default: adaptive based on k). Controls search breadth during HNSW traversal: higher ef = thorough search but slower, lower ef = faster but may miss neighbors. Typical range: [20, 300]. Ignored in lexical mode."
+    )]
+    pub ef_search: schemar_ext::Nullable<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -317,9 +322,10 @@ impl RagServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let top_k = req.top_k.unwrap_or(5);
         let mode = req.mode.0.unwrap_or_default();
+        let ef_search = req.ef_search.0; // Optional ef_search override
         let result = {
             let core = self.core.read().await;
-            core.search_with_mode(&req.query, top_k, mode).await
+            core.search_with_mode_ef(&req.query, top_k, mode, ef_search).await
         };
         match result {
             Ok(results) => {

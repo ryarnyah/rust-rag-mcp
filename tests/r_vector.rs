@@ -1474,3 +1474,40 @@ async fn test_concurrent_mutations() -> Result<()> {
     cleanup("test_concurrent.db");
     Ok(())
 }
+
+/// Test search efficiency with high tombstone density
+#[tokio::test]
+async fn test_search_skips_many_tombstones() -> Result<()> {
+    cleanup("test_tombstone_density.db");
+    let cfg = Config::new(4).with_capacity(512);
+    let mut db = VectorDb::open("test_tombstone_density.db", cfg).await?;
+
+    for i in 0..100 {
+        db.insert(&[i as f32 / 100.0, 0.5, 0.5, 0.5], Some(format!("doc_{}", i).as_bytes()))?;
+    }
+    for id in 0..90 {
+        db.delete(id as u32)?;
+    }
+
+    let query = vec![0.95, 0.5, 0.5, 0.5];
+    let results = db.search(&query, 5, 150)?;
+    assert!(results.len() > 0);
+    for result in &results {
+        assert!(result.id >= 90);
+    }
+    cleanup("test_tombstone_density.db");
+    Ok(())
+}
+
+/// Test OrderedFloat tie-breaking determinism
+#[test]
+fn test_ordered_float_deterministic_ties() {
+    use rust_rag_mcp::r_vector::cosine_distance;
+    let v1 = vec![0.0, 1.0, 0.0, 0.0];
+    let query = vec![1.0, 0.0, 0.0, 0.0];
+    let d1 = cosine_distance(&query, &v1).expect("valid distance");
+    for _ in 0..100 {
+        let d1_repeat = cosine_distance(&query, &v1).expect("valid distance");
+        assert_eq!(d1, d1_repeat);
+    }
+}

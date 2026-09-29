@@ -773,11 +773,35 @@ impl RagCore {
              (base * 50.0 + 40.0).ceil() as u32
          }.clamp(40, 250);
 
-        Ok(self
-            .vectors_db
-            .search(&query_embedding, k, ef as usize)
-            .await?)
-    }
+         Ok(self
+             .vectors_db
+             .search(&query_embedding, k, ef as usize)
+             .await?)
+     }
+
+     /// Dense hits with optional ef_search override (None = adaptive scaling).
+     async fn dense_hits_ef(&self, query: &str, k: usize, ef_search: Option<usize>) -> Result<Vec<SearchHitOwned>> {
+         let query_embedding = self.embedding.embed_query(query).await?;
+
+         if query_embedding.is_empty() {
+             return Err(anyhow::anyhow!("Failed to generate query embedding"));
+         }
+
+         // Use explicit ef_search if provided, otherwise use adaptive scaling
+         let ef = match ef_search {
+             Some(ef) => ef,
+             None => {
+                 // Adaptive ef_search based on k with diminishing returns
+                 let base = (k as f32).log2().max(1.0);
+                 (base * 50.0 + 40.0).ceil() as u32 as usize
+             }
+         };
+
+         Ok(self
+             .vectors_db
+             .search(&query_embedding, k, ef)
+             .await?)
+     }
 
     /// Extracts the [`DocumentChunk`] out of a vector's serialized
     /// metadata; `None` (with a warning, never a hard error) covers
@@ -803,20 +827,25 @@ impl RagCore {
         }
     }
 
-    /// Performs a semantic search for the given query string, returning the top_k most relevant results.
-    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        let hits = self.dense_hits(query, top_k).await?;
-        Ok(hits
-            .into_iter()
-            .filter_map(|hit| {
-                Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
-                    score: hit.score as f64,
-                    chunk,
-                    components: None,
-                })
-            })
-            .collect())
-    }
+     /// Performs a semantic search for the given query string, returning the top_k most relevant results.
+     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+         self.search_ef(query, top_k, None).await
+     }
+
+     /// Semantic search with optional ef_search override (None = adaptive scaling).
+     async fn search_ef(&self, query: &str, top_k: usize, ef_search: Option<usize>) -> Result<Vec<SearchResult>> {
+         let hits = self.dense_hits_ef(query, top_k, ef_search).await?;
+         Ok(hits
+             .into_iter()
+             .filter_map(|hit| {
+                 Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
+                     score: hit.score as f64,
+                     chunk,
+                     components: None,
+                 })
+             })
+             .collect())
+     }
 
     /// BM25-only retrieval: no embedding, so no model invocation at
     /// all. Scores are raw BM25 weights (unbounded, comparable only
@@ -862,14 +891,19 @@ impl RagCore {
     /// cosine/BM25 scores and the 1-based pool ranks that were fused,
     /// so callers can reproduce `score` and see why a document ranked
     /// where it did.
-    pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        let pool = top_k.max(HYBRID_POOL);
+     pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+         self.search_hybrid_ef(query, top_k, None).await
+     }
 
-        let dense = self.dense_hits(query, pool).await?;
-        let lexical = self.bm25.read().await.search(query, pool);
+     /// Hybrid search with optional ef_search override (None = adaptive scaling).
+     async fn search_hybrid_ef(&self, query: &str, top_k: usize, ef_search: Option<usize>) -> Result<Vec<SearchResult>> {
+         if top_k == 0 {
+             return Ok(Vec::new());
+         }
+         let pool = top_k.max(HYBRID_POOL);
+
+         let dense = self.dense_hits_ef(query, pool, ef_search).await?;
+         let lexical = self.bm25.read().await.search(query, pool);
 
         let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
         let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
@@ -944,18 +978,30 @@ impl RagCore {
     /// Dispatches on [`SearchMode`]; the MCP tool and CLI search
     /// command both funnel through here so the modes behave
     /// identically everywhere.
-    pub async fn search_with_mode(
-        &self,
-        query: &str,
-        top_k: usize,
-        mode: SearchMode,
-    ) -> Result<Vec<SearchResult>> {
-        match mode {
-            SearchMode::Hybrid => self.search_hybrid(query, top_k).await,
-            SearchMode::Semantic => self.search(query, top_k).await,
-            SearchMode::Lexical => self.search_lexical(query, top_k).await,
-        }
-    }
+     pub async fn search_with_mode(
+         &self,
+         query: &str,
+         top_k: usize,
+         mode: SearchMode,
+     ) -> Result<Vec<SearchResult>> {
+         self.search_with_mode_ef(query, top_k, mode, None).await
+     }
+
+     /// Same as search_with_mode but with explicit ef_search control (optional).
+     /// If ef_search is None, uses adaptive scaling (see dense_hits).
+     pub async fn search_with_mode_ef(
+         &self,
+         query: &str,
+         top_k: usize,
+         mode: SearchMode,
+         ef_search: Option<usize>,
+     ) -> Result<Vec<SearchResult>> {
+         match mode {
+             SearchMode::Hybrid => self.search_hybrid_ef(query, top_k, ef_search).await,
+             SearchMode::Semantic => self.search_ef(query, top_k, ef_search).await,
+             SearchMode::Lexical => self.search_lexical(query, top_k).await, // lexical ignores ef
+         }
+     }
 
     /// Returns the total number of chunks stored in the database.
     pub async fn chunk_count(&self) -> Result<usize> {
