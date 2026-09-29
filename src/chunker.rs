@@ -37,19 +37,20 @@ impl Chunker {
             return Vec::new();
         }
 
-        let mut chunks = Vec::new();
-        let mut char_offset = 0usize;
+        // P4: Precompute word positions to avoid O(n) text.find() per position.
+        // Scan text once to record (byte_start, byte_end) for each word.
         let mut word_positions: Vec<(usize, usize)> = Vec::with_capacity(words.len());
-
+        let mut byte_pos = 0;
         for word in &words {
-            let start = text[char_offset..]
-                .find(word)
-                .map(|i| i + char_offset)
-                .unwrap_or(char_offset);
-            word_positions.push((start, start + word.len()));
-            char_offset = start + word.len();
+            if let Some(idx) = text[byte_pos..].find(word) {
+                let start = byte_pos + idx;
+                let end = start + word.len();
+                word_positions.push((start, end));
+                byte_pos = end;
+            }
         }
 
+        let mut chunks = Vec::new();
         let mut start_word = 0;
 
         while start_word < words.len() {
