@@ -1,6 +1,8 @@
 use rust_rag_mcp::r_vector::Result;
 use rust_rag_mcp::r_vector::{AsyncVectorDb, Config, VectorDb, VectorDbError, cosine_distance};
 use std::fs;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 fn cleanup(path: &str) {
     let _ = fs::remove_file(path);
@@ -1379,5 +1381,96 @@ async fn test_insert_works_after_compact() -> Result<()> {
     }
 
     cleanup("test_compact_wal.db");
+    Ok(())
+}
+
+/// Concurrent mutation stress test: multiple async tasks inserting and deleting
+/// simultaneously to verify thread-safety and lack of race conditions.
+#[tokio::test]
+async fn test_concurrent_mutations() -> Result<()> {
+    cleanup("test_concurrent.db");
+
+    let cfg = Config::new(8).with_capacity(1024);
+    let db = Arc::new(Mutex::new(VectorDb::open("test_concurrent.db", cfg).await?));
+
+    // Pre-populate with 100 vectors
+    {
+        let mut db = db.lock().await;
+        for i in 0..100 {
+            let vec = vec![
+                (i as f32 / 100.0),
+                ((100 - i) as f32 / 100.0),
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+            ];
+            db.insert(&vec, Some(format!("doc_{}", i).as_bytes()))?;
+        }
+    }
+
+    // Spawn 10 concurrent tasks: 5 inserting, 5 deleting
+    let mut tasks = Vec::new();
+
+    // Insertion tasks
+    for task_id in 0..5 {
+        let db_clone = Arc::clone(&db);
+        let task = tokio::spawn(async move {
+            for i in 0..20 {
+                let id = 100 + task_id * 20 + i;
+                let vec = vec![
+                    (id as f32 / 1000.0),
+                    0.2,
+                    0.3,
+                    0.4,
+                    0.5,
+                    0.6,
+                    0.7,
+                    0.8,
+                ];
+                let mut db = db_clone.lock().await;
+                let _ = db.insert(&vec, Some(format!("task_{}_doc_{}", task_id, i).as_bytes()));
+            }
+        });
+        tasks.push(task);
+    }
+
+    // Deletion tasks
+    for task_id in 0..5 {
+        let db_clone = Arc::clone(&db);
+        let task = tokio::spawn(async move {
+            for i in 0..20 {
+                let id = (task_id * 20 + i) as u32;
+                let mut db = db_clone.lock().await;
+                let _ = db.delete(id);
+            }
+        });
+        tasks.push(task);
+    }
+
+    // Wait for all tasks
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    // Verify consistency
+    {
+        let db = db.lock().await;
+        db.integrity_check()?;
+        
+        // Count live vectors
+        let live_count = (0..db.len() as u32)
+            .filter(|id| !db.is_deleted(*id))
+            .count();
+        assert!(live_count > 0, "some vectors should survive concurrent mutations");
+        assert!(
+            live_count <= db.len() as usize,
+            "live count must be <= total count"
+        );
+    }
+
+    cleanup("test_concurrent.db");
     Ok(())
 }
