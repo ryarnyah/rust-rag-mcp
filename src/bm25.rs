@@ -271,11 +271,12 @@ impl Bm25Index {
             }
         }
 
-        // P4: Use partial sort instead of full sort when k << n
+        // P11: Use partial sort instead of full sort when k << n
         // select_nth_unstable_by is ~10x faster for selecting top-k from large sets
+        // Lower threshold from k < len/4 to k < len/3 for more aggressive optimization
         let mut ranked: Vec<(u32, f64)> = scores.into_iter().collect();
         
-        if ranked.len() > k && k < ranked.len() / 4 {
+        if ranked.len() > k && k < ranked.len() / 3 {
             // Use partial sort (select + sort top-k) for large result sets
             if k > 0 {
                 tracing::debug!(
