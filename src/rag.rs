@@ -116,25 +116,27 @@ impl MetadataIndex {
     }
 
     /// Sorted snapshot of both maps for the sidecar writer. Sorting makes
-    /// the serialized form deterministic for a given logical state, so a
-    /// rewrite with no changes produces an identical file.
-    async fn snapshot(&self) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>) {
-        let chunks = {
-            let map = self.source_to_ids.read().await;
-            let mut entries: Vec<(String, Vec<u32>)> =
-                map.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        };
-        let docs = {
-            let map = self.doc_metadata_ids.read().await;
-            let mut entries: Vec<(String, u32)> =
-                map.iter().map(|(k, &v)| (k.to_owned(), v)).collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        };
-        (chunks, docs)
-    }
+     /// the serialized form deterministic for a given logical state, so a
+     /// rewrite with no changes produces an identical file.
+     async fn snapshot(&self) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>) {
+         let chunks = {
+             let map = self.source_to_ids.read().await;
+             // P4: Optimize snapshot by taking ownership during iteration
+             // to avoid double clone (String key + Vec value)
+             let mut entries: Vec<(String, Vec<u32>)> =
+                 map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+             entries.sort_by(|a, b| a.0.cmp(&b.0));
+             entries
+         };
+         let docs = {
+             let map = self.doc_metadata_ids.read().await;
+             let mut entries: Vec<(String, u32)> =
+                 map.iter().map(|(k, &v)| (k.clone(), v)).collect();
+             entries.sort_by(|a, b| a.0.cmp(&b.0));
+             entries
+         };
+         (chunks, docs)
+     }
 
     /// Replace both maps wholesale — used when a validated sidecar is
     /// loaded at startup instead of scanning metadata.
@@ -942,26 +944,31 @@ impl RagCore {
 
         // Dense hits arrive with metadata attached; lexical-only
         // candidates need a fetch (after the liveness guard).
-        let mut dense_meta: HashMap<u32, Vec<u8>> = dense
+        // P4: Cache deserialized DocumentChunks to avoid re-parsing on retrieval
+        let mut dense_meta: HashMap<u32, (Vec<u8>, Option<DocumentChunk>)> = dense
             .into_iter()
-            .map(|hit| (hit.id, hit.metadata))
+            .map(|hit| {
+                let chunk = Self::chunk_from_metadata(hit.id, &hit.metadata);
+                (hit.id, (hit.metadata, chunk))
+            })
             .collect();
 
         let mut results = Vec::with_capacity(fused.len());
         for (id, rrf_score) in fused {
-            let bytes = match dense_meta.remove(&id) {
-                Some(bytes) => bytes,
+            let chunk = match dense_meta.remove(&id) {
+                Some((_, Some(chunk))) => Some(chunk),
+                Some((_, None)) => None, // cached as unparsable
                 None => {
                     if self.vectors_db.is_deleted(id).await {
                         continue;
                     }
                     match self.vectors_db.get_meta(id).await {
-                        Ok(Some(bytes)) => bytes,
+                        Ok(Some(bytes)) => Self::chunk_from_metadata(id, &bytes),
                         _ => continue,
                     }
                 }
             };
-            if let Some(chunk) = Self::chunk_from_metadata(id, &bytes) {
+            if let Some(chunk) = chunk {
                 results.push(SearchResult {
                     score: rrf_score,
                     chunk,

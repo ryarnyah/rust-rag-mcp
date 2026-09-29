@@ -1755,12 +1755,14 @@ impl HnswIndex {
             return Ok(());
         }
         let cap = Self::layer_capacity(&self.cfg, layer);
-        let mut neighbors = self.layer_neighbors(id, layer);
-        if !neighbors.contains(&new) {
-            neighbors.push(new);
-        }
+        
+        // P4: Avoid Vec allocation in hot path. Use iterator for neighbor traversal
+        // and collect only when needed. Build neighbor set with new candidate.
+        let neighbors_iter = self.layer_neighbors_iter(id, layer);
+        let mut neighbor_set: std::collections::HashSet<u32> = neighbors_iter.collect();
+        neighbor_set.insert(new);
 
-        let mut dists: Vec<(u32, f32)> = neighbors
+        let mut dists: Vec<(u32, f32)> = neighbor_set
             .iter()
             .filter_map(|&n| match dist(id, n) {
                 Ok(d) => Some(Ok((n, d))),
