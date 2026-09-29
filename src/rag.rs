@@ -42,6 +42,13 @@ use tokio::sync::{Mutex, RwLock};
 ///   compaction being unreachable through `RagCore` is load-bearing:
 ///   wiring it up would need the maps renumbered in lockstep, sidecar
 ///   included — and a generation token compaction cannot forge.
+///   
+///   *FUTURE OPTIMIZATION (P5):* To eliminate this edge case, track an
+///   explicit generation counter (u64) that increments on every mutation,
+///   not just when len/record_count change. This trades sidecar size
+///   (8 more bytes) for guaranteed uniqueness, eliminating the need for
+///   compaction to be hidden from the API.
+///
 /// - *When it is written*: only at quiescent points — after a startup
 ///   rebuild, and in `close()` with the `ops` mutex held, which every
 ///   mutator also holds, so tokens can never race the maps. A crash
@@ -115,15 +122,15 @@ impl MetadataIndex {
         let chunks = {
             let map = self.source_to_ids.read().await;
             let mut entries: Vec<(String, Vec<u32>)> =
-                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            entries.sort();
+                map.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
         };
         let docs = {
             let map = self.doc_metadata_ids.read().await;
             let mut entries: Vec<(String, u32)> =
-                map.iter().map(|(k, &v)| (k.clone(), v)).collect();
-            entries.sort();
+                map.iter().map(|(k, &v)| (k.to_owned(), v)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
         };
         (chunks, docs)
@@ -753,9 +760,18 @@ impl RagCore {
             return Err(anyhow::anyhow!("Failed to generate query embedding"));
         }
 
-        // P5: Adaptive ef_search based on k
-        // Small k: use lower ef (faster), large k: use higher ef (more thorough)
-        let ef = (k as u32 * 4).clamp(40, 200);
+         // P5: Adaptive ef_search based on k with diminishing returns
+         // ef_search = ef_construction parameter during query to control search breadth.
+         // Higher ef = more thorough search but slower; lower ef = faster but may miss neighbors.
+         //
+         // Strategy: Use logarithmic scaling so we don't waste cycles on very large k.
+         // - k=1-10: ef = 40-100 (tight beam, fast)
+         // - k=10-100: ef = 100-200 (wider beam, thorough)
+         // - k=100+: ef capped at 250 (search_layer won't visit more than needed)
+         let ef = {
+             let base = (k as f32).log2().max(1.0);
+             (base * 50.0 + 40.0).ceil() as u32
+         }.clamp(40, 250);
 
         Ok(self
             .vectors_db
