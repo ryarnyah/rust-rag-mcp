@@ -892,9 +892,9 @@ impl RagCore {
         let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
         let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
 
-        // P5: Avoid HashMap allocations by using Vec with position indexing
-        // Only convert to lookup structure for final top-k result processing
-        let dense_with_scores: Vec<_> = dense
+        // P7: Use HashMap for O(1) score lookups instead of Vec::find() O(pool)
+        // This eliminates 2*fused.len() linear searches during result collection
+        let dense_with_scores: HashMap<u32, RetrieverScore> = dense
             .iter()
             .enumerate()
             .map(|(i, hit)| {
@@ -907,7 +907,7 @@ impl RagCore {
                 )
             })
             .collect();
-        let lexical_with_scores: Vec<_> = lexical
+        let lexical_with_scores: HashMap<u32, RetrieverScore> = lexical
             .iter()
             .enumerate()
             .map(|(i, &(id, score))| {
@@ -946,9 +946,9 @@ impl RagCore {
                 }
             };
             if let Some(chunk) = chunk {
-                // Use Vec::find() instead of HashMap to avoid allocation
-                let dense_component = dense_with_scores.iter().find(|(did, _)| *did == id).map(|(_, score)| score.clone());
-                let lexical_component = lexical_with_scores.iter().find(|(lid, _)| *lid == id).map(|(_, score)| score.clone());
+                // P7: O(1) HashMap lookups instead of O(pool) Vec::find()
+                let dense_component = dense_with_scores.get(&id).cloned();
+                let lexical_component = lexical_with_scores.get(&id).cloned();
                 
                 results.push(SearchResult {
                     score: rrf_score,
