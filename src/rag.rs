@@ -749,38 +749,6 @@ impl RagCore {
         Ok(())
     }
 
-    /// Dense retrieval shared by [`Self::search`] (semantic mode) and
-    /// [`Self::search_hybrid`]: embed the query with the model's
-    /// query-side instruction, run HNSW, and return hits ranked
-    /// best-first with their metadata attached.
-    async fn dense_hits(&self, query: &str, k: usize) -> Result<Vec<SearchHitOwned>> {
-        // Asymmetric models embed queries with a different instruction
-        // than passages — go through embed_query, not the document path.
-        let query_embedding = self.embedding.embed_query(query).await?;
-
-        if query_embedding.is_empty() {
-            return Err(anyhow::anyhow!("Failed to generate query embedding"));
-        }
-
-         // P5: Adaptive ef_search based on k with diminishing returns
-         // ef_search = ef_construction parameter during query to control search breadth.
-         // Higher ef = more thorough search but slower; lower ef = faster but may miss neighbors.
-         //
-         // Strategy: Use logarithmic scaling so we don't waste cycles on very large k.
-         // - k=1-10: ef = 40-100 (tight beam, fast)
-         // - k=10-100: ef = 100-200 (wider beam, thorough)
-         // - k=100+: ef capped at 250 (search_layer won't visit more than needed)
-         let ef = {
-             let base = (k as f32).log2().max(1.0);
-             (base * 50.0 + 40.0).ceil() as u32
-         }.clamp(40, 250);
-
-         Ok(self
-             .vectors_db
-             .search(&query_embedding, k, ef as usize)
-             .await?)
-     }
-
      /// Dense hits with optional ef_search override (None = adaptive scaling).
      async fn dense_hits_ef(&self, query: &str, k: usize, ef_search: Option<usize>) -> Result<Vec<SearchHitOwned>> {
          let query_embedding = self.embedding.embed_query(query).await?;

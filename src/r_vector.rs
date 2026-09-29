@@ -1490,12 +1490,6 @@ impl HnswIndex {
         self.mmap_mut()[off..off + 4].copy_from_slice(&n.to_le_bytes());
     }
 
-    #[inline]
-    fn layer_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
-        let c = self.layer_count(id, layer);
-        (0..c).map(|i| self.layer_neighbor(id, layer, i)).collect()
-    }
-
     /// P6: Iterator version to avoid Vec allocation when just iterating
     #[inline]
     fn layer_neighbors_iter(&self, id: u32, layer: usize) -> impl Iterator<Item = u32> + '_ {

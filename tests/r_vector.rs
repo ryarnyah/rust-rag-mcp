@@ -1491,7 +1491,7 @@ async fn test_search_skips_many_tombstones() -> Result<()> {
 
     let query = vec![0.95, 0.5, 0.5, 0.5];
     let results = db.search(&query, 5, 150)?;
-    assert!(results.len() > 0);
+    assert!(!results.is_empty());
     for result in &results {
         assert!(result.id >= 90);
     }

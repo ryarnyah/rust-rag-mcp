@@ -1012,7 +1012,7 @@ async fn bench_search_ef_scaling() {
     // Insert 1000 vectors
     for i in 0..1000 {
         let v: Vec<f32> = (0..384)
-            .map(|j| (((i * 13 + j * 17) % 1000) as f32 / 1000.0))
+            .map(|j| ((i * 13 + j * 17) % 1000) as f32 / 1000.0)
             .collect();
         let _ = db.insert(&v, Some(format!("doc_{}", i).as_bytes())).await;
     }
