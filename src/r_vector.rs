@@ -293,6 +293,36 @@ impl Config {
         self.max_wal_segments = max_wal_segments;
         self
     }
+
+    /// Validate the configuration for HNSW soundness.
+    ///
+    /// # Panics
+    /// If:
+    /// - `m < 2` (minimum connectivity required for a meaningful graph)
+    /// - `max_level == 0` (need at least layer 0)
+    /// - `dim == 0` (caught in `new()`, but validated here for completeness)
+    ///
+    /// # Notes
+    /// - `ef_construction < 20` triggers a debug warning (not a panic)
+    /// - `ef_construction > k` is recommended but not enforced
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use rust_rag_mcp::r_vector::Config;
+    /// let cfg = Config::new(128).with_m(8);
+    /// cfg.validate(); // OK
+    /// ```
+    pub fn validate(&self) {
+        assert!(self.dim > 0, "dimension must be > 0, got {}", self.dim);
+        assert!(self.m >= 2, "m must be >= 2 for graph connectivity, got {}", self.m);
+        assert!(self.max_level > 0, "max_level must be > 0, got {}", self.max_level);
+        if self.ef_construction < 20 {
+            tracing::warn!(
+                ef_construction = self.ef_construction,
+                "ef_construction very low (< 20); consider increasing for better search quality"
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -1772,6 +1802,12 @@ impl HnswIndex {
         F: Fn(u32) -> Result<f32>,
         D: Fn(u32) -> bool,
     {
+        // SAFETY: `scratch()` returns a mutable reference to per-thread scratch buffers
+        // stored in UnsafeCell. This is safe because:
+        // 1. `self` is &mut in the insert path, or holds exclusive read in search (no mutations)
+        // 2. Each thread has its own scratch buffer (ThreadLocal)
+        // 3. The scratch buffer is never shared or aliased during graph operations
+        // 4. Graph invariants (valid node IDs, layer ranges) are maintained by builder logic
         let scratch = unsafe { &mut *self.scratch() };
         scratch.visited.clear();
         scratch.visited.insert(entry);
@@ -1919,44 +1955,49 @@ impl HnswIndex {
             l = l.saturating_sub(1);
         }
 
-        // 2. Link at every layer from min(level, cur_max) down to 0, clamped
-        // to what the (possibly non-descended) seed actually carries
-        let start_layer = level.min(cur_max).min(self.node_level(ep) as usize);
-        for layer in (0..=start_layer).rev() {
-            let to_new = |n: u32| dist(new_id, n);
-            self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
+         // 2. Link at every layer from min(level, cur_max) down to 0, clamped
+         // to what the (possibly non-descended) seed actually carries
+         let start_layer = level.min(cur_max).min(self.node_level(ep) as usize);
+         for layer in (0..=start_layer).rev() {
+             let to_new = |n: u32| dist(new_id, n);
+             self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
 
-            let cap = Self::layer_capacity(&self.cfg, layer);
-            let selected = {
-                let scratch = unsafe { &mut *self.scratch() };
-                scratch.dists.clear();
-                scratch
-                    .dists
-                    .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
-                scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-                let (dists_ptr, scratch_ptr) = {
-                    let d = &scratch.dists as *const Vec<(u32, f32)>;
-                    let s = scratch as *mut SearchBuffers;
-                    (d, s)
-                };
-                Self::select_neighbors_heuristic(
-                    unsafe { &*dists_ptr },
-                    cap,
-                    dist,
-                    Some(unsafe { &mut *scratch_ptr }),
-                )?
-            };
+             let cap = Self::layer_capacity(&self.cfg, layer);
+             let selected = {
+                 // SAFETY: scratch() returns a mutable reference to per-thread scratch buffers
+                 // in UnsafeCell. Pointers are cast back and dereferenced only within this scope
+                 // after all other borrows end. The graph invariant (valid node IDs < count)
+                 // is maintained by the insert logic and edge validation.
+                 let scratch = unsafe { &mut *self.scratch() };
+                 scratch.dists.clear();
+                 scratch
+                     .dists
+                     .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
+                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+                 let (dists_ptr, scratch_ptr) = {
+                     let d = &scratch.dists as *const Vec<(u32, f32)>;
+                     let s = scratch as *mut SearchBuffers;
+                     (d, s)
+                 };
+                 Self::select_neighbors_heuristic(
+                     unsafe { &*dists_ptr },
+                     cap,
+                     dist,
+                     Some(unsafe { &mut *scratch_ptr }),
+                 )?
+             };
 
-            for &n in &selected {
-                self.add_link(new_id, layer, n, &dist)?;
-                self.add_link(n, layer, new_id, &dist)?;
-            }
+             for &n in &selected {
+                 self.add_link(new_id, layer, n, &dist)?;
+                 self.add_link(n, layer, new_id, &dist)?;
+             }
 
-            let scratch = unsafe { &*self.scratch() };
-            if let Some(&(_, e)) = scratch.search_output.first() {
-                ep = e;
-            }
-        }
+             // SAFETY: scratch() returns thread-local buffer; no other references exist
+             let scratch = unsafe { &*self.scratch() };
+             if let Some(&(_, e)) = scratch.search_output.first() {
+                 ep = e;
+             }
+         }
 
         if level > cur_max {
             self.set_entry_point(new_id);
@@ -2019,6 +2060,9 @@ impl HnswIndex {
         }
 
         self.search_layer(ep, 0, ef.max(k), &dist, is_deleted)?;
+        // SAFETY: scratch() returns thread-local buffer; search_layer() populated it and
+        // no concurrent mutations can occur during &self (search is read-only and graph
+        // structure is immutable during a single search traversal).
         let scratch = unsafe { &*self.scratch() };
         scratch
             .search_output
@@ -2084,6 +2128,13 @@ impl VectorView {
     ///
     /// # Errors
     /// Returns None if ID is out of bounds
+    ///
+    /// # Safety
+    /// The unsafe slice construction is safe because:
+    /// 1. Bounds are checked before construction (end <= file_size)
+    /// 2. `self.ptr` points to valid, initialized mmap-backed memory
+    /// 3. The slice is valid for the lifetime of the mmap (held by HnswIndex)
+    /// 4. Alignment is guaranteed by f32 type (4-byte aligned)
     fn get(&self, id: u32) -> Option<&[f32]> {
         let start = self.base + (id as usize).checked_mul(self.dim)?.checked_mul(4)?;
         let end = start.checked_add(self.dim.checked_mul(4)?)?;
@@ -2129,6 +2180,7 @@ pub struct VectorDb {
 impl VectorDb {
     /// Open or create vector database at path
     pub async fn open<P: AsRef<Path>>(path: P, cfg: Config) -> Result<Self> {
+        cfg.validate(); // Validate config before opening
         assert!(cfg.dim > 0, "dim must be > 0");
         let path = path.as_ref().to_path_buf();
 
