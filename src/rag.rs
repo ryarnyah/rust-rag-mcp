@@ -1016,20 +1016,33 @@ impl RagCore {
         // P3: Use metadata index for O(k) instead of O(n) full table scan
         // k = number of chunks for this source (much smaller than total vectors)
         let chunk_ids = self.metadata_index.get_chunk_ids(source_path).await;
-        for id in chunk_ids {
+        
+        // P9: Batch BM25 removals to acquire lock once instead of per-chunk
+        // Collect all (id, text) pairs first, then remove in single batch
+        let mut removals = Vec::new();
+        for id in chunk_ids.iter() {
             // Lexical index removal reads the stored text *before* the
             // tombstone lands: `remove_document` needs the exact string
             // the postings were built from (see [`crate::bm25`]). A
             // failed read just leaves a posting that the query-time
             // liveness guard neutralizes.
-            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(id).await
+            if let Ok(Some(metadata_bytes)) = self.vectors_db.get_meta(*id).await
                 && let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes)
             {
-                self.bm25
-                    .write()
-                    .await
-                    .remove_document(id, &chunk_meta.text);
+                removals.push((*id, chunk_meta.text));
             }
+        }
+        
+        // Single lock acquisition for all BM25 removals
+        {
+            let mut bm25 = self.bm25.write().await;
+            for (id, text) in removals {
+                bm25.remove_document(id, &text);
+            }
+        }
+        
+        // Delete vectors (can still be parallel)
+        for id in chunk_ids {
             if let Err(e) = self.vectors_db.delete(id).await {
                 tracing::warn!(vector_id = id, error = %e, "Failed to delete vector");
             }
