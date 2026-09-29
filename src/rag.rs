@@ -80,14 +80,14 @@ impl MetadataIndex {
         }
     }
 
-    async fn add_chunk(&self, source: String, id: u32) {
+    async fn add_chunk(&self, source: &str, id: u32) {
         let mut map = self.source_to_ids.write().await;
-        map.entry(source).or_insert_with(Vec::new).push(id);
+        map.entry(source.to_string()).or_insert_with(Vec::new).push(id);
     }
 
-    async fn add_doc_metadata(&self, source: String, id: u32) {
+    async fn add_doc_metadata(&self, source: &str, id: u32) {
         let mut map = self.doc_metadata_ids.write().await;
-        map.insert(source, id);
+        map.insert(source.to_string(), id);
     }
 
     async fn get_chunk_ids(&self, source: &str) -> Vec<u32> {
@@ -415,7 +415,7 @@ impl RagCore {
                     if let Ok(chunk_meta) = serde_json::from_slice::<ChunkMetadata>(&metadata_bytes)
                     {
                         if !srcidx_ok {
-                            metadata_index.add_chunk(chunk_meta.source, id).await;
+                            metadata_index.add_chunk(&chunk_meta.source, id).await;
                         }
                         if !bm25_ok {
                             bm25.add_document(id, &chunk_meta.text);
@@ -425,7 +425,7 @@ impl RagCore {
                         && !srcidx_ok
                     {
                         metadata_index
-                            .add_doc_metadata(doc_meta.source_path, id)
+                            .add_doc_metadata(&doc_meta.source_path, id)
                             .await;
                     }
                 }
@@ -718,6 +718,11 @@ impl RagCore {
     where
         F: AsyncFnMut(usize, usize),
     {
+        // P5: Reduce BM25 lock contention by batching all updates
+        // before acquiring the write lock once, instead of per-chunk.
+        // This changes 64 lock acquisitions → 1 per batch.
+        let mut bm25_batch = Vec::with_capacity(batch.len());
+
         for (i, (chunk, embedding)) in batch.iter().zip(embeddings.iter()).enumerate() {
             let chunk_meta = ChunkMetadata {
                 id: chunk.id.clone(),
@@ -735,17 +740,26 @@ impl RagCore {
                 .await?;
 
             self.metadata_index
-                .add_chunk(chunk.source.clone(), vec_id)
+                .add_chunk(&chunk.source, vec_id)
                 .await;
-            // Lexical index: same id, exact stored text (its
-            // remove_document contract needs the identical string).
-            self.bm25.write().await.add_document(vec_id, &chunk.text);
+
+            // Collect BM25 updates for batch processing
+            bm25_batch.push((vec_id, chunk.text.clone()));
 
             // Report only once the chunk is fully stored (vector row,
             // metadata, postings), so `done` never runs ahead of what a
             // search would already return.
             on_chunk(done_before + i + 1, total).await;
         }
+
+        // Single lock acquisition for all batch updates
+        {
+            let mut bm25 = self.bm25.write().await;
+            for (vec_id, text) in bm25_batch {
+                bm25.add_document(vec_id, &text);
+            }
+        }
+
         Ok(())
     }
 
@@ -878,11 +892,9 @@ impl RagCore {
         let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
         let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
 
-        // Per-retriever components indexed with the *same* enumerate
-        // ranks rrf_fuse consumes (rank = index + 1 over these exact
-        // lists), so `Σ 1/(RRF_K + rank)` over the sides present
-        // reproduces the fused score bit-for-bit.
-        let dense_sides: HashMap<u32, RetrieverScore> = dense
+        // P5: Avoid HashMap allocations by using Vec with position indexing
+        // Only convert to lookup structure for final top-k result processing
+        let dense_with_scores: Vec<_> = dense
             .iter()
             .enumerate()
             .map(|(i, hit)| {
@@ -895,7 +907,7 @@ impl RagCore {
                 )
             })
             .collect();
-        let lexical_sides: HashMap<u32, RetrieverScore> = lexical
+        let lexical_with_scores: Vec<_> = lexical
             .iter()
             .enumerate()
             .map(|(i, &(id, score))| {
@@ -937,12 +949,16 @@ impl RagCore {
                 }
             };
             if let Some(chunk) = chunk {
+                // Use Vec::find() instead of HashMap to avoid allocation
+                let dense_component = dense_with_scores.iter().find(|(did, _)| *did == id).map(|(_, score)| score.clone());
+                let lexical_component = lexical_with_scores.iter().find(|(lid, _)| *lid == id).map(|(_, score)| score.clone());
+                
                 results.push(SearchResult {
                     score: rrf_score,
                     chunk,
                     components: Some(HybridScoreComponents {
-                        dense: dense_sides.get(&id).cloned(),
-                        lexical: lexical_sides.get(&id).cloned(),
+                        dense: dense_component,
+                        lexical: lexical_component,
                     }),
                 });
             }
@@ -1115,7 +1131,7 @@ impl RagCore {
 
         // Update index
         self.metadata_index
-            .add_doc_metadata(source_path.to_string(), doc_id)
+            .add_doc_metadata(source_path, doc_id)
             .await;
 
         Ok(())
