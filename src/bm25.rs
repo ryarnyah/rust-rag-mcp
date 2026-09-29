@@ -247,8 +247,12 @@ impl Bm25Index {
         let n = self.doc_len.len() as f64;
         let avgdl = self.avgdl();
 
-        // P4: Pre-allocate HashMap with expected document count to avoid rehashing
-        let mut scores: HashMap<u32, f64> = HashMap::with_capacity(self.doc_len.len().min(10000));
+        // P8: Smart HashMap sizing: allocate only what's needed for result collection
+        // For k=1: need ~4 buckets (load factor 0.75); for k=100: need ~133 buckets
+        // Avoids 10k allocation waste when k << corpus size
+        let expected_results = std::cmp::max(k * 4, 16);
+        let capacity = std::cmp::min(expected_results, self.doc_len.len());
+        let mut scores: HashMap<u32, f64> = HashMap::with_capacity(capacity);
         for token in &tokens {
             let Some(postings) = self.postings.get(token) else {
                 continue; // term never seen in the corpus
