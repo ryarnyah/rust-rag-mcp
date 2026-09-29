@@ -1,8 +1,46 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use std::sync::{Arc, Mutex};
+use std::io::Write;
 
 use rmcp::ServiceExt;
 use rust_rag_mcp::{SearchMode, docs, mcp, rag};
+
+// Thread-safe file writer for logging
+struct SyncFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyncFileWriter {
+    type Writer = SyncFileWriterGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SyncFileWriterGuard {
+            file: Arc::clone(&self.file),
+        }
+    }
+}
+
+struct SyncFileWriterGuard {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl Write for SyncFileWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self.file.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned")
+        })?;
+        file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut file = self.file.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned")
+        })?;
+        file.flush()
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +73,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 150)]
         ef_construction: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging. If specified, all logs will be written to this file instead of stderr."]
+        log_file: Option<String>,
     },
 
     /// Index a file or directory (skips unchanged files automatically)
@@ -59,6 +101,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 150)]
         ef_construction: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// Search the knowledge base
@@ -88,6 +134,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// List indexed sources
@@ -106,6 +156,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// Show index statistics
@@ -124,6 +178,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// Remove a source document from the index
@@ -145,6 +203,10 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// Match a whole document (new file, raw text, or an indexed source)
@@ -185,10 +247,18 @@ enum Commands {
 
         #[arg(long, default_value_t = 64)]
         overlap: usize,
+
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
     },
 
     /// List available embedding models
-    Models,
+    Models {
+        #[arg(long)]
+        #[doc = "Optional file path for debug logging."]
+        log_file: Option<String>,
+    },
 }
 
 /// `ef_construction` used by the commands that don't expose the flag.
@@ -228,13 +298,45 @@ fn ellipsize(text: &str, max: usize) -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize logging with optional file output for debugging
+    let log_file = match &cli.command {
+        Commands::Serve { log_file, .. } => log_file.clone(),
+        Commands::Index { log_file, .. } => log_file.clone(),
+        Commands::Search { log_file, .. } => log_file.clone(),
+        Commands::Sources { log_file, .. } => log_file.clone(),
+        Commands::Stats { log_file, .. } => log_file.clone(),
+        Commands::Delete { log_file, .. } => log_file.clone(),
+        Commands::Models { log_file } => log_file.clone(),
+        Commands::Match { log_file, .. } => log_file.clone(),
+    };
+
+    if let Some(log_path) = log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open log file '{}': {}", log_path, e))?;
+        
+        let writer = SyncFileWriter {
+            file: Arc::new(Mutex::new(file)),
+        };
+        
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_writer(writer)
+            .with_ansi(false)
+            .init();
+        
+        eprintln!("Logging to file: {}", log_path);
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    }
 
     match cli.command {
         Commands::Serve {
@@ -244,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
             ef_construction,
+            log_file: _,
         } => {
             tracing::info!("Starting RAG MCP server");
             let server = mcp::RagServer::new(
@@ -279,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
             chunk_size,
             overlap,
             ef_construction,
+            log_file: _,
         } => {
             let core = open_core(
                 &db_path,
@@ -321,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
             mode,
             chunk_size,
             overlap,
+            log_file: _,
         } => {
             let core = open_core(
                 &db_path,
@@ -381,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             chunk_size,
             overlap,
+            log_file: _,
         } => {
             let core = open_core(
                 &db_path,
@@ -408,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             chunk_size,
             overlap,
+            log_file: _,
         } => {
             let core = open_core(
                 &db_path,
@@ -435,6 +542,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             chunk_size,
             overlap,
+            log_file: _,
         } => {
             let core = open_core(
                 &db_path,
@@ -463,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
             mode,
             chunk_size,
             overlap,
+            log_file: _,
         } => {
             let selected = [path.is_some(), text.is_some(), source.is_some()]
                 .into_iter()
@@ -553,7 +662,7 @@ async fn main() -> anyhow::Result<()> {
             core.close().await?;
         }
 
-        Commands::Models => {
+        Commands::Models { log_file: _ } => {
             let models = rag::RagCore::list_embedding_models();
             println!("Available embedding models:");
             for model in &models {
