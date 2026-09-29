@@ -124,6 +124,35 @@ struct MatchResultItem {
     best_match_text: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchDocumentsRequest {
+    #[schemars(
+        description = "Search query for document source paths/names. Supports partial matching and case-insensitive search. Examples: 'api', 'docs/api.md', 'README', '*.txt'"
+    )]
+    pub query: String,
+
+    #[schemars(
+        description = "Maximum results to return (default: 10). Returns up to N matching document sources."
+    )]
+    pub top_k: schemar_ext::Nullable<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SearchDocumentsResponse {
+    query: String,
+    total_indexed: usize,
+    matched_count: usize,
+    results: Vec<DocumentMatch>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DocumentMatch {
+    rank: usize,
+    source: String,
+    /// Relevance score: 1.0 = exact match, <1.0 = partial/fuzzy match
+    score: f64,
+}
+
 #[derive(Clone)]
 pub struct RagServer {
     core: Arc<RwLock<RagCore>>,
@@ -702,6 +731,135 @@ impl RagServer {
             Err(e) => Err(internal_err("Error matching document", e)),
         }
     }
+
+    #[tool(description = "\
+        Search for indexed documents by name, path, or partial match. \
+        Only searches document source paths (not content). \
+        Supports case-insensitive partial matching and glob patterns. \
+        Returns up to top_k matching document sources with relevance scores (1.0 = exact match).")]
+    async fn search_documents(
+        &self,
+        Parameters(req): Parameters<SearchDocumentsRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let top_k = req.top_k.unwrap_or(10);
+        let query_lower = req.query.to_lowercase();
+
+        let sources = {
+            let core = self.core.read().await;
+            core.list_sources().await
+        };
+
+        match sources {
+            Ok(all_sources) => {
+                let total_indexed = all_sources.len();
+
+                // Score and filter documents based on source path matching
+                let mut matches: Vec<(String, f64)> = all_sources
+                    .into_iter()
+                    .filter_map(|source| {
+                        let source_lower = source.to_lowercase();
+                        let score = calculate_match_score(&source_lower, &query_lower);
+                        
+                        if score > 0.0 {
+                            Some((source, score))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Sort by score descending
+                matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                let matched_count = matches.len();
+                let results: Vec<DocumentMatch> = matches
+                    .into_iter()
+                    .take(top_k)
+                    .enumerate()
+                    .map(|(i, (source, score))| DocumentMatch {
+                        rank: i + 1,
+                        source,
+                        score,
+                    })
+                    .collect();
+
+                ok_json(SearchDocumentsResponse {
+                    query: req.query,
+                    total_indexed,
+                    matched_count,
+                    results,
+                })
+            }
+            Err(e) => Err(internal_err("Error listing indexed sources", e)),
+        }
+    }
+}
+
+/// Calculate relevance score for document source path match (0.0 = no match, 1.0 = exact match)
+fn calculate_match_score(source_lower: &str, query_lower: &str) -> f64 {
+    if source_lower == query_lower {
+        return 1.0; // Exact match
+    }
+
+    if source_lower.contains(&query_lower) {
+        // Substring match - score higher if match is at path boundaries
+        if source_lower.starts_with(&query_lower)
+            || source_lower.contains(&format!("/{}", query_lower))
+            || source_lower.ends_with(&query_lower)
+        {
+            return 0.95; // Strong substring match
+        }
+        return 0.7; // Weak substring match (match in middle)
+    }
+
+    // Check for glob-style matching (* wildcard)
+    if query_lower.contains('*') {
+        if glob_match(source_lower, &query_lower) {
+            return 0.85; // Glob pattern match
+        }
+    }
+
+    // Fuzzy matching: check if all query chars appear in order in source
+    if fuzzy_match(source_lower, &query_lower) {
+        return 0.6; // Fuzzy match
+    }
+
+    0.0 // No match
+}
+
+/// Simple glob pattern matching (* = any sequence of chars)
+fn glob_match(source: &str, pattern: &str) -> bool {
+    let pattern_parts: Vec<&str> = pattern.split('*').collect();
+    let mut remaining = source;
+
+    for (i, part) in pattern_parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        if i == 0 && !remaining.starts_with(part) {
+            return false;
+        } else if i == pattern_parts.len() - 1 && !remaining.ends_with(part) {
+            return false;
+        } else if let Some(pos) = remaining.find(part) {
+            remaining = &remaining[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Fuzzy matching: check if all chars in query appear in source in order
+fn fuzzy_match(source: &str, query: &str) -> bool {
+    let mut source_chars = source.chars();
+    for query_char in query.chars() {
+        if !source_chars.any(|c| c == query_char) {
+            return false;
+        }
+    }
+    true
 }
 
 #[tool_handler]
