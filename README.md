@@ -93,6 +93,28 @@ missing (or `null` in JSON) means the document never entered that retriever's to
 components inline: `(rrf, score: 0.0325; dense: 0.8412 @1, bm25: 7.1325 @2)`. Semantic and lexical results omit
 `components` — their `score` already is the raw value.
 
+### Whole-Document Matching
+
+`match` (CLI) and `match_document` (MCP) answer a different question than `search`: not
+"which *chunks* match this query" but "which **documents** in the index best match this
+whole document". The query can be a file that is not indexed yet, raw text, or a document
+already in the index (queried with its stored chunks).
+
+Every chunk of the query document runs through the normal retrieval path (same `mode`
+semantics as `search`), hits are grouped by the *matched* document, and each document
+scores the mean of its best per-chunk score — with query chunks that never hit it
+contributing `0`:
+
+```
+score = Σ (best chunk-level score against this document) / query chunk count
+```
+
+So a document that matches most of the query outranks one that matches a single chunk
+well, and each result reports the strongest passage (`best_match_text`) tying the two
+documents together. The query document's own source is always excluded — a document is
+never its own best match. Scores stay on the scale of the chosen mode (RRF weight,
+cosine, or BM25 weight) and are comparable only within one call.
+
 ### Syntax-Aware Code Chunking
 
 Source code is parsed into an AST and chunked by semantic boundaries:
@@ -199,6 +221,41 @@ rust-rag-mcp search <QUERY>... [OPTIONS]
 | `--cache-path <PATH>` | `.rag-cache` | Cache path |
 | `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
 
+### Match a Document
+
+```bash
+rust-rag-mcp match [<PATH>] [--text <TEXT>] [--source <SOURCE>] [OPTIONS]
+```
+
+Ranks the indexed documents that best match a whole document. Provide exactly one input:
+a document path (the file does not need to be indexed), `--text` for raw text, or
+`--source` for a document already in the index (its own source is excluded from the
+ranking, so a document never matches itself).
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--top-k <N>` | `5` | Number of matched documents |
+| `--mode <MODE>` | `hybrid` | Same modes and score scales as `search` |
+| `--db-path <PATH>` | `.rag-db` | Database path |
+| `--cache-path <PATH>` | `.rag-cache` | Cache path |
+| `--model <MODEL>` | `Xenova/bge-small-en-v1.5` | Embedding model |
+
+```bash
+# Which indexed documents does this new file resemble?
+rust-rag-mcp match ./drafts/weekly-report.pdf
+
+# Which other documents resemble one already in the index?
+rust-rag-mcp match --source /abs/path/to/notes.md --top-k 3
+```
+
+Each hit prints the matched source, its aggregate score, how many of the query's chunks
+matched, and a snippet of the strongest passage:
+
+```text
+[1] (rrf, score: 0.0182) [matched 3/4 query chunks; best 0.0244 @ q1 -> chunk 0] /docs/architecture.md
+    The storage layer keeps a write-ahead log so a crash mid-write ...
+```
+
 ### Delete Source
 
 ```bash
@@ -293,7 +350,7 @@ rust-rag-mcp
 ├── embeddings  fastembed ONNX local embeddings
 ├── docs        PDF/DOCX/XLSX/PPTX text extraction
 ├── rag         Core orchestrator + metadata index
-└── mcp         MCP server (8 tools over stdio)
+└── mcp         MCP server (7 tools over stdio)
 ```
 
 All ~4,200 lines of the vector database are written from scratch. No wrappers. No hidden dependencies.

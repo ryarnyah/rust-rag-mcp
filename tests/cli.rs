@@ -63,7 +63,7 @@ fn help_lists_every_subcommand() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     for subcommand in [
-        "serve", "index", "search", "sources", "stats", "delete", "models",
+        "serve", "index", "search", "match", "sources", "stats", "delete", "models",
     ] {
         assert!(help.contains(subcommand), "`{subcommand}` missing:\n{help}");
     }
@@ -161,6 +161,118 @@ fn index_search_sources_stats_delete_roundtrip() {
     // Deleting again is not an error — the source simply is not there.
     let again = cli.stdout(&["delete", &source]);
     assert!(again.contains("Deleted:"), "{again}");
+}
+
+/// `match` compares a whole document — new text, a new file, or an
+/// already-indexed source — against the index: the related source must
+/// rank first, and the query document's own source must never appear
+/// among its matches.
+#[test]
+fn match_ranks_the_related_document_and_excludes_the_query_itself() {
+    let cli = Cli::new();
+    let dir = tempfile::tempdir().unwrap();
+    let rust_doc = dir.path().join("rust.txt");
+    let garden_doc = dir.path().join("garden.txt");
+    std::fs::write(
+        &rust_doc,
+        "Rust is a systems programming language focused on memory safety without a garbage collector.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &garden_doc,
+        "Tomatoes need warm soil and daily watering throughout the summer months.\n",
+    )
+    .unwrap();
+    cli.stdout(&[
+        "index",
+        rust_doc.to_str().unwrap(),
+        garden_doc.to_str().unwrap(),
+    ]);
+
+    // Raw text that was never indexed: the related source ranks first.
+    let text = cli.stdout(&[
+        "match",
+        "--text",
+        "memory safe systems programming language",
+    ]);
+    let first = text
+        .lines()
+        .find(|line| line.starts_with('['))
+        .expect("a ranked match");
+    assert!(
+        first.contains("rust.txt"),
+        "related source must rank first: {text}"
+    );
+
+    // Matching an already-indexed source uses its stored chunks as the
+    // query and must not rank that source against itself.
+    let source = rust_doc
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let indexed = cli.stdout(&["match", "--source", &source]);
+    let ranked: Vec<&str> = indexed
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .collect();
+    assert!(
+        !ranked.is_empty(),
+        "the unrelated document still matches: {indexed}"
+    );
+    assert!(
+        !ranked.iter().any(|line| line.contains("rust.txt")),
+        "a document must not match itself: {indexed}"
+    );
+
+    // A new file on disk is read and chunked exactly as `index` would.
+    let new_doc = dir.path().join("borrow-checker.txt");
+    std::fs::write(
+        &new_doc,
+        "The Rust borrow checker enforces memory safety at compile time.\n",
+    )
+    .unwrap();
+    let file = cli.stdout(&["match", new_doc.to_str().unwrap()]);
+    let first = file
+        .lines()
+        .find(|line| line.starts_with('['))
+        .expect("a ranked match");
+    assert!(
+        first.contains("rust.txt"),
+        "related source must rank first: {file}"
+    );
+
+    // Non-default mode keeps the score labels `search` prints.
+    let semantic = cli.stdout(&["match", "--text", "watering tomatoes", "--mode", "semantic"]);
+    let first = semantic
+        .lines()
+        .find(|line| line.starts_with('['))
+        .expect("a ranked match");
+    assert!(first.contains("(cosine,"), "{semantic}");
+    assert!(first.contains("garden.txt"), "{semantic}");
+}
+
+/// `match` needs exactly one of path / `--text` / `--source`, and the
+/// usage error fires before the database or the model is opened.
+#[test]
+fn match_requires_exactly_one_input() {
+    let cli = Cli::new();
+    for args in [
+        vec!["match"],
+        vec!["match", "--text", "hello", "--source", "some/source"],
+        vec!["match", "--text", "hello", "some.txt"],
+    ] {
+        let output = cli.run(&args);
+        assert!(!output.status.success(), "`{args:?}` must fail");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains("exactly one"), "`{args:?}`: {err}");
+    }
+
+    // A path that does not exist fails the same way, before startup.
+    let output = cli.run(&["match", "/no/such/document.txt"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("Path not found"), "{err}");
 }
 
 /// A path that does not exist is reported on stderr and skipped rather

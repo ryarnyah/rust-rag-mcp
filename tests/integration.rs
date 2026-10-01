@@ -106,6 +106,211 @@ async fn test_rag_index_text_dedup() {
     core.close().await.unwrap();
 }
 
+/// Whole-document matching: a document (new text, new file, or an
+/// already-indexed source) is compared against the index as a whole and
+/// ranked per *document* — the related source first, the query document
+/// itself never, and every match carrying the shared query-chunk
+/// denominator behind its score.
+#[tokio::test]
+async fn test_rag_match_document_ranks_whole_documents() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    core.index_text(
+        "Rust is a systems programming language focused on safety and performance.",
+        "rust.txt",
+    )
+    .await
+    .unwrap();
+    core.index_text(
+        "Gardening advice: tomatoes thrive in warm soil with regular watering.",
+        "garden.txt",
+    )
+    .await
+    .unwrap();
+
+    // Raw, unindexed text: the related document ranks first.
+    let query = rust_rag_mcp::MatchDocument::Text {
+        text: "systems programming language safety",
+        ext: "",
+    };
+    let res = core
+        .match_document(&query, &rust_rag_mcp::MatchOptions::default())
+        .await
+        .unwrap();
+    assert!(res.query_source.is_none(), "{res:?}");
+    assert!(res.query_chunks >= 1, "{res:?}");
+    assert!(!res.matches.is_empty(), "{res:?}");
+    assert_eq!(res.matches[0].source, "rust.txt", "{res:?}");
+    assert!(res.matches[0].matched_chunks >= 1, "{res:?}");
+    assert!(res.matches[0].score > 0.0, "{res:?}");
+    // The mean never exceeds the best single-chunk hit it is built from.
+    assert!(
+        res.matches[0].best_score + 1e-9 >= res.matches[0].score,
+        "{res:?}"
+    );
+    assert!(
+        res.matches
+            .iter()
+            .all(|m| m.query_chunks == res.query_chunks),
+        "{res:?}"
+    );
+
+    // `top_k` truncates the ranking.
+    let res = core
+        .match_document(
+            &query,
+            &rust_rag_mcp::MatchOptions {
+                top_k: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.matches.len(), 1, "{res:?}");
+
+    // An indexed source is queried with its own stored chunks and must
+    // never rank against itself.
+    let res = core
+        .match_document(
+            &rust_rag_mcp::MatchDocument::Indexed { source: "rust.txt" },
+            &rust_rag_mcp::MatchOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.query_source.as_deref(), Some("rust.txt"), "{res:?}");
+    assert!(res.query_chunks >= 1, "{res:?}");
+    assert!(
+        res.matches.iter().all(|m| m.source != "rust.txt"),
+        "a document must not match itself: {res:?}"
+    );
+    assert!(
+        res.matches.iter().any(|m| m.source == "garden.txt"),
+        "{res:?}"
+    );
+
+    // An unknown source is an error, not an empty ranking.
+    let err = core
+        .match_document(
+            &rust_rag_mcp::MatchDocument::Indexed {
+                source: "never.txt",
+            },
+            &rust_rag_mcp::MatchOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not indexed"), "{err}");
+
+    // A new file resolves to its canonical path — the same key indexing
+    // would file it under, and therefore the source excluded from its
+    // own matches.
+    let file_dir = tempdir().unwrap();
+    let new_doc = file_dir.path().join("borrow-checker.txt");
+    std::fs::write(
+        &new_doc,
+        "The Rust borrow checker enforces memory safety at compile time.\n",
+    )
+    .unwrap();
+    let res = core
+        .match_document(
+            &rust_rag_mcp::MatchDocument::File {
+                path: new_doc.as_path(),
+            },
+            &rust_rag_mcp::MatchOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.query_source.as_deref(),
+        Some(new_doc.canonicalize().unwrap().to_str().unwrap()),
+        "{res:?}"
+    );
+    assert!(!res.matches.is_empty(), "{res:?}");
+    assert_eq!(res.matches[0].source, "rust.txt", "{res:?}");
+
+    // A code file must be split exactly as `index` splits it: the same
+    // syntax-aware boundaries, so the query-chunk count equals the
+    // stored chunk count. (A chunking label without the extension would
+    // silently fall back to the generic word chunker and mismatch.)
+    let code_dir = tempdir().unwrap();
+    let code_doc = code_dir.path().join("sample.rs");
+    std::fs::write(
+        &code_doc,
+        "fn alpha() {}\npub struct Beta;\npub fn gamma() {}\n",
+    )
+    .unwrap();
+    let stored = match core.index_file(&code_doc).await.unwrap() {
+        rust_rag_mcp::IndexResult::Indexed(count) => count,
+        rust_rag_mcp::IndexResult::Skipped => panic!("first index must store chunks"),
+    };
+    let res = core
+        .match_document(
+            &rust_rag_mcp::MatchDocument::File {
+                path: code_doc.as_path(),
+            },
+            &rust_rag_mcp::MatchOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.query_chunks as usize, stored,
+        "matching must chunk the file like indexing does: {res:?}"
+    );
+    assert!(
+        res.matches
+            .iter()
+            .all(|m| m.source != res.query_source.as_deref().unwrap()),
+        "a document must not match itself: {res:?}"
+    );
+
+    core.close().await.unwrap();
+}
+
+/// `list_sources_page` walks the sorted source list in stable pages:
+/// the page is a contiguous slice of `list_sources`, `total` always
+/// reports the full count, and offsets past the end (or a zero limit)
+/// yield empty pages rather than errors.
+#[tokio::test]
+async fn test_rag_list_sources_page_pagination() {
+    let dir = tempdir().unwrap();
+    let core = test_rag_core(dir.path()).await;
+
+    for i in 0..5 {
+        core.index_text(
+            &format!("content of document number {i}"),
+            &format!("doc{i}.txt"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (page, total) = core.list_sources_page(0, 2).await.unwrap();
+    assert_eq!(total, 5, "total counts every source, not the page");
+    assert_eq!(page, vec!["doc0.txt", "doc1.txt"], "sorted slice");
+
+    let (page, _) = core.list_sources_page(2, 2).await.unwrap();
+    assert_eq!(page, vec!["doc2.txt", "doc3.txt"]);
+
+    let (page, _) = core.list_sources_page(4, 2).await.unwrap();
+    assert_eq!(page, vec!["doc4.txt"], "the last page may be short");
+
+    let (page, total) = core.list_sources_page(5, 2).await.unwrap();
+    assert!(
+        page.is_empty(),
+        "offset past the end is empty, not an error"
+    );
+    assert_eq!(total, 5);
+
+    let (page, _) = core.list_sources_page(0, 0).await.unwrap();
+    assert!(page.is_empty(), "limit 0 yields an empty page");
+
+    // Pages are exactly a partition of the full listing.
+    let (first, _) = core.list_sources_page(0, 5).await.unwrap();
+    assert_eq!(first, core.list_sources().await.unwrap());
+
+    core.close().await.unwrap();
+}
+
 /// Chunk progress must fire once per stored chunk, counting `1..=total` in
 /// insertion order — each report is what the MCP layer forwards as a
 /// `notifications/progress` message. A skipped (unchanged) file produces no

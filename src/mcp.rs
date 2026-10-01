@@ -64,6 +64,66 @@ struct DocumentStatusResponse {
     chunk_count: Option<u32>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ListSourcesResponse {
+    /// Total number of indexed sources — not just this page.
+    total: usize,
+    /// The `offset` this page was fetched with.
+    offset: usize,
+    /// Entries in this page (≤ `limit`).
+    count: usize,
+    /// Pass back as `offset` to fetch the page after this one; `null`
+    /// when the listing has reached the end.
+    next_offset: Option<usize>,
+    sources: Vec<IndexedSource>,
+}
+
+/// One indexed source on a page, with the document status stored at
+/// indexing time. `content_hash`/`indexed_at`/`chunk_count` are `null`
+/// only when the source has no document-metadata row (it still has
+/// chunks) — see `RagCore::document_status`.
+#[derive(Debug, serde::Serialize)]
+struct IndexedSource {
+    source: String,
+    content_hash: Option<String>,
+    indexed_at: Option<u64>,
+    chunk_count: Option<u32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MatchDocumentResponse {
+    mode: crate::SearchMode,
+    query: MatchQueryInfo,
+    count: usize,
+    results: Vec<MatchResultItem>,
+}
+
+/// What the query document resolved to: which input kind supplied it,
+/// the source key it is filed under (canonical path or indexed source;
+/// `null` for raw text), and how many chunks it was split into.
+#[derive(Debug, serde::Serialize)]
+struct MatchQueryInfo {
+    kind: &'static str,
+    source: Option<String>,
+    chunks: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MatchResultItem {
+    rank: usize,
+    source: String,
+    /// Mean per-query-chunk score (see `DocumentMatch::score`): the
+    /// scale is the one of `mode`, never comparable across modes.
+    score: f64,
+    matched_chunks: u32,
+    query_chunks: u32,
+    /// Strongest single chunk-level match behind `score`.
+    best_score: f64,
+    best_query_chunk: u32,
+    best_match_chunk: u32,
+    best_match_text: String,
+}
+
 #[derive(Clone)]
 pub struct RagServer {
     core: Arc<RwLock<RagCore>>,
@@ -175,6 +235,56 @@ pub struct DocumentStatusRequest {
         description = "Exact source path used during indexing. Returns content hash, last indexed timestamp, and chunk count."
     )]
     pub source_path: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListSourcesRequest {
+    #[serde(default)]
+    #[schemars(
+        description = "Number of sources to skip before the first entry of this page (optional; default: 0). Pass the `next_offset` returned by the previous response to fetch the page after it."
+    )]
+    pub offset: schemar_ext::Nullable<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum number of sources per page (optional; default: 50). The final page may contain fewer entries, and `next_offset` is null once the listing has reached the end. An `offset` past the end returns an empty page (with `total` still set)."
+    )]
+    pub limit: schemar_ext::Nullable<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MatchDocumentRequest {
+    #[schemars(
+        description = "Raw text of a new document to match against the index (it does not need to be indexed). Provide exactly one of `text`, `path`, or `source`."
+    )]
+    pub text: Option<String>,
+    #[schemars(
+        description = "Path to a document file to match against the index — supports the same formats as `index_path` (PDF, DOCX, XLSX, PPTX, TXT, MD, code, ...). The file does not need to be indexed; it is read and chunked exactly as `index_path` would. Provide exactly one of `text`, `path`, or `source`."
+    )]
+    pub path: Option<String>,
+    #[schemars(
+        description = "Source key of a document already in the index: its stored chunks are used as the query document. Provide exactly one of `text`, `path`, or `source`."
+    )]
+    pub source: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum matched documents to return (default: 5). Higher values return more candidates but take longer."
+    )]
+    pub top_k: schemar_ext::Nullable<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Retrieval mode per query chunk (optional; omit or null = hybrid), with the same semantics and score scales as `search`: `hybrid` (RRF weights), `semantic` (cosine in [0,1]), `lexical` (raw BM25 weights, no embedding). Scores are comparable only within one call, never across modes."
+    )]
+    pub mode: schemar_ext::Nullable<crate::SearchMode>,
+    #[serde(default)]
+    #[schemars(
+        description = "HNSW search expansion factor (optional; default: adaptive based on the per-chunk candidate pool). Ignored in lexical mode. See `search.ef_search`."
+    )]
+    pub ef_search: schemar_ext::Nullable<usize>,
+    #[serde(default)]
+    #[schemars(
+        description = "Candidates retrieved per query chunk before hits are grouped by document (default: 50). Larger values let a single chunk of the query document reach more distinct documents; smaller values are faster."
+    )]
+    pub candidates_per_chunk: schemar_ext::Nullable<usize>,
 }
 
 #[tool_router]
@@ -427,6 +537,169 @@ impl RagServer {
                 &format!("Error checking status for '{}'", req.source_path),
                 e,
             )),
+        }
+    }
+    #[tool(description = "\
+        List the indexed sources (files and text documents) with pagination. \
+        Entries come back sorted by source name — stable page boundaries while the index does not change — and each carries its content hash, last indexed timestamp, and chunk count. \
+        `total` is the full number of indexed sources, not just this page's; keep passing the returned `next_offset` back as `offset` until it is null. \
+        Defaults: offset 0, limit 50. Use this to discover the exact source paths expected by `search.source_filter`, `match_document.source`, and `delete_source`.")]
+    async fn list_sources(
+        &self,
+        Parameters(req): Parameters<ListSourcesRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let offset = req.offset.unwrap_or(0);
+        let limit = req.limit.unwrap_or(50);
+
+        // A single read lock spans the slice and the per-source statuses,
+        // so the page cannot interleave with an index/delete and show a
+        // half-updated view.
+        let core = self.core.read().await;
+        let (page, total) = match core.list_sources_page(offset, limit).await {
+            Ok(page) => page,
+            Err(e) => return Err(internal_err("Error listing sources", e)),
+        };
+
+        let mut sources = Vec::with_capacity(page.len());
+        for source in &page {
+            // `document_status` is an O(1) metadata-index lookup, so
+            // enriching a page never scans the vector table.
+            let status = match core.document_status(source).await {
+                Ok(status) => status,
+                Err(e) => {
+                    return Err(internal_err(
+                        &format!("Error reading status for '{source}'"),
+                        e,
+                    ));
+                }
+            };
+            sources.push(IndexedSource {
+                source: source.clone(),
+                content_hash: status.as_ref().map(|s| s.content_hash.clone()),
+                indexed_at: status.as_ref().map(|s| s.indexed_at),
+                chunk_count: status.as_ref().map(|s| s.chunk_count),
+            });
+        }
+
+        let count = sources.len();
+        // A page that stops short of `total` still has a next one;
+        // `offset + count` is exactly where that page must start.
+        let next_offset = (offset + count < total).then_some(offset + count);
+        ok_json(ListSourcesResponse {
+            total,
+            offset,
+            count,
+            next_offset,
+            sources,
+        })
+    }
+
+    #[tool(description = "\
+        Match a whole document against the index and rank the indexed documents that best match it — document-level similarity, not isolated chunk hits. \
+        The query document is one of: raw `text`, a file `path` (PDF/DOCX/TXT/code; it does not need to be indexed), or the `source` key of an already-indexed document — provide exactly one. \
+        Every chunk of the query document is searched (same `mode` semantics and score scale as `search`), hits are grouped by the matched document's source, and each document scores the mean of its best per-chunk score with query chunks that never hit it contributing 0 — so documents matching more of the query rank higher. \
+        The query document's own source is excluded, so a document is never its own match. \
+        Each result carries the matched source, the aggregate score, how many query chunks matched, and the strongest single passage (`best_match_text`) tying the two documents together.")]
+    async fn match_document(
+        &self,
+        Parameters(req): Parameters<MatchDocumentRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let selected = [req.text.is_some(), req.path.is_some(), req.source.is_some()]
+            .into_iter()
+            .filter(|&chosen| chosen)
+            .count();
+        if selected != 1 {
+            return Err(ErrorData::invalid_params(
+                "Provide exactly one of: `text`, `path`, or `source`",
+                None,
+            ));
+        }
+        if let Some(path) = &req.path
+            && !std::path::Path::new(path).exists()
+        {
+            return Err(ErrorData::invalid_params(
+                format!("Path not found: {path}"),
+                None,
+            ));
+        }
+        if let Some(source) = &req.source {
+            let status = {
+                let core = self.core.read().await;
+                core.document_status(source).await
+            };
+            match status {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(ErrorData::invalid_params(
+                        format!("Source not indexed: {source}"),
+                        None,
+                    ));
+                }
+                Err(e) => return Err(internal_err("Error checking source", e)),
+            }
+        }
+
+        let defaults = crate::MatchOptions::default();
+        let opts = crate::MatchOptions {
+            top_k: req.top_k.unwrap_or(defaults.top_k),
+            mode: req.mode.0.unwrap_or(defaults.mode),
+            ef_search: req.ef_search.0,
+            candidates_per_chunk: req
+                .candidates_per_chunk
+                .unwrap_or(defaults.candidates_per_chunk),
+        };
+        let (document, kind) = if let Some(text) = &req.text {
+            (crate::MatchDocument::Text { text, ext: "" }, "text")
+        } else if let Some(path) = &req.path {
+            (
+                crate::MatchDocument::File {
+                    path: std::path::Path::new(path),
+                },
+                "file",
+            )
+        } else {
+            (
+                crate::MatchDocument::Indexed {
+                    source: req.source.as_deref().unwrap(),
+                },
+                "indexed",
+            )
+        };
+
+        let outcome = {
+            let core = self.core.read().await;
+            core.match_document(&document, &opts).await
+        };
+        match outcome {
+            Ok(result) => {
+                let results: Vec<MatchResultItem> = result
+                    .matches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, m)| MatchResultItem {
+                        rank: i + 1,
+                        source: m.source,
+                        score: m.score,
+                        matched_chunks: m.matched_chunks,
+                        query_chunks: m.query_chunks,
+                        best_score: m.best_score,
+                        best_query_chunk: m.best_query_chunk,
+                        best_match_chunk: m.best_match_chunk,
+                        best_match_text: m.best_match_text,
+                    })
+                    .collect();
+                ok_json(MatchDocumentResponse {
+                    mode: opts.mode,
+                    query: MatchQueryInfo {
+                        kind,
+                        source: result.query_source,
+                        chunks: result.query_chunks,
+                    },
+                    count: results.len(),
+                    results,
+                })
+            }
+            Err(e) => Err(internal_err("Error matching document", e)),
         }
     }
 }

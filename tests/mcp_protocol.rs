@@ -182,11 +182,13 @@ fn as_error_data(error: ServiceError) -> rmcp::ErrorData {
     }
 }
 
-const TOOL_NAMES: [&str; 5] = [
+const TOOL_NAMES: [&str; 7] = [
     "delete_source",
     "document_status",
     "index_path",
     "index_text",
+    "list_sources",
+    "match_document",
     "search",
 ];
 
@@ -330,6 +332,184 @@ async fn lexical_mode_omits_hybrid_components() {
         search["count"].as_u64().unwrap() <= 3,
         "top_k ignored: {search}"
     );
+}
+
+/// `match_document` compares a whole document against the index and
+/// ranks *documents* (not chunks): the related source must come out on
+/// top, and an indexed query source must never match itself.
+#[tokio::test]
+async fn match_document_ranks_related_source_and_excludes_the_query_itself() {
+    let h = Harness::start().await;
+    h.call(
+        "index_text",
+        json!({
+            "text": "Rust is a systems programming language focused on memory safety and performance.",
+            "source": "rust.txt",
+        }),
+    )
+    .await;
+    h.call(
+        "index_text",
+        json!({
+            "text": "Tomatoes grow best in warm soil with regular watering.",
+            "source": "garden.txt",
+        }),
+    )
+    .await;
+
+    // A new (unindexed) document: related source ranks first.
+    let resp = h
+        .call(
+            "match_document",
+            json!({ "text": "memory safe systems programming language" }),
+        )
+        .await;
+    assert_eq!(resp["mode"], "hybrid", "default mode is hybrid: {resp}");
+    assert_eq!(resp["query"]["kind"], "text", "{resp}");
+    assert!(resp["query"]["source"].is_null(), "{resp}");
+    assert!(resp["query"]["chunks"].as_u64().unwrap() >= 1, "{resp}");
+    assert!(resp["count"].as_u64().unwrap() > 0, "{resp}");
+    let top = &resp["results"][0];
+    assert_eq!(top["rank"], 1);
+    assert_eq!(top["source"], "rust.txt", "{resp}");
+    assert!(top["score"].as_f64().unwrap() > 0.0, "{top}");
+    assert!(top["matched_chunks"].as_u64().unwrap() >= 1, "{top}");
+    assert_eq!(
+        top["query_chunks"], resp["query"]["chunks"],
+        "every result carries the shared denominator: {top}"
+    );
+    assert!(top["best_score"].as_f64().unwrap() > 0.0, "{top}");
+    assert!(
+        !top["best_match_text"].as_str().unwrap().is_empty(),
+        "{top}"
+    );
+
+    // An indexed source is queried with its stored chunks, and the
+    // source itself is excluded from its own ranking.
+    let indexed = h
+        .call("match_document", json!({ "source": "rust.txt" }))
+        .await;
+    assert_eq!(indexed["query"]["kind"], "indexed", "{indexed}");
+    assert_eq!(indexed["query"]["source"], "rust.txt", "{indexed}");
+    assert!(
+        indexed["query"]["chunks"].as_u64().unwrap() >= 1,
+        "{indexed}"
+    );
+    let sources: Vec<&str> = indexed["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["source"].as_str().unwrap())
+        .collect();
+    assert!(
+        !sources.contains(&"rust.txt"),
+        "a document must not match itself: {indexed}"
+    );
+
+    // `top_k` truncates the ranking.
+    let limited = h
+        .call(
+            "match_document",
+            json!({ "text": "systems programming", "top_k": 1 }),
+        )
+        .await;
+    assert!(
+        limited["count"].as_u64().unwrap() <= 1,
+        "top_k ignored: {limited}"
+    );
+
+    // Exactly one of `text` / `path` / `source` is required, and the
+    // inputs that cannot work are client mistakes, not crashes.
+    let none = h.try_call("match_document", json!({})).await.unwrap_err();
+    assert_eq!(none.code, ErrorCode::INVALID_PARAMS);
+    let both = h
+        .try_call(
+            "match_document",
+            json!({ "text": "hello", "source": "rust.txt" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(both.code, ErrorCode::INVALID_PARAMS);
+    let unknown = h
+        .try_call("match_document", json!({ "source": "never/indexed.txt" }))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, ErrorCode::INVALID_PARAMS);
+    let missing = h
+        .try_call("match_document", json!({ "path": "/definitely/not/here" }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code, ErrorCode::INVALID_PARAMS);
+}
+
+/// `list_sources` pages through the index: a stable sorted order, the
+/// total across all pages, per-entry document status, and a
+/// `next_offset` cursor that walks to `null`.
+#[tokio::test]
+async fn list_sources_paginates_over_every_indexed_source() {
+    let h = Harness::start().await;
+    for i in 0..7 {
+        h.call(
+            "index_text",
+            json!({
+                "text": format!("document number {i} about some topic"),
+                "source": format!("docs/file{i}.txt"),
+            }),
+        )
+        .await;
+    }
+
+    // No arguments: everything fits on the single default page, so the
+    // cursor is already null.
+    let all = h.call("list_sources", json!({})).await;
+    assert_eq!(all["total"], 7, "{all}");
+    assert_eq!(all["offset"], 0, "{all}");
+    assert_eq!(all["count"], 7, "{all}");
+    assert!(all["next_offset"].is_null(), "listing must end: {all}");
+
+    // Walk the whole index three entries at a time via the cursor.
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let page = h
+            .call("list_sources", json!({ "offset": offset, "limit": 3 }))
+            .await;
+        assert_eq!(page["total"], 7, "`total` is the full count: {page}");
+        assert_eq!(
+            page["offset"], offset,
+            "echoes the requested offset: {page}"
+        );
+        let entries = page["sources"].as_array().expect("sources is an array");
+        assert!(entries.len() <= 3, "`limit` is honoured: {page}");
+        for entry in entries {
+            // Every entry carries the status recorded at indexing time.
+            assert!(entry["chunk_count"].as_u64().unwrap() >= 1, "{entry}");
+            assert!(entry["indexed_at"].as_u64().unwrap() > 0, "{entry}");
+            assert_eq!(
+                entry["content_hash"].as_str().unwrap().len(),
+                64,
+                "SHA-256 hex: {entry}"
+            );
+            seen.push(entry["source"].as_str().unwrap().to_string());
+        }
+        match &page["next_offset"] {
+            serde_json::Value::Null => break,
+            serde_json::Value::Number(n) => offset = n.as_u64().unwrap() as usize,
+            other => panic!("unexpected cursor: {other:?}"),
+        }
+    }
+    assert_eq!(seen.len(), 7, "pages must cover every source: {seen:?}");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "pages are sorted and non-overlapping: {seen:?}"
+    );
+
+    // An offset past the end is an empty final page, not an error.
+    let past = h.call("list_sources", json!({ "offset": 100 })).await;
+    assert_eq!(past["total"], 7, "{past}");
+    assert_eq!(past["count"], 0, "{past}");
+    assert!(past["sources"].as_array().unwrap().is_empty(), "{past}");
+    assert!(past["next_offset"].is_null(), "{past}");
 }
 
 /// A missing path is a client mistake (`invalid_params`), not a crash.

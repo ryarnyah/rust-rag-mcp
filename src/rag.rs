@@ -6,8 +6,8 @@ use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig, SearchHitOwned};
 use crate::sidecar;
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
 use crate::{
-    DocumentChunk, DocumentStatus, HybridScoreComponents, IndexResult, RetrieverScore, SearchMode,
-    SearchResult,
+    DocumentChunk, DocumentMatch, DocumentStatus, HybridScoreComponents, IndexResult, MatchDocument,
+    MatchDocumentResult, MatchOptions, RetrieverScore, SearchMode, SearchResult,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -991,6 +991,218 @@ impl RagCore {
          }
      }
 
+    /// Splits a query document into chunk texts the way indexing would
+    /// (see [`Self::index_prepared`]), so a file matched before it is
+    /// ever indexed is compared on exactly the chunks indexing would
+    /// produce for it.
+    ///
+    /// The label must carry the extension: `SyntaxChunker::chunk_text`
+    /// re-derives the language from its `source` argument, so a label
+    /// without one would silently fall back to the generic word chunker
+    /// for code files — mismatching the stored chunks. An unknown (or
+    /// empty) extension falls back to the word chunker anyway, exactly
+    /// as indexing does.
+    fn query_chunks_for(&self, text: &str, ext: &str) -> Vec<String> {
+        let source = if ext.is_empty() {
+            "<match-query>".to_string()
+        } else {
+            format!("<match-query>.{ext}")
+        };
+        let chunks = self.syntax_chunker.chunk_text(text, &source);
+        chunks.into_iter().map(|chunk| chunk.text).collect()
+    }
+
+    /// Resolves `document` into `(source key to exclude, chunk texts to
+    /// query with)`. The two are the same key by design: whatever the
+    /// query document is filed under — canonical path for a file, the
+    /// source for an indexed document — must not rank against itself.
+    async fn resolve_match_document(
+        &self,
+        document: &MatchDocument<'_>,
+    ) -> Result<(Option<String>, Vec<String>)> {
+        match document {
+            MatchDocument::Text { text, ext } => Ok((None, self.query_chunks_for(text, ext))),
+
+            MatchDocument::File { path } => {
+                // Same canonicalization `index_file_with_progress` uses,
+                // so the exclusion matches the stored source key.
+                let source = path
+                    .canonicalize()
+                    .map_err(|e| anyhow::anyhow!("Failed to canonicalize path {:?}: {}", path, e))?
+                    .to_string_lossy()
+                    .to_string();
+                let (_, text) = Self::read_file_for_indexing(path).await?;
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let chunks = self.query_chunks_for(&text, &ext);
+                Ok((Some(source), chunks))
+            }
+
+            MatchDocument::Indexed { source } => {
+                let ids = self.metadata_index.get_chunk_ids(source).await;
+                if ids.is_empty() {
+                    return Err(anyhow::anyhow!("Source '{source}' is not indexed"));
+                }
+                // Query with the stored chunks as they are: re-chunking
+                // a joined text would move the boundaries and the
+                // offsets the caller may rely on.
+                let mut chunks = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if self.vectors_db.is_deleted(id).await {
+                        continue;
+                    }
+                    let Ok(Some(bytes)) = self.vectors_db.get_meta(id).await else {
+                        continue;
+                    };
+                    if let Some(chunk) = Self::chunk_from_metadata(id, &bytes) {
+                        chunks.push(chunk);
+                    }
+                }
+                chunks.sort_by_key(|chunk| chunk.chunk_index);
+                Ok((
+                    Some(source.to_string()),
+                    chunks.into_iter().map(|chunk| chunk.text).collect(),
+                ))
+            }
+        }
+    }
+
+    /// Matches a whole document — new text, a file, or an already-indexed
+    /// source — against the index and ranks the indexed documents by how
+    /// well they match it *overall*, rather than returning isolated chunk
+    /// hits.
+    ///
+    /// Every chunk of the query document is searched independently
+    /// through [`Self::search_with_mode_ef`], so `opts.mode` behaves
+    /// exactly as it does for `search`; the hits are then grouped by the
+    /// *matched* document's source and each document gets
+    ///
+    /// `score = Σ (best chunk-level score against it) / query chunk count`,
+    ///
+    /// i.e. the mean per-chunk similarity, with a query chunk that never
+    /// hit the document contributing `0.0` — so documents that match
+    /// more of the query rank above documents that match one chunk well
+    /// and ignore the rest. `score` stays on the scale of the chosen
+    /// mode and is only comparable within one call.
+    ///
+    /// The query document's own source is always excluded: a document
+    /// must not be its own best match.
+    pub async fn match_document(
+        &self,
+        document: &MatchDocument<'_>,
+        opts: &MatchOptions,
+    ) -> Result<MatchDocumentResult> {
+        let (query_source, query_chunks) = self.resolve_match_document(document).await?;
+        let matches = self
+            .match_query_chunks(&query_chunks, query_source.as_deref(), opts)
+            .await?;
+        Ok(MatchDocumentResult {
+            query_source,
+            query_chunks: query_chunks.len() as u32,
+            matches,
+        })
+    }
+
+    /// Body of [`Self::match_document`] once the query chunks and the
+    /// excluded source are known: one retrieval per query chunk, folded
+    /// into a per-source aggregation. Read-only — no `ops` lock.
+    async fn match_query_chunks(
+        &self,
+        query_chunks: &[String],
+        exclude: Option<&str>,
+        opts: &MatchOptions,
+    ) -> Result<Vec<DocumentMatch>> {
+        if query_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One chunk never retrieves fewer candidates than the caller
+        // asked documents for, so `top_k` can always be filled.
+        let pool = opts.candidates_per_chunk.max(opts.top_k);
+
+        /// Running aggregation for one matched document.
+        struct Aggregator {
+            /// Sum of the best-per-query-chunk scores.
+            score_sum: f64,
+            /// Query chunks that hit this document at least once.
+            matched_chunks: u32,
+            /// `(score, query chunk, matched chunk, text)` of the single
+            /// strongest hit — the passage that best ties the documents.
+            best: (f64, u32, u32, String),
+        }
+
+        let mut by_source: HashMap<String, Aggregator> = HashMap::new();
+
+        for (query_index, text) in query_chunks.iter().enumerate() {
+            let hits = self
+                .search_with_mode_ef(text, pool, opts.mode, opts.ef_search)
+                .await?;
+
+            // A source can surface through several of its chunks in one
+            // search; this query chunk contributes its *best* hit only,
+            // so a document with many chunks cannot multiply its weight.
+            let mut best_for_source: HashMap<&str, (&DocumentChunk, f64)> = HashMap::new();
+            for hit in &hits {
+                if exclude == Some(hit.chunk.source.as_str()) {
+                    continue;
+                }
+                let entry = best_for_source
+                    .entry(hit.chunk.source.as_str())
+                    .or_insert((&hit.chunk, hit.score));
+                if hit.score > entry.1 {
+                    *entry = (&hit.chunk, hit.score);
+                }
+            }
+
+            for (source, (chunk, score)) in best_for_source {
+                let aggregator = by_source.entry(source.to_string()).or_insert(Aggregator {
+                    score_sum: 0.0,
+                    matched_chunks: 0,
+                    best: (f64::NEG_INFINITY, 0, 0, String::new()),
+                });
+                aggregator.score_sum += score;
+                aggregator.matched_chunks += 1;
+                if score > aggregator.best.0 {
+                    aggregator.best = (
+                        score,
+                        query_index as u32,
+                        chunk.chunk_index,
+                        chunk.text.clone(),
+                    );
+                }
+            }
+        }
+
+        let query_chunk_count = query_chunks.len() as u32;
+        let mut results: Vec<DocumentMatch> = by_source
+            .into_iter()
+            .map(|(source, aggregator)| DocumentMatch {
+                source,
+                score: aggregator.score_sum / query_chunk_count as f64,
+                matched_chunks: aggregator.matched_chunks,
+                query_chunks: query_chunk_count,
+                best_score: aggregator.best.0,
+                best_query_chunk: aggregator.best.1,
+                best_match_chunk: aggregator.best.2,
+                best_match_text: aggregator.best.3,
+            })
+            .collect();
+
+        // Ties break on coverage (more query chunks matched), then on
+        // the source name — so equal scores still order deterministically.
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.matched_chunks.cmp(&a.matched_chunks))
+                .then_with(|| a.source.cmp(&b.source))
+        });
+        results.truncate(opts.top_k);
+        Ok(results)
+    }
+
     /// Returns the total number of chunks stored in the database.
     pub async fn chunk_count(&self) -> Result<usize> {
         Ok(self.vectors_db.len().await)
@@ -1000,6 +1212,22 @@ impl RagCore {
     pub async fn list_sources(&self) -> Result<Vec<String>> {
         // P3: Use metadata index for O(1) instead of O(n) full table scan
         Ok(self.metadata_index.get_all_sources().await)
+    }
+
+    /// Returns one page of indexed sources — `(page, total)` — for
+    /// paginated listings. Sources come back sorted by name (the same
+    /// order [`Self::list_sources`] returns), so page boundaries are
+    /// stable as long as the index does not change: `offset` past the
+    /// end yields an empty page, `limit = 0` yields an empty page with
+    /// `total` still reporting the full count.
+    pub async fn list_sources_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<String>, usize)> {
+        let all = self.metadata_index.get_all_sources().await;
+        let total = all.len();
+        Ok((all.into_iter().skip(offset).take(limit).collect(), total))
     }
 
     /// Deletes all chunks and metadata associated with the specified source path from the database.

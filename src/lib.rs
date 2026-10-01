@@ -44,6 +44,98 @@ pub enum SearchMode {
     Lexical,
 }
 
+/// Parameters for whole-document matching, shared by the CLI `match`
+/// command and the MCP `match_document` tool so both behave identically.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchOptions {
+    /// How many matched documents to return.
+    pub top_k: usize,
+    /// Retrieval mode used for each per-chunk search — the same modes
+    /// `search` exposes, with the same score scales.
+    pub mode: SearchMode,
+    /// HNSW `ef` override for the dense side; `None` = adaptive scaling
+    /// (see `search_with_mode_ef`).
+    pub ef_search: Option<usize>,
+    /// Candidate pool depth per query chunk (per retriever). Each chunk
+    /// of the query document retrieves this many chunks before hits are
+    /// grouped by document, so it bounds how many distinct documents a
+    /// single chunk can contribute to.
+    pub candidates_per_chunk: usize,
+}
+
+impl Default for MatchOptions {
+    fn default() -> Self {
+        Self {
+            top_k: 5,
+            mode: SearchMode::default(),
+            ef_search: None,
+            // Same depth as the hybrid pool: one chunk sees the same
+            // candidates it would see in a `search` call.
+            candidates_per_chunk: 50,
+        }
+    }
+}
+
+/// The whole document to match against the index: either side of the
+/// comparison can be a *new* document (raw text or a file) or one that
+/// is already indexed.
+#[derive(Debug, Clone, Copy)]
+pub enum MatchDocument<'a> {
+    /// Raw text that is not (yet) indexed. `ext` selects syntax-aware
+    /// chunking (e.g. `"rs"`); `""` uses the generic word chunker.
+    Text { text: &'a str, ext: &'a str },
+    /// A file on disk — it does not need to be indexed. Read and
+    /// chunked exactly as `index` would, so the comparison uses the
+    /// chunks the file would produce.
+    File { path: &'a std::path::Path },
+    /// A document already in the index, queried with its stored chunks
+    /// (no re-chunking, no re-embedding of the index side).
+    Indexed { source: &'a str },
+}
+
+/// One indexed document's aggregate match against a whole query document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentMatch {
+    /// Source key of the matched indexed document.
+    pub source: String,
+    /// Aggregate score: the mean over the query document's chunks of the
+    /// best chunk-level score against this document, with a query chunk
+    /// that never hit it contributing `0.0`. Documents matching more of
+    /// the query therefore pull ahead. The scale is the one of
+    /// [`MatchOptions::mode`] (`SearchResult::score`), never comparable
+    /// across modes.
+    pub score: f64,
+    /// How many of the query document's chunks matched this document.
+    pub matched_chunks: u32,
+    /// Total chunks in the query document — the denominator of `score`.
+    pub query_chunks: u32,
+    /// Strongest single chunk-level score against this document.
+    pub best_score: f64,
+    /// Index of the query-document chunk behind `best_score`.
+    pub best_query_chunk: u32,
+    /// Chunk index (within the matched document) behind `best_score`.
+    pub best_match_chunk: u32,
+    /// Text of the matched chunk behind `best_score` — the passage that
+    /// ties the two documents together.
+    pub best_match_text: String,
+}
+
+/// Outcome of `RagCore::match_document`: the ranked matches plus what
+/// the query document resolved to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchDocumentResult {
+    /// Source key the query document resolved to (canonicalized file
+    /// path or indexed source); `None` for raw text, which has no key.
+    /// The same key is excluded from `matches` — a document is never
+    /// its own match.
+    pub query_source: Option<String>,
+    /// Number of chunks the query document was split into — the
+    /// denominator behind every [`DocumentMatch::score`].
+    pub query_chunks: u32,
+    /// Best-matching indexed documents, sorted by `score` descending.
+    pub matches: Vec<DocumentMatch>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentChunk {
     pub id: String,

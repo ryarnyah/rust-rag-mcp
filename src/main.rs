@@ -147,6 +147,46 @@ enum Commands {
         overlap: usize,
     },
 
+    /// Match a whole document (new file, raw text, or an indexed source)
+    /// against the index and rank the indexed documents that match it best
+    Match {
+        /// Path to a document file to match (omit when using --text or --source)
+        path: Option<String>,
+
+        /// Match raw text instead of a file
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Match an already-indexed document by its source key
+        #[arg(long)]
+        source: Option<String>,
+
+        #[arg(long, default_value = ".rag-db")]
+        db_path: String,
+
+        #[arg(long, default_value = ".rag-cache")]
+        cache_path: String,
+
+        #[arg(long, default_value = "Xenova/bge-small-en-v1.5")]
+        model: String,
+
+        /// Number of best-matching documents to return
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+
+        /// Retrieval mode per query chunk: `hybrid` (HNSW + BM25 fused
+        /// with RRF), `semantic` (dense only), or `lexical` (BM25 only,
+        /// no model)
+        #[arg(long, value_enum, default_value = "hybrid")]
+        mode: SearchMode,
+
+        #[arg(long, default_value_t = 512)]
+        chunk_size: usize,
+
+        #[arg(long, default_value_t = 64)]
+        overlap: usize,
+    },
+
     /// List available embedding models
     Models,
 }
@@ -173,6 +213,17 @@ async fn open_core(
         ef_construction,
     )
     .await
+}
+
+/// Collapse whitespace and cut `text` to `max` characters (append `…`),
+/// so a matched passage stays readable on one indented line.
+fn ellipsize(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(max).collect();
+    format!("{cut}…")
 }
 
 #[tokio::main]
@@ -397,6 +448,107 @@ async fn main() -> anyhow::Result<()> {
             match core.delete_source(&source_path).await {
                 Ok(()) => println!("Deleted: {}", source_path),
                 Err(e) => eprintln!("Failed to delete '{}': {}", source_path, e),
+            }
+            core.close().await?;
+        }
+
+        Commands::Match {
+            path,
+            text,
+            source,
+            db_path,
+            cache_path,
+            model,
+            top_k,
+            mode,
+            chunk_size,
+            overlap,
+        } => {
+            let selected = [path.is_some(), text.is_some(), source.is_some()]
+                .into_iter()
+                .filter(|&chosen| chosen)
+                .count();
+            if selected != 1 {
+                anyhow::bail!(
+                    "provide exactly one of: a document path, --text <TEXT>, or --source <SOURCE>"
+                );
+            }
+            // Rejected before the database and the model are opened, so
+            // a usage mistake never pays for startup.
+            if let Some(path_str) = &path
+                && !std::path::Path::new(path_str).exists()
+            {
+                anyhow::bail!("Path not found: {}", path_str);
+            }
+
+            let core = open_core(
+                &db_path,
+                &cache_path,
+                &model,
+                chunk_size,
+                overlap,
+                DEFAULT_EF_CONSTRUCTION,
+            )
+            .await?;
+            let opts = rust_rag_mcp::MatchOptions {
+                top_k,
+                mode,
+                ..Default::default()
+            };
+            let outcome = if let Some(path_str) = &path {
+                let path = std::path::Path::new(path_str);
+                core.match_document(&rust_rag_mcp::MatchDocument::File { path }, &opts)
+                    .await
+            } else if let Some(text_str) = &text {
+                // Raw text has no extension to chunk on: the generic
+                // word chunker is what `index` uses for plain prose too.
+                core.match_document(
+                    &rust_rag_mcp::MatchDocument::Text {
+                        text: text_str,
+                        ext: "",
+                    },
+                    &opts,
+                )
+                .await
+            } else {
+                core.match_document(
+                    &rust_rag_mcp::MatchDocument::Indexed {
+                        source: source.as_deref().unwrap(),
+                    },
+                    &opts,
+                )
+                .await
+            };
+            let result = outcome?;
+
+            if result.matches.is_empty() {
+                println!("No matches found.");
+            } else {
+                // Same per-mode labels the `search` command prints, so
+                // the score in parentheses reads identically.
+                let label = match mode {
+                    SearchMode::Hybrid => "rrf",
+                    SearchMode::Semantic => "cosine",
+                    SearchMode::Lexical => "bm25",
+                };
+                for (i, m) in result.matches.iter().enumerate() {
+                    println!(
+                        "[{}] ({}, score: {:.4}) [matched {}/{} query chunks; \
+                         best {:.4} @ q{} -> chunk {}] {}",
+                        i + 1,
+                        label,
+                        m.score,
+                        m.matched_chunks,
+                        m.query_chunks,
+                        m.best_score,
+                        m.best_query_chunk,
+                        m.best_match_chunk,
+                        m.source,
+                    );
+                    // The strongest passage, collapsed to one short
+                    // line — a full 512-word chunk would bury the list.
+                    println!("    {}", ellipsize(&m.best_match_text, 160));
+                }
             }
             core.close().await?;
         }
