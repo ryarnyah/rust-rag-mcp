@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
-use std::sync::{Arc, Mutex};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::EnvFilter;
 
 use rmcp::ServiceExt;
 use rust_rag_mcp::{SearchMode, docs, mcp, rag};
@@ -27,17 +27,19 @@ struct SyncFileWriterGuard {
 
 impl Write for SyncFileWriterGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut file = self.file.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned")
-        })?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned"))?;
         file.write_all(buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut file = self.file.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned")
-        })?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "lock poisoned"))?;
         file.flush()
     }
 }
@@ -318,21 +320,25 @@ async fn main() -> anyhow::Result<()> {
             .append(true)
             .open(&log_path)
             .map_err(|e| anyhow::anyhow!("Failed to open log file '{}': {}", log_path, e))?;
-        
+
         let writer = SyncFileWriter {
             file: Arc::new(Mutex::new(file)),
         };
-        
+
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
+            )
             .with_writer(writer)
             .with_ansi(false)
             .init();
-        
+
         eprintln!("Logging to file: {}", log_path);
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
+            )
             .with_writer(std::io::stderr)
             .with_ansi(false)
             .init();

@@ -1178,7 +1178,10 @@ async fn bench_metadata_snapshot() {
         let _ = entries;
     }
     let elapsed = start.elapsed();
-    println!("Baseline (100 snapshots of 1000 sources): {:.2} ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "Baseline (100 snapshots of 1000 sources): {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 #[tokio::test]
@@ -1199,7 +1202,7 @@ async fn bench_chunker_performance() {
         let _ = chunker.chunk_text(&large_text, "test.txt");
     }
     let elapsed = start.elapsed();
-    
+
     let avg_ms = elapsed.as_secs_f64() / 100.0 * 1000.0;
     println!("Chunker (10k words, 100 iterations): {:?}", elapsed);
     println!("Per-iteration: {:.4} ms", avg_ms);
@@ -1232,7 +1235,11 @@ async fn bench_search_ef_scaling() {
             let _ = db.search(&query, k, 200).await; // static ef for comparison
         }
         let elapsed = start.elapsed();
-        println!("Search k={:3}: 10x avg {:.3} ms", k, elapsed.as_secs_f64() / 10.0 * 1000.0);
+        println!(
+            "Search k={:3}: 10x avg {:.3} ms",
+            k,
+            elapsed.as_secs_f64() / 10.0 * 1000.0
+        );
     }
 
     let _ = std::fs::remove_file("test_ef_scale.db");

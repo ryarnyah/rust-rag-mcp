@@ -468,12 +468,13 @@ impl RagServer {
         let mode = req.mode.0.unwrap_or_default();
         let ef_search = req.ef_search.0;
         let source_filter = req.source_filter.clone();
-        
+
         let result = {
             let core = self.core.read().await;
-            core.search_with_mode_ef(&req.query, top_k, mode, ef_search).await
+            core.search_with_mode_ef(&req.query, top_k, mode, ef_search)
+                .await
         };
-        
+
         match result {
             Ok(results) => {
                 // P6: Use source filter if provided. Pre-computed source→vec_id index
@@ -487,7 +488,7 @@ impl RagServer {
                 } else {
                     results
                 };
-                
+
                 let items: Vec<SearchResultItem> = filtered_results
                     .iter()
                     .enumerate()
@@ -759,7 +760,7 @@ impl RagServer {
                     .filter_map(|source| {
                         let source_lower = source.to_lowercase();
                         let score = calculate_match_score(&source_lower, &query_lower);
-                        
+
                         if score > 0.0 {
                             Some((source, score))
                         } else {

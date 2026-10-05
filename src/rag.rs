@@ -6,8 +6,8 @@ use crate::r_vector::{AsyncVectorDb, Config as VectorDbConfig, SearchHitOwned};
 use crate::sidecar;
 use crate::syntax_chunker::{SyntaxChunker, language_for_extension};
 use crate::{
-    DocumentChunk, DocumentMatch, DocumentStatus, HybridScoreComponents, IndexResult, MatchDocument,
-    MatchDocumentResult, MatchOptions, RetrieverScore, SearchMode, SearchResult,
+    DocumentChunk, DocumentMatch, DocumentStatus, HybridScoreComponents, IndexResult,
+    MatchDocument, MatchDocumentResult, MatchOptions, RetrieverScore, SearchMode, SearchResult,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,9 @@ impl MetadataIndex {
 
     async fn add_chunk(&self, source: &str, id: u32) {
         let mut map = self.source_to_ids.write().await;
-        map.entry(source.to_string()).or_insert_with(Vec::new).push(id);
+        map.entry(source.to_string())
+            .or_insert_with(Vec::new)
+            .push(id);
     }
 
     async fn add_doc_metadata(&self, source: &str, id: u32) {
@@ -116,27 +118,27 @@ impl MetadataIndex {
     }
 
     /// Sorted snapshot of both maps for the sidecar writer. Sorting makes
-     /// the serialized form deterministic for a given logical state, so a
-     /// rewrite with no changes produces an identical file.
-     async fn snapshot(&self) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>) {
-         let chunks = {
-             let map = self.source_to_ids.read().await;
-             // P4: Optimize snapshot by taking ownership during iteration
-             // to avoid double clone (String key + Vec value)
-             let mut entries: Vec<(String, Vec<u32>)> =
-                 map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-             entries.sort_by(|a, b| a.0.cmp(&b.0));
-             entries
-         };
-         let docs = {
-             let map = self.doc_metadata_ids.read().await;
-             let mut entries: Vec<(String, u32)> =
-                 map.iter().map(|(k, &v)| (k.clone(), v)).collect();
-             entries.sort_by(|a, b| a.0.cmp(&b.0));
-             entries
-         };
-         (chunks, docs)
-     }
+    /// the serialized form deterministic for a given logical state, so a
+    /// rewrite with no changes produces an identical file.
+    async fn snapshot(&self) -> (Vec<(String, Vec<u32>)>, Vec<(String, u32)>) {
+        let chunks = {
+            let map = self.source_to_ids.read().await;
+            // P4: Optimize snapshot by taking ownership during iteration
+            // to avoid double clone (String key + Vec value)
+            let mut entries: Vec<(String, Vec<u32>)> =
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        let docs = {
+            let map = self.doc_metadata_ids.read().await;
+            let mut entries: Vec<(String, u32)> =
+                map.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        };
+        (chunks, docs)
+    }
 
     /// Replace both maps wholesale — used when a validated sidecar is
     /// loaded at startup instead of scanning metadata.
@@ -739,9 +741,7 @@ impl RagCore {
                 .insert(embedding, Some(&metadata_bytes))
                 .await?;
 
-            self.metadata_index
-                .add_chunk(&chunk.source, vec_id)
-                .await;
+            self.metadata_index.add_chunk(&chunk.source, vec_id).await;
 
             // Collect BM25 updates for batch processing
             bm25_batch.push((vec_id, chunk.text.clone()));
@@ -763,29 +763,31 @@ impl RagCore {
         Ok(())
     }
 
-     /// Dense hits with optional ef_search override (None = adaptive scaling).
-     async fn dense_hits_ef(&self, query: &str, k: usize, ef_search: Option<usize>) -> Result<Vec<SearchHitOwned>> {
-         let query_embedding = self.embedding.embed_query(query).await?;
+    /// Dense hits with optional ef_search override (None = adaptive scaling).
+    async fn dense_hits_ef(
+        &self,
+        query: &str,
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchHitOwned>> {
+        let query_embedding = self.embedding.embed_query(query).await?;
 
-         if query_embedding.is_empty() {
-             return Err(anyhow::anyhow!("Failed to generate query embedding"));
-         }
+        if query_embedding.is_empty() {
+            return Err(anyhow::anyhow!("Failed to generate query embedding"));
+        }
 
-         // Use explicit ef_search if provided, otherwise use adaptive scaling
-         let ef = match ef_search {
-             Some(ef) => ef,
-             None => {
-                 // Adaptive ef_search based on k with diminishing returns
-                 let base = (k as f32).log2().max(1.0);
-                 (base * 50.0 + 40.0).ceil() as u32 as usize
-             }
-         };
+        // Use explicit ef_search if provided, otherwise use adaptive scaling
+        let ef = match ef_search {
+            Some(ef) => ef,
+            None => {
+                // Adaptive ef_search based on k with diminishing returns
+                let base = (k as f32).log2().max(1.0);
+                (base * 50.0 + 40.0).ceil() as u32 as usize
+            }
+        };
 
-         Ok(self
-             .vectors_db
-             .search(&query_embedding, k, ef)
-             .await?)
-     }
+        Ok(self.vectors_db.search(&query_embedding, k, ef).await?)
+    }
 
     /// Extracts the [`DocumentChunk`] out of a vector's serialized
     /// metadata; `None` (with a warning, never a hard error) covers
@@ -811,25 +813,30 @@ impl RagCore {
         }
     }
 
-     /// Performs a semantic search for the given query string, returning the top_k most relevant results.
-     pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-         self.search_ef(query, top_k, None).await
-     }
+    /// Performs a semantic search for the given query string, returning the top_k most relevant results.
+    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        self.search_ef(query, top_k, None).await
+    }
 
-     /// Semantic search with optional ef_search override (None = adaptive scaling).
-     async fn search_ef(&self, query: &str, top_k: usize, ef_search: Option<usize>) -> Result<Vec<SearchResult>> {
-         let hits = self.dense_hits_ef(query, top_k, ef_search).await?;
-         Ok(hits
-             .into_iter()
-             .filter_map(|hit| {
-                 Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
-                     score: hit.score as f64,
-                     chunk,
-                     components: None,
-                 })
-             })
-             .collect())
-     }
+    /// Semantic search with optional ef_search override (None = adaptive scaling).
+    async fn search_ef(
+        &self,
+        query: &str,
+        top_k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        let hits = self.dense_hits_ef(query, top_k, ef_search).await?;
+        Ok(hits
+            .into_iter()
+            .filter_map(|hit| {
+                Self::chunk_from_metadata(hit.id, &hit.metadata).map(|chunk| SearchResult {
+                    score: hit.score as f64,
+                    chunk,
+                    components: None,
+                })
+            })
+            .collect())
+    }
 
     /// BM25-only retrieval: no embedding, so no model invocation at
     /// all. Scores are raw BM25 weights (unbounded, comparable only
@@ -875,19 +882,24 @@ impl RagCore {
     /// cosine/BM25 scores and the 1-based pool ranks that were fused,
     /// so callers can reproduce `score` and see why a document ranked
     /// where it did.
-     pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
-         self.search_hybrid_ef(query, top_k, None).await
-     }
+    pub async fn search_hybrid(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+        self.search_hybrid_ef(query, top_k, None).await
+    }
 
-     /// Hybrid search with optional ef_search override (None = adaptive scaling).
-     async fn search_hybrid_ef(&self, query: &str, top_k: usize, ef_search: Option<usize>) -> Result<Vec<SearchResult>> {
-         if top_k == 0 {
-             return Ok(Vec::new());
-         }
-         let pool = top_k.max(HYBRID_POOL);
+    /// Hybrid search with optional ef_search override (None = adaptive scaling).
+    async fn search_hybrid_ef(
+        &self,
+        query: &str,
+        top_k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let pool = top_k.max(HYBRID_POOL);
 
-         let dense = self.dense_hits_ef(query, pool, ef_search).await?;
-         let lexical = self.bm25.read().await.search(query, pool);
+        let dense = self.dense_hits_ef(query, pool, ef_search).await?;
+        let lexical = self.bm25.read().await.search(query, pool);
 
         let dense_ids: Vec<u32> = dense.iter().map(|hit| hit.id).collect();
         let lexical_ids: Vec<u32> = lexical.iter().map(|&(id, _)| id).collect();
@@ -949,7 +961,7 @@ impl RagCore {
                 // P7: O(1) HashMap lookups instead of O(pool) Vec::find()
                 let dense_component = dense_with_scores.get(&id).cloned();
                 let lexical_component = lexical_with_scores.get(&id).cloned();
-                
+
                 results.push(SearchResult {
                     score: rrf_score,
                     chunk,
@@ -966,30 +978,30 @@ impl RagCore {
     /// Dispatches on [`SearchMode`]; the MCP tool and CLI search
     /// command both funnel through here so the modes behave
     /// identically everywhere.
-     pub async fn search_with_mode(
-         &self,
-         query: &str,
-         top_k: usize,
-         mode: SearchMode,
-     ) -> Result<Vec<SearchResult>> {
-         self.search_with_mode_ef(query, top_k, mode, None).await
-     }
+    pub async fn search_with_mode(
+        &self,
+        query: &str,
+        top_k: usize,
+        mode: SearchMode,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_mode_ef(query, top_k, mode, None).await
+    }
 
-     /// Same as search_with_mode but with explicit ef_search control (optional).
-     /// If ef_search is None, uses adaptive scaling (see dense_hits).
-     pub async fn search_with_mode_ef(
-         &self,
-         query: &str,
-         top_k: usize,
-         mode: SearchMode,
-         ef_search: Option<usize>,
-     ) -> Result<Vec<SearchResult>> {
-         match mode {
-             SearchMode::Hybrid => self.search_hybrid_ef(query, top_k, ef_search).await,
-             SearchMode::Semantic => self.search_ef(query, top_k, ef_search).await,
-             SearchMode::Lexical => self.search_lexical(query, top_k).await, // lexical ignores ef
-         }
-     }
+    /// Same as search_with_mode but with explicit ef_search control (optional).
+    /// If ef_search is None, uses adaptive scaling (see dense_hits).
+    pub async fn search_with_mode_ef(
+        &self,
+        query: &str,
+        top_k: usize,
+        mode: SearchMode,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        match mode {
+            SearchMode::Hybrid => self.search_hybrid_ef(query, top_k, ef_search).await,
+            SearchMode::Semantic => self.search_ef(query, top_k, ef_search).await,
+            SearchMode::Lexical => self.search_lexical(query, top_k).await, // lexical ignores ef
+        }
+    }
 
     /// Splits a query document into chunk texts the way indexing would
     /// (see [`Self::index_prepared`]), so a file matched before it is
@@ -1244,7 +1256,7 @@ impl RagCore {
         // P3: Use metadata index for O(k) instead of O(n) full table scan
         // k = number of chunks for this source (much smaller than total vectors)
         let chunk_ids = self.metadata_index.get_chunk_ids(source_path).await;
-        
+
         // P9: Batch BM25 removals to acquire lock once instead of per-chunk
         // Collect all (id, text) pairs first, then remove in single batch
         let mut removals = Vec::new();
@@ -1260,7 +1272,7 @@ impl RagCore {
                 removals.push((*id, chunk_meta.text));
             }
         }
-        
+
         // Single lock acquisition for all BM25 removals
         {
             let mut bm25 = self.bm25.write().await;
@@ -1268,7 +1280,7 @@ impl RagCore {
                 bm25.remove_document(id, &text);
             }
         }
-        
+
         // Delete vectors (can still be parallel)
         for id in chunk_ids {
             if let Err(e) = self.vectors_db.delete(id).await {

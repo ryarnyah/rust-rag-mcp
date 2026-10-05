@@ -314,8 +314,16 @@ impl Config {
     /// ```
     pub fn validate(&self) {
         assert!(self.dim > 0, "dimension must be > 0, got {}", self.dim);
-        assert!(self.m >= 2, "m must be >= 2 for graph connectivity, got {}", self.m);
-        assert!(self.max_level > 0, "max_level must be > 0, got {}", self.max_level);
+        assert!(
+            self.m >= 2,
+            "m must be >= 2 for graph connectivity, got {}",
+            self.m
+        );
+        assert!(
+            self.max_level > 0,
+            "max_level must be > 0, got {}",
+            self.max_level
+        );
         if self.ef_construction < 20 {
             tracing::warn!(
                 ef_construction = self.ef_construction,
@@ -1749,7 +1757,7 @@ impl HnswIndex {
             return Ok(());
         }
         let cap = Self::layer_capacity(&self.cfg, layer);
-        
+
         // P4: Avoid Vec allocation in hot path. Use iterator for neighbor traversal
         // and collect only when needed. Build neighbor set with new candidate.
         let neighbors_iter = self.layer_neighbors_iter(id, layer);
@@ -1951,49 +1959,49 @@ impl HnswIndex {
             l = l.saturating_sub(1);
         }
 
-         // 2. Link at every layer from min(level, cur_max) down to 0, clamped
-         // to what the (possibly non-descended) seed actually carries
-         let start_layer = level.min(cur_max).min(self.node_level(ep) as usize);
-         for layer in (0..=start_layer).rev() {
-             let to_new = |n: u32| dist(new_id, n);
-             self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
+        // 2. Link at every layer from min(level, cur_max) down to 0, clamped
+        // to what the (possibly non-descended) seed actually carries
+        let start_layer = level.min(cur_max).min(self.node_level(ep) as usize);
+        for layer in (0..=start_layer).rev() {
+            let to_new = |n: u32| dist(new_id, n);
+            self.search_layer(ep, layer, self.cfg.ef_construction, &to_new, is_deleted)?;
 
-             let cap = Self::layer_capacity(&self.cfg, layer);
-             let selected = {
-                 // SAFETY: scratch() returns a mutable reference to per-thread scratch buffers
-                 // in UnsafeCell. Pointers are cast back and dereferenced only within this scope
-                 // after all other borrows end. The graph invariant (valid node IDs < count)
-                 // is maintained by the insert logic and edge validation.
-                 let scratch = unsafe { &mut *self.scratch() };
-                 scratch.dists.clear();
-                 scratch
-                     .dists
-                     .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
-                 scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
-                 let (dists_ptr, scratch_ptr) = {
-                     let d = &scratch.dists as *const Vec<(u32, f32)>;
-                     let s = scratch as *mut SearchBuffers;
-                     (d, s)
-                 };
-                 Self::select_neighbors_heuristic(
-                     unsafe { &*dists_ptr },
-                     cap,
-                     dist,
-                     Some(unsafe { &mut *scratch_ptr }),
-                 )?
-             };
+            let cap = Self::layer_capacity(&self.cfg, layer);
+            let selected = {
+                // SAFETY: scratch() returns a mutable reference to per-thread scratch buffers
+                // in UnsafeCell. Pointers are cast back and dereferenced only within this scope
+                // after all other borrows end. The graph invariant (valid node IDs < count)
+                // is maintained by the insert logic and edge validation.
+                let scratch = unsafe { &mut *self.scratch() };
+                scratch.dists.clear();
+                scratch
+                    .dists
+                    .extend(scratch.search_output.iter().map(|&(d, id)| (id, d)));
+                scratch.dists.sort_by(|a, b| distance_cmp(a.1, b.1));
+                let (dists_ptr, scratch_ptr) = {
+                    let d = &scratch.dists as *const Vec<(u32, f32)>;
+                    let s = scratch as *mut SearchBuffers;
+                    (d, s)
+                };
+                Self::select_neighbors_heuristic(
+                    unsafe { &*dists_ptr },
+                    cap,
+                    dist,
+                    Some(unsafe { &mut *scratch_ptr }),
+                )?
+            };
 
-             for &n in &selected {
-                 self.add_link(new_id, layer, n, &dist)?;
-                 self.add_link(n, layer, new_id, &dist)?;
-             }
+            for &n in &selected {
+                self.add_link(new_id, layer, n, &dist)?;
+                self.add_link(n, layer, new_id, &dist)?;
+            }
 
-             // SAFETY: scratch() returns thread-local buffer; no other references exist
-             let scratch = unsafe { &*self.scratch() };
-             if let Some(&(_, e)) = scratch.search_output.first() {
-                 ep = e;
-             }
-         }
+            // SAFETY: scratch() returns thread-local buffer; no other references exist
+            let scratch = unsafe { &*self.scratch() };
+            if let Some(&(_, e)) = scratch.search_output.first() {
+                ep = e;
+            }
+        }
 
         if level > cur_max {
             self.set_entry_point(new_id);

@@ -1420,16 +1420,7 @@ async fn test_concurrent_mutations() -> Result<()> {
         let task = tokio::spawn(async move {
             for i in 0..20 {
                 let id = 100 + task_id * 20 + i;
-                let vec = vec![
-                    (id as f32 / 1000.0),
-                    0.2,
-                    0.3,
-                    0.4,
-                    0.5,
-                    0.6,
-                    0.7,
-                    0.8,
-                ];
+                let vec = vec![(id as f32 / 1000.0), 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
                 let mut db = db_clone.lock().await;
                 let _ = db.insert(&vec, Some(format!("task_{}_doc_{}", task_id, i).as_bytes()));
             }
@@ -1459,12 +1450,15 @@ async fn test_concurrent_mutations() -> Result<()> {
     {
         let db = db.lock().await;
         db.integrity_check()?;
-        
+
         // Count live vectors
         let live_count = (0..db.len() as u32)
             .filter(|id| !db.is_deleted(*id))
             .count();
-        assert!(live_count > 0, "some vectors should survive concurrent mutations");
+        assert!(
+            live_count > 0,
+            "some vectors should survive concurrent mutations"
+        );
         assert!(
             live_count <= db.len() as usize,
             "live count must be <= total count"
@@ -1483,7 +1477,10 @@ async fn test_search_skips_many_tombstones() -> Result<()> {
     let mut db = VectorDb::open("test_tombstone_density.db", cfg).await?;
 
     for i in 0..100 {
-        db.insert(&[i as f32 / 100.0, 0.5, 0.5, 0.5], Some(format!("doc_{}", i).as_bytes()))?;
+        db.insert(
+            &[i as f32 / 100.0, 0.5, 0.5, 0.5],
+            Some(format!("doc_{}", i).as_bytes()),
+        )?;
     }
     for id in 0..90 {
         db.delete(id as u32)?;
