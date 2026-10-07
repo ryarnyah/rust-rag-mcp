@@ -3912,9 +3912,9 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "undoc"
-version = "0.12.0"
+version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f5b1ac4e6501feb078ca537dc83dd610d4351316439c7583834e3c91e75ecb"
+checksum = "fc89a791b0b64588a851ec3d437818dfd29a71c5047d25e925e2174d2e053ef0"
 dependencies = [
  "cfb",
  "quick-xml",
